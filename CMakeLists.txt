@@ -91,8 +91,6 @@ set(LIB_SOURCES
     src/quant/quant.cpp
     src/arch/llama/llama.cpp
     src/graph/graph.cpp
-    src/graph/ops.cpp
-    src/runtime/scheduler.cpp
     src/runtime/kv_cache.cpp
     src/cache/cache.cpp
     src/backends/cpu_ref/cpu_ref.cpp

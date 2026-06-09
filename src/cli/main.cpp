@@ -434,7 +434,7 @@ int main(int argc, char* argv[]) {
     int ctx_size = params.ctx_size > 0 ? params.ctx_size : static_cast<int>(hparams.context_length);
     float rms_eps = 1e-5f;
     if (hparams.attention_layer_norm_rms_epsilon > 0) {
-        rms_eps = std::sqrt(static_cast<float>(hparams.attention_layer_norm_rms_epsilon));
+        rms_eps = static_cast<float>(hparams.attention_layer_norm_rms_epsilon);
     }
     float rope_freq_scale = static_cast<float>(hparams.rope_freq_scale);
     float rope_freq_base = static_cast<float>(hparams.rope_freq_base);

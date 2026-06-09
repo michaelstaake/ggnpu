@@ -4,7 +4,7 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state:** Greenfield — only `README.md` and `LICENSE` exist. All code must be written from scratch.
+**Current state:** Phases 0–3 partially implemented. GGUF parser, quantization decoders, CPU reference backend, compute graph, KV cache, tokenizer, CLI, and XRT NPU backend skeleton exist. Full inference loop works on CPU ref; NPU ops need kernel integration. See `git log` for commit history.
 
 ---
 
@@ -50,6 +50,47 @@ Build a standalone C++20 inference binary named `ggnpu` that:
 ### Production rule
 
 If NPU initialization fails, `ggnpu` must **exit with an error**. No silent fallback to CPU or GPU.
+
+### AIE kernel design guardrails
+
+The AMD XDNA 2 architecture has no safety net — no OS thread scheduler, no hardware cache handlers, no hazard checking. These four guardrails prevent AI agents (and humans) from writing code that compiles but crashes the NPU or runs slower than CPU execution.
+
+#### 1. Memory-First Design
+
+Memory bandwidth, not compute, is the killer bottleneck on XDNA 2. All memory operations must be strictly block-based and explicitly partitioned to match the Strix Point 4 MB shared L2 memory tile array.
+
+- **Tensor execution loop:** Structure so that while Compute Tile Row 1 processes Layer N, the XRT DMA engine streams weights for Layer N+1 from host DDR5 into L2 tiles.
+- **Never** let compute tiles stall waiting for host memory fetches.
+- **Never** write continuous, un-chunked data reads. All DMA transfers must be block-aligned.
+- **L2 awareness:** Each tile row has limited local memory. Tile large matmuls to fit within L2; stream remaining data from DDR.
+
+#### 2. Strict Vectorization and Type Constraints
+
+The AIE cores have 512-bit vector registers. Standard C math operators (`+`, `*`) will not auto-vectorize efficiently into VLIW.
+
+- **Write core kernels using explicit AMD AIE API vector intrinsics**, not scalar loops.
+- **Native math types:** Restrict kernel functions strictly to `INT8`, `BF16`, or `FP8`. No scalar `float` or `double` in hot paths.
+- **No scalar fallback:** If a computation doesn't map to a vector intrinsic, restructure the algorithm — don't drop to scalar C.
+
+#### 3. Prohibit Branch Logic in Kernels
+
+VLIW processors inside XDNA compute tiles have a flat instruction pipeline with zero hardware-level hazard checking. Branching breaks instruction pipelining.
+
+- **Kernels must be fully deterministic and completely unrolled** where possible.
+- **Zero conditional branch logic (`if/else`, `switch`, `while` with non-constant bounds)** inside hot execution loops.
+- Use predication, lookup tables, or arithmetic tricks instead of branches.
+- Loop bounds must be compile-time constants or kernel parameters passed as immediate values.
+
+#### 4. Two-Layer Output Architecture
+
+LLMs confuse what code goes where when dealing with XRT. Clearly separate:
+
+| Layer | Where it runs | What it does |
+|-------|--------------|--------------|
+| **Control Code** | NPU internal microcontroller (core 0) | Data movement graph, DMA setup, kernel launch via IRON API / `XAie_TxnOpcode` sequence |
+| **Kernel Execution Code** | Spatial compute tile rows (Peano ELFs) | Vectorized INT8/BF16 math kernels, no branches, fully unrolled loops |
+
+The control code **never** contains tensor math. The kernel code **never** handles DMA setup or kernel launch. This separation is enforced by the IRON/mlir-aie compilation pipeline.
 
 ### "No conversion" clarified
 
@@ -199,6 +240,13 @@ struct Backend {
 Production: `AmdXdnaBackend`. Tests only: `cpu_ref`.
 
 ### Layer 6 — AMD XDNA backend (`src/backends/amd_xdna/`)
+
+**Architecture split (Guardrail #4):**
+
+The NPU backend consists of two code paths that must never mix:
+
+- **Control plane** (`amd_xdna.cpp`): XRT device management, buffer allocation, xclbin loading, kernel launch. Runs on host CPU, talks to NPU microcontroller via IRON API / `XAie_TxnOpcode`.
+- **Kernel plane** (`kernels/amd/`): Peano-compiled C++ tile code. Runs on spatial compute tiles. Vectorized intrinsics only, no branches, no scalar math.
 
 **Bring-up:**
 
@@ -534,6 +582,15 @@ On **Ubuntu 26.04** + **Ryzen AI 7 350**, natively or in Docker:
 6. Add tests for every parser/quant/graph component; NPU tests marked `MANUAL`.
 7. Update `docs/usage.md` and `--help` whenever CLI flags change.
 8. Commit logically per phase; write clear commit messages.
+
+### AIE kernel rules (enforce on all code generation)
+
+When generating NPU kernel code (`kernels/amd/`), **always** apply the four guardrails from Section 2b:
+
+- **Memory-first:** Block-based DMA, no un-chunked reads, overlap compute with streaming.
+- **Vector intrinsics only:** No scalar `+`/`*` in kernels. Use AIE vector ops. Types: INT8, BF16, FP8.
+- **No branches:** Zero `if/else`/`switch`/`while` in hot loops. Predication or lookup tables only.
+- **Two layers:** Control code (IRON API, DMA setup) never contains tensor math. Kernel code (Peano ELF) never handles DMA or launch.
 
 **Start here:** Phase 0 — scaffold CMake, `scripts/verify-npu.sh`, and `docs/amd-krackan.md`.
 

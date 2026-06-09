@@ -2,8 +2,46 @@
 #include "backend.h"
 #include <algorithm>
 #include <iostream>
+#include <queue>
+#include <map>
 
 namespace ggnpu {
+
+namespace {
+
+std::vector<std::shared_ptr<OpNode>> topological_sort(const std::vector<std::shared_ptr<OpNode>>& nodes) {
+    std::map<std::shared_ptr<OpNode>, int> in_degree;
+    for (auto& node : nodes) {
+        in_degree[node] = static_cast<int>(node->inputs.size());
+    }
+
+    std::queue<std::shared_ptr<OpNode>> ready;
+    for (auto& [node, deg] : in_degree) {
+        if (deg == 0) ready.push(node);
+    }
+
+    std::vector<std::shared_ptr<OpNode>> order;
+    while (!ready.empty()) {
+        auto node = ready.front();
+        ready.pop();
+        order.push_back(node);
+
+        for (auto& other : nodes) {
+            for (auto& inp : other->inputs) {
+                if (inp == node) {
+                    in_degree[other]--;
+                    if (in_degree[other] == 0) {
+                        ready.push(other);
+                    }
+                }
+            }
+        }
+    }
+
+    return order;
+}
+
+} // namespace
 
 ComputeGraph::ComputeGraph() = default;
 ComputeGraph::~ComputeGraph() = default;
@@ -26,7 +64,9 @@ Status ComputeGraph::execute() {
         return Status::ERROR;
     }
 
-    for (auto& node : nodes_) {
+    std::vector<std::shared_ptr<OpNode>> exec_order = topological_sort(nodes_);
+
+    for (auto& node : exec_order) {
         Status status = Status::OK;
 
         switch (node->type) {

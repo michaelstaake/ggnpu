@@ -255,18 +255,19 @@ bool GgufLoader::parse_kv() {
     return true;
 }
 
-bool GgufLoader::parse_tensors() {    tensors_.clear();
+bool GgufLoader::parse_tensors() {
+    tensors_.clear();
     tensors_.reserve(header_.tensor_count);
 
-          for (uint64_t i = 0; i < header_.tensor_count; i++) {
+    for (uint64_t i = 0; i < header_.tensor_count; i++) {
         GgufTensorInfo info;
 
         // Read name length
         uint8_t name_key_len_buf[8];
-        if (::read(fd_, name_key_len_buf, 8) != 8) {            return false;
+        if (::read(fd_, name_key_len_buf, 8) != 8) {
+            return false;
         }
         uint64_t name_len = read_u64_le(name_key_len_buf);
-        if (i < 3 || i >= header_.tensor_count - 3) {        }
         if (name_len > 1024) return false;
 
         // Read name
@@ -400,8 +401,8 @@ uint64_t GgufLoader::attention_head_count_kv() const {
     return static_cast<uint64_t>(get_int("llama.attention.head_count_kv", 0));
 }
 
-uint64_t GgufLoader::attention_layer_norm_rms_epsilon() const {
-    return static_cast<uint64_t>(get_float("llama.attention.layer_norm_rms_epsilon", 1e-5) * 1e8);
+double GgufLoader::attention_layer_norm_rms_epsilon() const {
+    return get_float("llama.attention.layer_norm_rms_epsilon", 1e-5);
 }
 
 uint64_t GgufLoader::rope_dimension_count() const {

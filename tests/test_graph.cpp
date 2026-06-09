@@ -39,6 +39,45 @@ void test_compute_graph() {
     assert_true(status == ggnpu::Status::OK, "Graph compiles successfully");
 }
 
+void test_topological_order() {
+    std::cout << "\n--- Topological Order ---\n";
+
+    ggnpu::ComputeGraph graph;
+    auto backend = ggnpu::create_cpu_ref_backend();
+    graph.set_backend(backend);
+
+    auto node_a = graph.add_node(ggnpu::OpType::RMS_NORM, "norm_a");
+    auto node_b = graph.add_node(ggnpu::OpType::MUL_MAT_Q, "matmul_b");
+    auto node_c = graph.add_node(ggnpu::OpType::SOFTMAX, "softmax_c");
+
+    graph.connect(node_a, node_b);
+    graph.connect(node_b, node_c);
+
+    graph.compile();
+
+    node_a->cpu_buffer = new float[4]{1.0f, 2.0f, 3.0f, 4.0f};
+    node_b->cpu_buffer = new float[4]{0.0f, 0.0f, 0.0f, 0.0f};
+    node_c->cpu_buffer = new float[4]{0.0f, 0.0f, 0.0f, 0.0f};
+
+    node_b->M = 1;
+    node_b->N = 1;
+    node_b->K = 4;
+    node_b->B_type = ggnpu::GgmlType::F32;
+
+    node_c->rows = 1;
+    node_c->cols = 4;
+
+    node_a->size = 4;
+    node_a->eps = 1e-5f;
+
+    auto status = graph.execute();
+    assert_true(status == ggnpu::Status::OK, "Graph executes in topological order");
+
+    delete[] static_cast<float*>(node_a->cpu_buffer);
+    delete[] static_cast<float*>(node_b->cpu_buffer);
+    delete[] static_cast<float*>(node_c->cpu_buffer);
+}
+
 void test_backend_interface() {
     std::cout << "\n--- Backend Interface ---\n";
 
@@ -53,6 +92,7 @@ void run_tests(const std::string& filter) {
     std::cout << "Running ggnpu tests...\n";
 
     test_compute_graph();
+    test_topological_order();
     test_backend_interface();
 
     std::cout << "\n=== Results ===\n";

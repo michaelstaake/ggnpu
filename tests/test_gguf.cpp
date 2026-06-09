@@ -80,6 +80,15 @@ void test_gguf_loader_basic() {
     assert_true(loader.header().tensor_count == 0, "Empty loader tensor_count = 0");
 }
 
+void test_gguf_epsilon_accessor() {
+    std::cout << "\n--- GGUF Epsilon Accessor ---\n";
+
+    ggnpu::GgufLoader loader;
+    double default_eps = loader.attention_layer_norm_rms_epsilon();
+    assert_true(std::abs(default_eps - 1e-5) < 1e-10,
+                "Default epsilon = 1e-5 (got " + std::to_string(default_eps) + ")");
+}
+
 void run_tests(const std::string& filter) {
     std::cout << "Running ggnpu tests...\n";
 
@@ -87,6 +96,7 @@ void run_tests(const std::string& filter) {
     test_gguf_type_names();
     test_tensor_view();
     test_gguf_loader_basic();
+    test_gguf_epsilon_accessor();
 
     std::cout << "\n=== Results ===\n";
     std::cout << "Passed: " << tests_passed << "\n";
