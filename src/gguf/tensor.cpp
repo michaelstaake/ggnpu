@@ -43,9 +43,9 @@ size_t ggml_blck_size(GgmlType type) {
     return block_sizes[idx];
 }
 
-size_t ggml_type_sizef(GgmlType type) {
+float ggml_type_sizef(GgmlType type) {
     // Fractional size per element in bytes
-    return static_cast<float>(ggml_type_size(type)) / ggml_blck_size(type);
+    return static_cast<float>(ggml_type_size(type)) / static_cast<float>(ggml_blck_size(type));
 }
 
 const char* ggml_type_name(GgmlType type) {

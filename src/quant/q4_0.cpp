@@ -24,19 +24,20 @@ static void dequantize_q4_0_block(const uint8_t* block, float* out) {
 void decode_q4_0_for_npu(const uint8_t* gguf_data, size_t data_size,
                          std::vector<int8_t>& int8_output,
                          std::vector<float>& scales_output) {
-    int num_blocks = data_size / sizeof(Q4_0Block);
-    int8_output.resize(num_blocks * 16);
+    size_t block_size = 16;
+    int num_blocks = data_size / block_size;
+    int8_output.resize(num_blocks * 32);
     scales_output.resize(num_blocks);
 
     for (int i = 0; i < num_blocks; i++) {
-        const uint8_t* block = gguf_data + i * sizeof(Q4_0Block);
+        const uint8_t* block = gguf_data + i * block_size;
         const Q4_0Block* qb = reinterpret_cast<const Q4_0Block*>(block);
         scales_output[i] = static_cast<float>(qb->d);
 
-        for (int j = 0; j < 16; j++) {
+        for (int j = 0; j < 32; j++) {
             uint8_t nibble = (j % 2 == 0) ? (qb->qs[j / 2] & 0x0F) : (qb->qs[j / 2] >> 4);
             int val = static_cast<int>(nibble) - 8;
-            int8_output[i * 16 + j] = static_cast<int8_t>(val);
+            int8_output[i * 32 + j] = static_cast<int8_t>(val);
         }
     }
 }

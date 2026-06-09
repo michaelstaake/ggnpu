@@ -150,8 +150,46 @@ Status ComputeGraph::execute() {
             break;
 
         case OpType::ADD:
+            if (node->cpu_buffer && node->inputs.size() >= 2) {
+                float* a = static_cast<float*>(node->inputs[0]->cpu_buffer);
+                float* b = static_cast<float*>(node->inputs[1]->cpu_buffer);
+                float* out = static_cast<float*>(node->cpu_buffer);
+                int size = node->size;
+                if (a && b && out && size > 0) {
+                    for (int i = 0; i < size; i++) {
+                        out[i] = a[i] + b[i];
+                    }
+                }
+            }
+            break;
+
         case OpType::MUL:
+            if (node->cpu_buffer && node->inputs.size() >= 2) {
+                float* a = static_cast<float*>(node->inputs[0]->cpu_buffer);
+                float* b = static_cast<float*>(node->inputs[1]->cpu_buffer);
+                float* out = static_cast<float*>(node->cpu_buffer);
+                int size = node->size;
+                if (a && b && out && size > 0) {
+                    for (int i = 0; i < size; i++) {
+                        out[i] = a[i] * b[i];
+                    }
+                }
+            }
+            break;
+
         case OpType::COPY:
+            if (node->cpu_buffer && node->inputs.size() >= 1) {
+                float* src = static_cast<float*>(node->inputs[0]->cpu_buffer);
+                float* dst = static_cast<float*>(node->cpu_buffer);
+                int size = node->size;
+                if (src && dst && size > 0) {
+                    for (int i = 0; i < size; i++) {
+                        dst[i] = src[i];
+                    }
+                }
+            }
+            break;
+
         case OpType::VIEW:
             break;
 

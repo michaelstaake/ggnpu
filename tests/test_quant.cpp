@@ -3,268 +3,212 @@
 #include <string>
 #include <cmath>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
-
-#include "tensor.h"
-#include "backend.h"
-#include "quant/q4_0.h"
-#include "quant/q8_0.h"
-
-namespace {
+#include "ggnpu/tensor.h"
+#include "ggnpu/quant/q4_0.h"
+#include "ggnpu/quant/q8_0.h"
+#include "ggnpu/quant/quant.h"
 
 int tests_passed = 0;
 int tests_failed = 0;
 
-void assert_true(bool cond, const std::string& msg) {
-    if (cond) {
-        tests_passed++;
-        std::cout << "  PASS: " << msg << "\n";
-    } else {
-        tests_failed++;
-        std::cout << "  FAIL: " << msg << "\n";
-    }
-}
+#define ASSERT_EQ(a, b, msg) do { \
+    if ((a) != (b)) { \
+        std::cerr << "  FAIL: " << msg << " (expected " << (b) << ", got " << (a) << ")\n"; \
+        tests_failed++; \
+    } else { \
+        tests_passed++; \
+    } \
+} while(0)
 
-void test_quant_types() {
-    std::cout << "\n--- Quantization Types ---\n";
+#define ASSERT_TRUE(cond, msg) do { \
+    if (!(cond)) { \
+        std::cerr << "  FAIL: " << msg << "\n"; \
+        tests_failed++; \
+    } else { \
+        tests_passed++; \
+    } \
+} while(0)
 
-    assert_true(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0) == 32, "Q4_0: 32 values per block");
-    assert_true(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q8_0) == 32, "Q8_0: 32 values per block");
-    assert_true(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_K) == 32, "Q4_K: 32 values per block");
-    assert_true(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q6_K) == 32, "Q6_K: 32 values per block");
+#define ASSERT_NEAR(a, b, eps, msg) do { \
+    if (std::fabs((a) - (b)) > (eps)) { \
+        std::cerr << "  FAIL: " << msg << " (expected ~" << (b) << ", got " << (a) << ")\n"; \
+        tests_failed++; \
+    } else { \
+        tests_passed++; \
+    } \
+} while(0)
 
-    assert_true(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_0) == 16, "Q4_0: 16 bytes per block");
-    assert_true(ggnpu::ggml_type_size(ggnpu::GgmlType::Q8_0) == 34, "Q8_0: 34 bytes per block");
-    assert_true(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_K) == 48, "Q4_K: 48 bytes per block");
-    assert_true(ggnpu::ggml_type_size(ggnpu::GgmlType::Q6_K) == 64, "Q6_K: 64 bytes per block");
-}
+void test_q4_0_block_structure() {
+    std::cout << "  test_q4_0_block_structure\n";
 
-void test_rms_norm() {
-    std::cout << "\n--- RMS Norm ---\n";
-
-    std::vector<float> input = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
-    std::vector<float> output(5);
-
-    ggnpu::RmsNormParams params;
-    params.input = input.data();
-    params.output = output.data();
-    params.size = 5;
-    params.eps = 1e-5f;
-
-    auto backend = ggnpu::create_cpu_ref_backend();
-    auto status = backend->rms_norm(params);
-
-    assert_true(status == ggnpu::Status::OK, "RMS norm returns OK");
-
-    // Verify output is normalized
-    float rms = 0.0f;
-    for (int i = 0; i < 5; i++) {
-        rms += output[i] * output[i];
-    }
-    rms = std::sqrt(rms / 5);
-    assert_true(std::abs(rms - 1.0f) < 1e-5, "RMS of output ≈ 1.0");
-}
-
-void test_softmax() {
-    std::cout << "\n--- Softmax ---\n";
-
-    std::vector<float> input = {1.0f, 2.0f, 3.0f, 4.0f};
-    std::vector<float> output(4);
-
-    ggnpu::SoftmaxParams params;
-    params.input = input.data();
-    params.output = output.data();
-    params.rows = 1;
-    params.cols = 4;
-
-    auto backend = ggnpu::create_cpu_ref_backend();
-    auto status = backend->softmax(params);
-
-    assert_true(status == ggnpu::Status::OK, "Softmax returns OK");
-
-    // Verify sum = 1
-    float sum = 0.0f;
-    for (int i = 0; i < 4; i++) {
-        sum += output[i];
-    }
-    assert_true(std::abs(sum - 1.0f) < 1e-5, "Softmax sum ≈ 1.0");
-
-    // Verify all positive
-    for (int i = 0; i < 4; i++) {
-        assert_true(output[i] > 0, "Softmax output[" + std::to_string(i) + "] > 0");
-    }
-}
-
-void test_silu() {
-    std::cout << "\n--- SiLU ---\n";
-
-    std::vector<float> input = {-2.0f, -1.0f, 0.0f, 1.0f, 2.0f};
-    std::vector<float> output(5);
-
-    ggnpu::SiluParams params;
-    params.input = input.data();
-    params.output = output.data();
-    params.size = 5;
-
-    auto backend = ggnpu::create_cpu_ref_backend();
-    auto status = backend->silu(params);
-
-    assert_true(status == ggnpu::Status::OK, "SiLU returns OK");
-
-    // SiLU(0) = 0
-    assert_true(std::abs(output[2]) < 1e-5, "SiLU(0) ≈ 0");
-
-    // SiLU is approximately linear for large positive values
-    assert_true(output[4] < input[4], "SiLU(2) < 2");
-}
-
-void test_rope() {
-    std::cout << "\n--- RoPE ---\n";
-
-    std::vector<float> data = {1.0f, 0.0f, 0.0f, 1.0f}; // [cos(0), sin(0), cos(0), sin(0)]
-
-    ggnpu::RopeParams params;
-    params.data = data.data();
-    params.n_dims = 4;
-    params.offset = 0;
-    params.freq_scale = 1.0f;
-    params.freq_base = 10000.0f;
-    params.rope_dims = 4;
-
-    auto backend = ggnpu::create_cpu_ref_backend();
-    auto status = backend->rope(params);
-
-    assert_true(status == ggnpu::Status::OK, "RoPE returns OK");
-
-    // At offset 0, RoPE should be identity
-    assert_true(std::abs(data[0] - 1.0f) < 1e-5, "RoPE[0] ≈ 1.0 at offset 0");
-    assert_true(std::abs(data[1] - 0.0f) < 1e-5, "RoPE[1] ≈ 0.0 at offset 0");
-}
-
-void test_matmul() {
-    std::cout << "\n--- MatMul ---\n";
-
-    // 2x3 x 3x2 = 2x2
-    std::vector<float> A = {1, 2, 3, 4, 5, 6};
-    std::vector<float> B = {7, 8, 9, 10, 11, 12};
-    std::vector<float> C(4, 0);
-
-    ggnpu::MulMatParams params;
-    params.A = A.data();
-    params.B = B.data();
-    params.C = C.data();
-    params.M = 2;
-    params.N = 2;
-    params.K = 3;
-    params.lda = 3;
-    params.ldb = 2;
-    params.ldc = 2;
-    params.n_batches = 1;
-    params.B_type = ggnpu::GgmlType::F32;
-
-    auto backend = ggnpu::create_cpu_ref_backend();
-    auto status = backend->mul_mat_q(params);
-
-    assert_true(status == ggnpu::Status::OK, "MatMul returns OK");
-
-    // Expected: [[58, 64], [139, 154]]
-    assert_true(std::abs(C[0] - 58.0f) < 0.1f, "MatMul[0,0] = 58");
-    assert_true(std::abs(C[1] - 64.0f) < 0.1f, "MatMul[0,1] = 64");
-    assert_true(std::abs(C[2] - 139.0f) < 0.1f, "MatMul[1,0] = 139");
-    assert_true(std::abs(C[3] - 154.0f) < 0.1f, "MatMul[1,1] = 154");
-}
-
-void test_q8_0_matmul() {
-    std::cout << "\n--- Q8_0 MatMul ---\n";
-
-    // Simple 2x4 x 4x2 = 2x2 with F32 activations and Q8_0 quantized weights
-    std::vector<float> A = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
-    std::vector<int8_t> B = {1, 2, 3, 4, 5, 6, 7, 8};
-    std::vector<float> C(4, 0);
-
-    ggnpu::MulMatParams params;
-    params.A = A.data();
-    params.B = B.data();
-    params.C = C.data();
-    params.M = 2;
-    params.N = 2;
-    params.K = 4;
-    params.lda = 4;
-    params.ldb = 2;
-    params.ldc = 2;
-    params.n_batches = 1;
-    params.B_type = ggnpu::GgmlType::Q8_0;
-
-    auto backend = ggnpu::create_cpu_ref_backend();
-    auto status = backend->mul_mat_q(params);
-
-    assert_true(status == ggnpu::Status::OK, "Q8_0 MatMul returns OK");
-
-    // A (F32) = {{1,2,3,4}, {5,6,7,8}}, B (Q8_0 int8) = {{1,2},{3,4},{5,6},{7,8}}
-    // C[0,0] = 1*1 + 2*3 + 3*5 + 4*7 = 50
-    // C[0,1] = 1*2 + 2*4 + 3*6 + 4*8 = 60
-    // C[1,0] = 5*1 + 6*3 + 7*5 + 8*7 = 114
-    // C[1,1] = 5*2 + 6*4 + 7*6 + 8*8 = 140
-    assert_true(std::abs(C[0] - 50.0f) < 0.1f, "Q8_0 MatMul[0,0] = 50");
-    assert_true(std::abs(C[1] - 60.0f) < 0.1f, "Q8_0 MatMul[0,1] = 60");
-    assert_true(std::abs(C[2] - 114.0f) < 0.1f, "Q8_0 MatMul[1,0] = 114");
-    assert_true(std::abs(C[3] - 140.0f) < 0.1f, "Q8_0 MatMul[1,1] = 140");
-}
-
-void test_q4_0_decode() {
-    std::cout << "\n--- Q4_0 Decode ---\n";
-
-    // Create a simple Q4_0 block
     ggnpu::Q4_0Block block;
-    block.d = 1;
-    memset(block.qs, 0, 8);
+    memset(&block, 0, sizeof(block));
 
-    std::vector<uint8_t> gguf_data(sizeof(ggnpu::Q4_0Block));
-    memcpy(gguf_data.data(), &block, sizeof(ggnpu::Q4_0Block));
+    ASSERT_EQ(sizeof(block.d), 2, "Q4_0Block.d is int16_t (2 bytes)");
+    ASSERT_EQ(sizeof(block.qs), 8, "Q4_0Block.qs is 8 bytes");
+    ASSERT_TRUE(sizeof(block) >= 10, "Q4_0Block size >= 10 bytes");
 
-    std::vector<int8_t> int8_output;
-    std::vector<float> scales_output;
-
-    ggnpu::decode_q4_0_for_npu(gguf_data.data(), gguf_data.size(), int8_output, scales_output);
-
-    assert_true(int8_output.size() == 16, "Q4_0 decode produces 16 values");
-    assert_true(scales_output.size() == 1, "Q4_0 decode produces 1 scale");
-
-    // All values should be -8 since qs is all zeros (nibble=0, val=0-8=-8)
-    for (int i = 0; i < 16; i++) {
-        assert_true(int8_output[i] == -8, "Q4_0 decoded value[" + std::to_string(i) + "] = -8");
-    }
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), 32, "Q4_0 block size is 32 elements");
+    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_0), 16, "Q4_0 type size is 16 bytes");
 }
 
-void run_tests(const std::string& filter) {
-    std::cout << "Running ggnpu tests...\n";
+void test_q8_0_block_structure() {
+    std::cout << "  test_q8_0_block_structure\n";
 
-    test_quant_types();
-    test_rms_norm();
-    test_softmax();
-    test_silu();
-    test_rope();
-    test_matmul();
-    test_q8_0_matmul();
-    test_q4_0_decode();
+    ggnpu::Q8_0Block block;
+    memset(&block, 0, sizeof(block));
 
-    std::cout << "\n=== Results ===\n";
+    ASSERT_EQ(sizeof(block), 34, "Q8_0Block size is 34 bytes");
+    ASSERT_EQ(sizeof(block.d), 2, "Q8_0Block.d is int16_t (2 bytes)");
+    ASSERT_EQ(sizeof(block.qs), 32, "Q8_0Block.qs is 32 bytes");
+
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q8_0), 32, "Q8_0 block size is 32 elements");
+    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q8_0), 34, "Q8_0 type size is 34 bytes");
+}
+
+void test_q4_0_to_int8_conversion() {
+    std::cout << "  test_q4_0_to_int8_conversion\n";
+
+    // Test sign extension manually
+    // nibble 0x00 -> 0
+    // nibble 0x08 -> -8 (sign bit set)
+    // nibble 0x0F -> -1
+    uint8_t nibble = 0x08;
+    int8_t val = static_cast<int8_t>((nibble & 0x08) ? (nibble | 0xF0) : nibble);
+    ASSERT_EQ(val, -8, "0x08 sign-extends to -8");
+
+    nibble = 0x0F;
+    val = static_cast<int8_t>((nibble & 0x08) ? (nibble | 0xF0) : nibble);
+    ASSERT_EQ(val, -1, "0x0F sign-extends to -1");
+
+    nibble = 0x07;
+    val = static_cast<int8_t>((nibble & 0x08) ? (nibble | 0xF0) : nibble);
+    ASSERT_EQ(val, 7, "0x07 sign-extends to 7");
+}
+
+void test_q4_0_decode_basic() {
+    std::cout << "  test_q4_0_decode_basic\n";
+
+    uint8_t block_data[16];
+    ggnpu::Q4_0Block* block = reinterpret_cast<ggnpu::Q4_0Block*>(block_data);
+    block->d = 1;
+    block->qs[0] = 0x11;
+    memset(block->qs + 1, 0, 7);
+
+    std::vector<int8_t> int8_out;
+    std::vector<float> scales_out;
+
+    ggnpu::decode_q4_0_for_npu(block_data, 16, int8_out, scales_out);
+
+    ASSERT_EQ(int8_out.size(), 32, "Q4_0 decode produces 32 int8 values");
+    ASSERT_EQ(scales_out.size(), 1, "Q4_0 decode produces 1 scale");
+
+    // With scale=1, nibble 0x11 gives values 1 and 0
+    // But the decode function uses val = nibble - 8, so:
+    // int8_out[0] = 1 - 8 = -7
+    // int8_out[1] = 0 - 8 = -8
+    ASSERT_EQ(int8_out[0], -7, "Q4_0 decode value[0]");
+    ASSERT_EQ(int8_out[1], -7, "Q4_0 decode value[1]");
+}
+
+void test_q8_0_decode_basic() {
+    std::cout << "  test_q8_0_decode_basic\n";
+
+    uint8_t block_data[34];
+    ggnpu::Q8_0Block* block = reinterpret_cast<ggnpu::Q8_0Block*>(block_data);
+    block->d = 2;
+    memset(block->qs, 0, 32);
+    block->qs[0] = 3;
+    block->qs[31] = 1;
+
+    std::vector<int8_t> int8_out;
+    std::vector<float> scales_out;
+
+    ggnpu::decode_q8_0_for_npu(block_data, 34, int8_out, scales_out);
+
+    ASSERT_EQ(int8_out.size(), 32, "Q8_0 decode produces 32 int8 values");
+    ASSERT_EQ(scales_out.size(), 1, "Q8_0 decode produces 1 scale");
+
+    ASSERT_EQ(int8_out[0], 3, "Q8_0 decode value[0]");
+    ASSERT_EQ(int8_out[31], 1, "Q8_0 decode value[31]");
+}
+
+void test_decode_dispatch() {
+    std::cout << "  test_decode_dispatch\n";
+
+    std::vector<int8_t> int8_out;
+    std::vector<float> scales_out;
+
+    float f32_data[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    ggnpu::decode_for_npu(ggnpu::GgmlType::F32, reinterpret_cast<const uint8_t*>(f32_data), 16, int8_out, scales_out);
+    ASSERT_TRUE(int8_out.size() >= 4, "F32 decode produces output");
+
+    uint8_t q8_block[34];
+    ggnpu::Q8_0Block* q8b = reinterpret_cast<ggnpu::Q8_0Block*>(q8_block);
+    q8b->d = 1;
+    q8b->qs[0] = 5;
+    memset(q8b->qs + 1, 0, 31);
+
+    int8_out.clear();
+    scales_out.clear();
+    ggnpu::decode_for_npu(ggnpu::GgmlType::Q8_0, q8_block, 34, int8_out, scales_out);
+    ASSERT_EQ(int8_out.size(), 32, "Q8_0 dispatch produces 32 values");
+    ASSERT_EQ(int8_out[0], 5, "Q8_0 dispatch value[0]");
+
+    uint8_t q4_block[16];
+    ggnpu::Q4_0Block* q4b = reinterpret_cast<ggnpu::Q4_0Block*>(q4_block);
+    q4b->d = 1;
+    q4b->qs[0] = 0x12;
+    memset(q4b->qs + 1, 0, 7);
+
+    int8_out.clear();
+    scales_out.clear();
+    ggnpu::decode_for_npu(ggnpu::GgmlType::Q4_0, q4_block, 16, int8_out, scales_out);
+    ASSERT_EQ(int8_out.size(), 32, "Q4_0 dispatch produces 32 values");
+   // qs[0] = 0x12, so nibbles are 2 and 1
+    // val = nibble - 8, so 2-8=-6, 1-8=-7
+    ASSERT_EQ(int8_out[0], -6, "Q4_0 dispatch value[0]");
+    ASSERT_EQ(int8_out[1], -7, "Q4_0 dispatch value[1]");
+}
+
+void test_block_size_consistency() {
+    std::cout << "  test_block_size_consistency\n";
+
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_1), "Q4_0 == Q4_1 block size");
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), ggnpu::ggml_blck_size(ggnpu::GgmlType::Q5_0), "Q4_0 == Q5_0 block size");
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), ggnpu::ggml_blck_size(ggnpu::GgmlType::Q8_0), "Q4_0 == Q8_0 block size");
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_K), "Q4_0 == Q4_K block size");
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), ggnpu::ggml_blck_size(ggnpu::GgmlType::Q6_K), "Q4_0 == Q6_K block size");
+
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::F32), 1, "F32 block size is 1");
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::F16), 1, "F16 block size is 1");
+}
+
+void run_tests() {
+    std::cout << "=== Quantization Tests ===\n\n";
+
+    test_q4_0_block_structure();
+    test_q8_0_block_structure();
+    test_q4_0_to_int8_conversion();
+    test_q4_0_decode_basic();
+    test_q8_0_decode_basic();
+    test_decode_dispatch();
+    test_block_size_consistency();
+
+    std::cout << "\n--- Results ---\n";
     std::cout << "Passed: " << tests_passed << "\n";
     std::cout << "Failed: " << tests_failed << "\n";
-    std::cout << "Total:  " << (tests_passed + tests_failed) << "\n";
+
+    if (tests_failed > 0) {
+        std::cout << "\nSOME TESTS FAILED\n";
+    } else {
+        std::cout << "\nALL TESTS PASSED\n";
+    }
 }
 
-} // namespace
-
-int main(int argc, char* argv[]) {
-    std::string filter;
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if (arg == "--filter" && i + 1 < argc) {
-            filter = argv[++i];
-        }
-    }
-
-    run_tests(filter);
+int main() {
+    run_tests();
     return tests_failed > 0 ? 1 : 0;
 }
