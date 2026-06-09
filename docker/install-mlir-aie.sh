@@ -33,6 +33,7 @@ python3 -m venv /opt/ironenv
 source /opt/ironenv/bin/activate
 python3 -m pip install --upgrade pip
 python3 -m pip install -r "$MLIR_AIE_SRC/python/requirements.txt"
+python3 -m pip install nanobind
 
 cd "$MLIR_AIE_SRC"
 bash ./utils/build-mlir-aie-from-wheels.sh
