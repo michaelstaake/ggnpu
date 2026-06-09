@@ -177,8 +177,8 @@ void test_matmul() {
 void test_q8_0_matmul() {
     std::cout << "\n--- Q8_0 MatMul ---\n";
 
-    // Simple 2x4 x 4x2 = 2x2 with Q8_0 quantized weights
-    std::vector<int8_t> A = {1, 2, 3, 4, 5, 6, 7, 8};
+    // Simple 2x4 x 4x2 = 2x2 with F32 activations and Q8_0 quantized weights
+    std::vector<float> A = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
     std::vector<int8_t> B = {1, 2, 3, 4, 5, 6, 7, 8};
     std::vector<float> C(4, 0);
 
@@ -200,7 +200,11 @@ void test_q8_0_matmul() {
 
     assert_true(status == ggnpu::Status::OK, "Q8_0 MatMul returns OK");
 
-    // Expected: [[50, 60], [114, 140]]
+    // A (F32) = {{1,2,3,4}, {5,6,7,8}}, B (Q8_0 int8) = {{1,2},{3,4},{5,6},{7,8}}
+    // C[0,0] = 1*1 + 2*3 + 3*5 + 4*7 = 50
+    // C[0,1] = 1*2 + 2*4 + 3*6 + 4*8 = 60
+    // C[1,0] = 5*1 + 6*3 + 7*5 + 8*7 = 114
+    // C[1,1] = 5*2 + 6*4 + 7*6 + 8*8 = 140
     assert_true(std::abs(C[0] - 50.0f) < 0.1f, "Q8_0 MatMul[0,0] = 50");
     assert_true(std::abs(C[1] - 60.0f) < 0.1f, "Q8_0 MatMul[0,1] = 60");
     assert_true(std::abs(C[2] - 114.0f) < 0.1f, "Q8_0 MatMul[1,0] = 114");

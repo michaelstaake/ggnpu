@@ -33,13 +33,13 @@ public:
 
         switch (params.B_type) {
         case GgmlType::Q8_0: {
+            const float* A_f32 = static_cast<const float*>(params.A);
             const int8_t* B_q = static_cast<const int8_t*>(params.B);
-            const int8_t* A_q = static_cast<const int8_t*>(params.A);
             for (int m = 0; m < M; m++) {
                 for (int n = 0; n < N; n++) {
                     float sum = 0.0f;
                     for (int k = 0; k < K; k++) {
-                        sum += static_cast<float>(A_q[m * K + k]) *
+                        sum += A_f32[m * K + k] *
                                static_cast<float>(B_q[k * N + n]);
                     }
                     C[m * N + n] = sum;
@@ -49,7 +49,7 @@ public:
         }
 
         case GgmlType::Q4_0: {
-            const int8_t* A_f32 = static_cast<const int8_t*>(params.A);
+            const float* A_f32 = static_cast<const float*>(params.A);
             const uint8_t* B_q = static_cast<const uint8_t*>(params.B);
             size_t B_block_size = ggml_type_size(GgmlType::Q4_0);
             size_t num_blocks = K / ggml_blck_size(GgmlType::Q4_0);
@@ -74,7 +74,7 @@ public:
                                 nibble = (block.qs[k_in_block / 2] >> 4) & 0x0F;
                             }
                             int8_t bv = q4_0_to_int8(nibble);
-                            sum += static_cast<float>(A_f32[m * K + k]) * static_cast<float>(bv) * d;
+                            sum += A_f32[m * K + k] * static_cast<float>(bv) * d;
                         }
                     }
                     C[m * N + n] = sum;
