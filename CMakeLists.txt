@@ -27,16 +27,52 @@ if(GGNPU_NPU_BACKEND)
     if(XRT_INCLUDE_DIRS AND XRT_LIBRARIES)
         message(STATUS "XRT found: ${XRT_LIBRARIES}")
     else()
-        find_path(XRT_INCLUDE_DIRS xrt.h
-            PATHS /opt/xilinx/include /usr/include
-            PATH_SUFFIXES xrt
-        )
-        find_library(XRT_LIBRARIES xrt_coreutil
-            PATHS /opt/xilinx/lib /usr/lib
-        )
+        # Try XRT setup script first (sets XRT_PREFIX)
+        find_program(XRT_SETUP_SCRIPT setup.sh PATHS /opt/xilinx/xrt)
+        if(XRT_SETUP_SCRIPT)
+            execute_process(
+                COMMAND bash -c "source ${XRT_SETUP_SCRIPT} 2>/dev/null && echo \$XRT_PREFIX"
+                OUTPUT_VARIABLE XRT_PREFIX
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+            )
+            if(XRT_PREFIX)
+                message(STATUS "XRT found via setup.sh: ${XRT_PREFIX}")
+                set(XRT_INCLUDE_DIRS "${XRT_PREFIX}/include")
+                set(XRT_LIB_SEARCH_PATHS "${XRT_PREFIX}/lib" "${XRT_PREFIX}/lib/x86_64-linux-gnu")
+            endif()
+        endif()
+
+        if(NOT XRT_INCLUDE_DIRS)
+            find_path(XRT_INCLUDE_DIRS xrt.h
+                PATHS
+                    /opt/xilinx/include
+                    /opt/xilinx/include/xrt
+                    /usr/include
+                    /usr/include/xrt
+                    ${XRT_LIB_SEARCH_PATHS}
+                PATH_SUFFIXES
+                    xrt
+            )
+        endif()
+
+        if(NOT XRT_LIBRARIES)
+            find_library(XRT_LIBRARIES NAMES xrt_core xrt_coreutil xilinxopencl
+                PATHS
+                    /opt/xilinx/lib
+                    /opt/xilinx/lib/x86_64-linux-gnu
+                    /usr/lib
+                    /usr/lib/x86_64-linux-gnu
+                    ${XRT_LIB_SEARCH_PATHS}
+            )
+        endif()
+
         if(NOT XRT_INCLUDE_DIRS OR NOT XRT_LIBRARIES)
             message(WARNING "XRT not found. NPU backend will be disabled. Set GGNPU_NPU_BACKEND=OFF.")
+            message(WARNING "  XRT headers: ${XRT_INCLUDE_DIRS}")
+            message(WARNING "  XRT libs: ${XRT_LIBRARIES}")
             set(GGNPU_NPU_BACKEND OFF)
+        else()
+            message(STATUS "XRT found: ${XRT_LIBRARIES} (headers: ${XRT_INCLUDE_DIRS})")
         endif()
     endif()
 endif()
@@ -76,8 +112,11 @@ target_link_libraries(ggnpu_lib PRIVATE Threads::Threads)
 
 if(GGNPU_NPU_BACKEND)
     target_include_directories(ggnpu_lib PUBLIC ${XRT_INCLUDE_DIRS})
-    target_link_libraries(ggnpu_lib PRIVATE ${XRT_LIBRARIES})
+    target_link_libraries(ggnpu_lib PRIVATE ${XRT_LIBRARIES} dl pthread rt)
     target_compile_definitions(ggnpu_lib PRIVATE GGNPU_HAS_NPU_BACKEND=1)
+    if(XRT_PREFIX)
+        link_directories(${XRT_PREFIX}/lib ${XRT_PREFIX}/lib/x86_64-linux-gnu)
+    endif()
 endif()
 
 if(GGNPU_TEST_CPU)
