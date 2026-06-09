@@ -139,7 +139,7 @@ cmake .. -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
 #   CPU ref backend:    OFF
 
 # Build
-make -j$(nproc)
+make -j2
 ```
 
 ## Step 8: Run Benchmark

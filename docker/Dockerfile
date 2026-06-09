@@ -15,7 +15,7 @@ COPY . .
 
 RUN mkdir -p build && cd build && \
     cmake .. -DGGNPU_BUILD_TESTS=ON && \
-    make -j$(nproc) && \
+    make -j2 && \
     ctest --output-on-failure
 
 RUN cp ggnpu /usr/local/bin/
