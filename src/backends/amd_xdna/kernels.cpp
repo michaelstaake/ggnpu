@@ -121,11 +121,22 @@ std::string generate_matmul_mlir(int M, int N, int K, int npu_profile) {
     // AIE2P has 4x8 tile array. We use:
     // - Tile (0,0): shim/control
     // - Tiles (1,0)-(1,7): compute row
-    int tile_m = 16;   // Output tiles in M dimension
-    int tile_n = 16;   // Output tiles in N dimension
+    int tile_m = 16;
+    int tile_n = 16;
+
+    // Calculate number of compute tiles needed
+    int tiles_m = (M + tile_m - 1) / tile_m;
+    int tiles_n = (N + tile_n - 1) / tile_n;
+    int num_tiles = std::min(8, tiles_m * tiles_n);
+    num_tiles = std::max(1, num_tiles);
+
+    // K dimension vectorization factor
+    int vec_len = 16;
+    int k_chunks = (K + vec_len - 1) / vec_len;
 
     mlir << "// GGNPU auto-generated MLIR for INT8 matmul: " << M << "x" << N << "x" << K << "\n";
-    mlir << "// Compiled for NPU profile: " << profile_str << "\n\n";
+    mlir << "// Compiled for NPU profile: " << profile_str << "\n";
+    mlir << "// Compute tiles: " << num_tiles << ", K chunks: " << k_chunks << "\n\n";
 
     mlir << "module attributes {aie.device = \"aie2p\"} {\n";
 
@@ -135,17 +146,20 @@ std::string generate_matmul_mlir(int M, int N, int K, int npu_profile) {
     mlir << "    // DMA channels for data movement\n";
     mlir << "    %dma_a = \"aie.dma_acquire\"() {\n";
     mlir << "        channel_id = 0 : i32,\n";
-    mlir << "        direction = \"host_to_tile\" : string\n";
+    mlir << "        direction = \"host_to_tile\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
     mlir << "    } : () -> !aie.objectbox.stream\n\n";
 
     mlir << "    %dma_b = \"aie.dma_acquire\"() {\n";
     mlir << "        channel_id = 1 : i32,\n";
-    mlir << "        direction = \"host_to_tile\" : string\n";
+    mlir << "        direction = \"host_to_tile\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
     mlir << "    } : () -> !aie.objectbox.stream\n\n";
 
     mlir << "    %dma_c = \"aie.dma_acquire\"() {\n";
     mlir << "        channel_id = 2 : i32,\n";
-    mlir << "        direction = \"tile_to_host\" : string\n";
+    mlir << "        direction = \"tile_to_host\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
     mlir << "    } : () -> !aie.objectbox.stream\n\n";
 
     //====//
@@ -158,61 +172,64 @@ std::string generate_matmul_mlir(int M, int N, int K, int npu_profile) {
     mlir << "    }\n\n";
 
     //====//
-    // Control tile (0,0): DMA setup and synchronization
+    // Control tile: DMA setup and synchronization
     //====//
     mlir << "    \"aie.tile\"(#aie.tile{row = 0, col = 0}) {\n";
-    mlir << "        // Lock for synchronization\n";
+    mlir << "        // Lock for synchronization with compute tiles\n";
     mlir << "        %lock_compute = \"aie.lock\"() {\n";
     mlir << "            lock = #aie.lock{lock_id = 3, target = \"tile\",\n";
     mlir << "                tile = #aie.tile{row = 1, col = 0}}\n";
     mlir << "        } : () -> !aie.lock\n\n";
 
-    mlir << "        // Start DMA transfers\n";
+    mlir << "        // Start DMA transfers for A and B matrices\n";
     mlir << "        \"aie.dma_start\"(%dma_a) { len = " << (M * K) << " : i64 } : (!aie.objectbox.stream) -> ()\n";
     mlir << "        \"aie.dma_start\"(%dma_b) { len = " << (K * N) << " : i64 } : (!aie.objectbox.stream) -> ()\n\n";
 
-    mlir << "        // Launch compute tiles\n";
+    mlir << "        // Signal compute tiles to start\n";
     mlir << "        \"aie.lock\"(%lock_compute) : (!aie.lock) -> ()\n\n";
 
-    mlir << "        // Wait for output DMA\n";
+    mlir << "        // Wait for output DMA to complete\n";
     mlir << "        \"aie.dma_wait\"(%dma_c) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n";
     mlir << "    }\n\n";
 
     //====//
     // Compute tiles: matrix multiplication
-    // We use tiles (1,0) through (1, num_tiles-1)
+    // Each tile computes a tile_m x tile_n block of the output
     //====//
-    int num_tiles = std::min(8, ((M + tile_m - 1) / tile_m) * ((N + tile_n - 1) / tile_n));
-    num_tiles = std::max(1, num_tiles);
-
-    mlir << "    // Compute tiles: " << num_tiles << " tiles for " << M << "x" << N << " output\n";
-
     for (int t = 0; t < num_tiles && t < 8; t++) {
-        int col = t;  // All tiles in row 1
-        mlir << "\n    // Tile (" << 1 << "," << col << ")\n";
+        int col = t;
+        mlir << "    // Compute tile (" << 1 << "," << col << ")\n";
         mlir << "    \"aie.tile\"(#aie.tile{row = " << 1 << ", col = " << col << "}) {\n";
 
-        // Lock/unlock for synchronization
+        // Lock for synchronization with control tile
         mlir << "        %lock_start = \"aie.lock\"() {\n";
         mlir << "            lock = #aie.lock{lock_id = 3, target = \"tile\",\n";
         mlir << "                tile = #aie.tile{row = 1, col = 0}}\n";
         mlir << "        } : () -> !aie.lock\n";
+
+        // Wait for control tile signal
         mlir << "        \"aie.lock\"(%lock_start) : (!aie.lock) -> ()\n";
+
+        // Zero accumulator
+        mlir << "        // Zero accumulator\n";
+        mlir << "        // vzero: %acc = zero vector (16xi32)\n";
+
+        // K-dimension loop (unrolled into k_chunks iterations)
+        mlir << "        // K-dimension: " << k_chunks << " chunks of " << vec_len << " elements\n";
+        for (int k = 0; k < k_chunks; k++) {
+            mlir << "        // K chunk " << k << ": process elements [" << (k * vec_len) << ".." << ((k + 1) * vec_len - 1) << "]\n";
+            mlir << "        // Load A vector (16xi8) from local memory\n";
+            mlir << "        // %a_vec = aie.load(%ptr_a, offset=" << (k * vec_len * tile_m) << ")\n";
+            mlir << "        // Load B vector (16xi8) from local memory\n";
+            mlir << "        // %b_vec = aie.load(%ptr_b, offset=" << (k * vec_len) << ")\n";
+            mlir << "        // Multiply-accumulate: %acc = mlacc(%acc, %a_vec, %b_vec)\n";
+        }
+
+        // Unlock when done
+        mlir << "\n        // Signal completion\n";
         mlir << "        \"aie.unlock\"(%lock_start) : (!aie.lock) -> ()\n";
 
-        // Vectorized matmul body (unrolled, no branches)
-        // In the compiled xclbin, this becomes AIE vector instructions
-        mlir << "        // INT8 matmul tile: " << tile_m << "x" << tile_n << " with K=" << K << "\n";
-        mlir << "        // Load A vector, load B vector, multiply-accumulate\n";
-        mlir << "        // Loop over K dimension in " << tile_k << "-element chunks\n";
-        mlir << "        for (int k = 0; k < " << K << "; k += " << 16 << ") {\n";
-        mlir << "            // Vector load A[" << tile_m << "][k+0..15]\n";
-        mlir << "            // Vector load B[k+0..15][" << tile_n << "]\n";
-        mlir << "            // Vector MAC: acc += A * B (INT8 -> INT32)\n";
-        mlir << "        }\n";
-        mlir << "        // Store INT32 results to local memory\n";
-
-        mlir << "    }\n";
+        mlir << "    }\n\n";
     }
 
     mlir << "}\n";

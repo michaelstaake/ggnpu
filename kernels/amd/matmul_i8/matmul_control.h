@@ -1,178 +1,180 @@
-// Control code for INT8 matrix multiplication kernel
-// Runs on NPU internal microcontroller (core 0)
-// Handles: DMA setup, buffer management, kernel launch
+// GGNPU Control Code for INT8 Matrix Multiplication
+// Runs on control tile (tile 0,0) - handles DMA and synchronization
 //
-// This is the CONTROL LAYER (Guardrail #4)
-// It NEVER contains tensor math - that goes in the tile code.
+// Architecture:
+//   - Control tile manages DMA transfers and compute tile launch
+//   - Sets up kernel arguments via shared memory
+//   - Coordinates data movement and computation
+//
+// Guardrail compliance:
+//   1. Two-layer: DMA setup here, tensor math in matmul_tile.h
+//   2. No branches in compute path: DMA lengths set once, launched sequentially
+//
+// Usage:
+//   1. Control tile receives kernel arguments from host via MMIO
+//   2. Sets up DMA transfers for A and B matrices
+//   3. Launches compute tiles via lock signaling
+//   4. Waits for compute completion
+//   5. Initiates DMA to read back C matrix
 
-#ifndef GGNPU_MATMUL_CONTROL_H
-#define GGNPU_MATMUL_CONTROL_H
+#pragma once
 
-#include <cstdint>
-#include <cstring>
+//====//
+// Kernel argument structure (passed via shared memory from host)
+//====//
+struct MatmulKernelArgs {
+    // Input pointers (DDR addresses)
+    uint64_t ptr_a;   // A matrix: M x K (INT8, row-major)
+    uint64_t ptr_b;   // B matrix: K x N (INT8, row-major)
+    uint64_t ptr_c;   // C matrix: M x N (INT32, row-major, accumulator)
 
-namespace ggnpu {
-namespace kernels {
-namespace control {
-
-// Kernel parameters passed from host via XRT kernel arguments
-struct MatMulParams {
-    // Buffer pointers (physical addresses for DMA)
-    uint64_t a_addr;  // A matrix: M x K INT8
-    uint64_t b_addr;  // B matrix: K x N INT8
-    uint64_t c_addr;  // C matrix: M x N INT32 accumulator
-
-    // Matrix dimensions
-    uint32_t M;  // Output rows
-    uint32_t N;  // Output columns
-    uint32_t K;  // Reduction dimension
+    // Dimensions
+    uint32_t M;       // Output rows
+    uint32_t N;       // Output columns
+    uint32_t K;       // Reduction dimension
 
     // Tile configuration
-    uint32_t tile_m;  // Tile size in M (typically 16)
-    uint32_t tile_n;  // Tile size in N (typically 16)
-    uint32_t tile_k;  // Tile size in K (vector width, typically 16)
+    uint32_t tile_col;   // This tile's column (0-7)
+    uint32_t tile_row;   // This tile's row (always 1 for compute)
 
-    // Scale factors for dequantization (optional, nullptr for raw INT8)
-    uint64_t scales_addr;  // Per-row scales, M floats
-    uint32_t use_scales;   // 0 = no scales, 1 = use scales
+    // Computed
+    uint32_t k_chunks;  // K / VEC_LEN (rounded up)
+    uint32_t padding;   // Alignment padding
 };
 
-// DMA buffer descriptor for XRT
-struct DmaBuffer {
-    uint64_t physical_addr;  // Physical address for DMA
-    void* virtual_addr;      // Virtual address for host access
-    size_t size;
-};
+//====//
+// DMA setup for A matrix transfer (host -> tile)
+// A matrix: M x K INT8, row-major layout
+//====//
+__attribute__((noinline))
+void setup_dma_a(const MatmulKernelArgs* args) {
+    // DMA channel 0: A matrix from host to tile (0,0)
+    // Length: M * K bytes
+    uint64_t len_a = static_cast<uint64_t>(args->M) * static_cast<uint64_t>(args->K);
 
-// Initialize DMA buffers for matrix multiplication
-// Returns true on success, false if buffers couldn't be allocated
-inline bool init_dma_buffers(
-    DmaBuffer& buf_a,
-    DmaBuffer& buf_b,
-    DmaBuffer& buf_c,
-    int M, int N, int K,
-    bool use_scales = false
-) {
-    // Calculate buffer sizes
-    size_t size_a = M * K;  // INT8: 1 byte per element
-    size_t size_b = K * N;  // INT8: 1 byte per element
-    size_t size_c = M * N * sizeof(int32_t);  // INT32: 4 bytes per element
-
-    // Note: In production, these would be XRT buffer objects (xrt::bo)
-    // allocated with xrt::bo::flags::host for host-accessible memory
-    // or xrt::bo::flags::device for device-only memory
-
-    // For now, return false to indicate buffers need to be allocated
-    // by the XRT backend using proper XRT APIs
-    (void)size_a;
-    (void)size_b;
-    (void)size_c;
-    return false;
+    // In actual AIE code, this would call:
+    // aie::dma::start(channel_0, args->ptr_a, len_a)
+    // For now, document the parameters:
+    //   - Channel: 0 (A matrix)
+    //   - Source: args->ptr_a (host DDR)
+    //   - Destination: tile (0,0) shim buffer
+    //   - Length: len_a bytes
+    //   - Direction: host_to_tile
+    (void)len_a;
 }
 
-// Set up DMA transfers for matrix multiplication
-// This function runs on the NPU microcontroller
-// It configures the DMA engines to stream data between DDR and tile local memory
-inline void setup_dma_transfers(
-    const MatMulParams& params,
-    const DmaBuffer& buf_a,
-    const DmaBuffer& buf_b,
-    const DmaBuffer& buf_c
-) {
-    // Configure DMA engine 0: A matrix (host -> tile)
-    // In production: use IRON API (XAie_TxnOpcode) to set up DMA
-    // XAie_DmaSetConfig(..., buf_a.physical_addr, params.M * params.K, ...);
+//====//
+// DMA setup for B matrix transfer (host -> tile)
+// B matrix: K x N INT8, row-major layout
+//====//
+__attribute__((noinline))
+void setup_dma_b(const MatmulKernelArgs* args) {
+    // DMA channel 1: B matrix from host to tile (0,0)
+    // Length: K * N bytes
+    uint64_t len_b = static_cast<uint64_t>(args->K) * static_cast<uint64_t>(args->N);
 
-    // Configure DMA engine 1: B matrix (host -> tile)
-    // XAie_DmaSetConfig(..., buf_b.physical_addr, params.K * params.N, ...);
-
-    // Configure DMA engine 2: C matrix (tile -> host)
-    // XAie_DmaSetConfig(..., buf_c.physical_addr, params.M * params.N * 4, ...);
-
-    // Start DMA transfers
-    // XAie_DmaStart(..., 0);  // Start A transfer
-    // XAie_DmaStart(..., 1);  // Start B transfer
-
-    // Synchronize with compute tiles
-    // XAie_LockSet(..., TILE_ROW, TILE_COL, COMPUTE_LOCK_ID);
-
-    (void)params;
-    (void)buf_a;
-    (void)buf_b;
-    (void)buf_c;
+    // In actual AIE code:
+    // aie::dma::start(channel_1, args->ptr_b, len_b)
+    (void)len_b;
 }
 
-// Launch compute tiles for matrix multiplication
-// Signals the AIE compute tiles to begin execution
-inline void launch_compute_tiles(
-    const MatMulParams& params,
-    int num_tiles
-) {
-    // For each compute tile, set the data pointers and launch
-    for (int tile = 0; tile < num_tiles; tile++) {
-        // Set kernel arguments for this tile
-        // In production: use XRT kernel arguments or tile register writes
+//====//
+// DMA setup for C matrix transfer (tile -> host)
+// C matrix: M x N INT32, row-major layout
+//====//
+__attribute__((noinline))
+void setup_dma_c(const MatmulKernelArgs* args) {
+    // DMA channel 2: C matrix from tile (0,0) to host
+    // Length: M * N * 4 bytes (INT32)
+    uint64_t len_c = static_cast<uint64_t>(args->M) * static_cast<uint64_t>(args->N) * 4;
 
-        // Launch the tile
-        // XAie_LockSet(..., 1 + tile, 0, COMPUTE_LOCK_ID);
-
-        // The tile will:
-        // 1. Wait for COMPUTE_LOCK_ID (acquired by control code)
-        // 2. Load A and B vectors from local memory
-        // 3. Perform vectorized multiply-accumulate
-        // 4. Store results to local memory
-        // 5. Release COMPUTE_LOCK_ID (signals completion)
-    }
-
-    (void)params;
-    (void)num_tiles;
+    // In actual AIE code:
+    // aie::dma::start(channel_2, tile_local_c_buffer, len_c)
+    // Destination: args->ptr_c (host DDR)
+    (void)len_c;
 }
 
-// Wait for all DMA transfers and compute tiles to complete
-inline void wait_for_completion() {
-    // Wait for DMA engine 2 (C matrix output) to complete
-    // In production: XAie_DmaWait(..., 2, 1);
-
-    // Wait for all compute tiles to finish
-    // In production: poll COMPUTE_LOCK_ID on each tile
-
-    // Synchronize host with NPU
-    // xrt::run::wait() or equivalent
+//====//
+// Synchronization: signal compute tiles to start
+// Uses lock mechanism: control tile releases lock 3
+// Compute tiles are waiting on lock 3
+//====//
+__attribute__((noinline))
+void signal_compute_start() {
+    // Release lock 3 to signal compute tiles (1,0) through (1,7)
+    // In actual AIE code:
+    // aie::lock::release(lock_3)
 }
 
-// Execute a complete matrix multiplication on the NPU
-// This is the main entry point called from the XRT backend
-inline bool execute_matmul(
-    const MatMulParams& params,
-    int num_compute_tiles = 4
-) {
-    // 1. Set up DMA buffers (should be done before this call)
-    // DmaBuffer buf_a, buf_b, buf_c;
-    // if (!init_dma_buffers(buf_a, buf_b, buf_c, params.M, params.N, params.K)) {
-    //     return false;
-    // }
-
-    // 2. Configure and start DMA transfers
-    // setup_dma_transfers(params, buf_a, buf_b, buf_c);
-
-    // 3. Launch compute tiles
-    // launch_compute_tiles(params, num_compute_tiles);
-
-    // 4. Wait for completion
-    // wait_for_completion();
-
-    // 5. Apply scales if needed (on host or tile)
-    if (params.use_scales && params.scales_addr) {
-        // Apply per-row scales: C[i][j] = C[i][j] * scales[i]
-        // This can be done on the host after DMA transfer back
-        // Or on the tile as a final step
-    }
-
-    return true;
+//====//
+// Synchronization: wait for compute tiles to complete
+// Compute tiles release their completion lock when done
+//====//
+__attribute__((noinline))
+void wait_compute_complete() {
+    // Wait for compute tiles to signal completion
+    // In actual AIE code:
+    // aie::lock::acquire(lock_completion)
 }
 
-} // namespace control
-} // namespace kernels
-} // namespace ggnpu
+//====//
+// Launch DMA transfers and compute
+// Main control flow for matrix multiplication
+//====//
+__attribute__((noinline))
+void launch_matmul(const MatmulKernelArgs* args) {
+    // Step 1: Set up DMA transfers
+    setup_dma_a(args);
+    setup_dma_b(args);
 
-#endif // GGNPU_MATMUL_CONTROL_H
+    // Step 2: Start DMA (A and B transfer in parallel)
+    // aie::dma::start(channel_0, ...)
+    // aie::dma::start(channel_1, ...)
+
+    // Step 3: Signal compute tiles to start
+    signal_compute_start();
+
+    // Step 4: Wait for compute to complete
+    wait_compute_complete();
+
+    // Step 5: Start DMA to read back C matrix
+    setup_dma_c(args);
+    // aie::dma::start(channel_2, ...)
+
+    // Step 6: Wait for DMA completion
+    // aie::dma::wait(channel_2)
+}
+
+//====//
+// Control tile main entry point
+// Called by Peano runtime on control tile (0,0)
+//
+// Kernel arguments are passed via MMIO registers or
+// shared memory location known to both host and tile
+//====//
+__attribute__((noinline))
+void matmul_control_main(uintptr_t args_ptr) {
+    const MatmulKernelArgs* args = reinterpret_cast<const MatmulKernelArgs*>(args_ptr);
+
+    // Compute K chunks from K dimension
+    // VEC_LEN = 16 (defined in matmul_tile.h)
+    constexpr int VEC_LEN = 16;
+    uint32_t k_chunks = (args->K + VEC_LEN - 1) / VEC_LEN;
+
+    // Store k_chunks in args for compute tiles to read
+    const MatmulKernelArgs mutable_args = {
+        .ptr_a = args->ptr_a,
+        .ptr_b = args->ptr_b,
+        .ptr_c = args->ptr_c,
+        .M = args->M,
+        .N = args->N,
+        .K = args->K,
+        .tile_col = args->tile_col,
+        .tile_row = args->tile_row,
+        .k_chunks = k_chunks,
+        .padding = 0
+    };
+
+    // Launch the matmul kernel
+    launch_matmul(&mutable_args);
+}
