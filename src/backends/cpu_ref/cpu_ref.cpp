@@ -175,36 +175,56 @@ public:
     }
 
     Status flash_attn(const AttnParams& params) override {
-        // Simplified attention: QK^T / sqrt(d) + V
+        // Proper decomposed flash attention v1:
+        //   attn = softmax(Q @ K^T / sqrt(d)) @ V
+        // Q: [n_head, head_dim] (single query token)
+        // K: [n_head, ctx_len, head_dim]
+        // V: [n_head, ctx_len, head_dim]
+        // Output: [n_head, head_dim]
         if (!params.Q || !params.K || !params.V || !params.output) return Status::INVALID_PARAM;
 
-        int bs = params.batch_size;
         int nh = params.n_head;
         int hd = params.head_dim;
         int64_t cl = params.ctx_len;
 
-        for (int b = 0; b < bs; b++) {
-            for (int h = 0; h < nh; h++) {
-                // Q: [bs, nh, 1, hd]
-                // K: [bs, nh, cl, hd]
-                // V: [bs, nh, cl, hd]
-                // Output: [bs, nh, 1, hd]
+        float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
-                float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-                float* out = params.output + b * nh * hd + h * hd;
+        for (int h = 0; h < nh; h++) {
+            const float* Qh = params.Q + h * hd;
+            const float* Kh = params.K + h * cl * hd;
+            const float* Vh = params.V + h * cl * hd;
+            float* outh = params.output + h * hd;
 
-                // Compute attention weights (simplified: uniform)
+            // Compute attention weights: scores[j] = Q @ K[j] * scale
+            std::vector<float> scores(cl, 0.0f);
+            for (int64_t j = 0; j < cl; j++) {
+                float sum = 0.0f;
                 for (int d = 0; d < hd; d++) {
-                    float sum = 0.0f;
-                    for (int ki = 0; ki < cl; ki++) {
-                        float qk = 0.0f;
-                        const float* q = params.Q + b * nh * hd + h * hd + d;
-                        const float* k_ptr = params.K + b * nh * cl * hd + h * cl * hd + ki * hd + d;
-                        qk = static_cast<float>(*q) * static_cast<float>(*k_ptr) * scale;
-                        float attn = std::exp(qk);
-                        sum += attn * params.V[b * nh * cl * hd + h * cl * hd + ki * hd + d];
-                    }
-                    out[d] = sum;
+                    sum += Qh[d] * Kh[j * hd + d];
+                }
+                scores[j] = sum * scale;
+            }
+
+            // Softmax over scores
+            float max_val = -INFINITY;
+            for (int64_t j = 0; j < cl; j++) {
+                if (scores[j] > max_val) max_val = scores[j];
+            }
+            float sum = 0.0f;
+            std::vector<float> weights(cl);
+            for (int64_t j = 0; j < cl; j++) {
+                weights[j] = std::exp(scores[j] - max_val);
+                sum += weights[j];
+            }
+            for (int64_t j = 0; j < cl; j++) {
+                weights[j] /= sum;
+            }
+
+            // Weighted V sum: out = sum_j weights[j] * V[j]
+            std::fill(outh, outh + hd, 0.0f);
+            for (int64_t j = 0; j < cl; j++) {
+                for (int d = 0; d < hd; d++) {
+                    outh[d] += weights[j] * Vh[j * hd + d];
                 }
             }
         }

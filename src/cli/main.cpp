@@ -626,42 +626,43 @@ int main(int argc, char* argv[]) {
                                          k_rope.data(), v_proj.data(),
                                          num_kv_heads, head_dim);
 
-            // Attention: compute QK^T / sqrt(d) then apply to V
-            float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            // Attention: compute softmax(QK^T / sqrt(d)) @ V via NPU
             int64_t ctx_len = pos + n_tokens;
+            int64_t num_kv_heads = hparams.attention_head_count_kv;
+            int64_t qkv_groups = hparams.attention_head_count / num_kv_heads;
 
-            // For each query position
-            std::vector<float> attn_scores(static_cast<size_t>(n_tokens * ctx_len), 0.0f);
-            for (int i = 0; i < n_tokens; i++) {
+            // Expand K/V from num_kv_heads to num_heads (GQA support)
+            // Each KV head is repeated qkv_groups times for the corresponding query heads
+            std::vector<float> k_expanded(static_cast<size_t>(hparams.attention_head_count * ctx_len * head_dim));
+            std::vector<float> v_expanded(static_cast<size_t>(hparams.attention_head_count * ctx_len * head_dim));
+
+            for (int64_t h = 0; h < static_cast<int64_t>(hparams.attention_head_count); h++) {
+                int64_t kv_h = h / qkv_groups;
+                float* kh = k_expanded.data() + h * ctx_len * head_dim;
+                float* vh = v_expanded.data() + h * ctx_len * head_dim;
                 for (int64_t j = 0; j < ctx_len; j++) {
-                    float sum = 0.0f;
-                    for (int d = 0; d < head_dim; d++) {
-                        sum += q_rope[i * head_dim + d] *
-                               model.kv_cache().key_buffer(layer, j)[d];
-                    }
-                    attn_scores[i * ctx_len + j] = sum * scale;
+                    const float* kj = model.kv_cache().key_buffer(layer, j) + kv_h * head_dim;
+                    const float* vj = model.kv_cache().value_buffer(layer, j) + kv_h * head_dim;
+                    if (kj) std::memcpy(kh + j * head_dim, kj, head_dim * sizeof(float));
+                    if (vj) std::memcpy(vh + j * head_dim, vj, head_dim * sizeof(float));
                 }
             }
 
-            // Softmax + weighted V
             std::vector<float> attn_out(static_cast<size_t>(n_tokens) * head_dim, 0.0f);
-            std::vector<float> weights(static_cast<size_t>(n_tokens * ctx_len));
 
-            SoftmaxParams softmax_params;
-            softmax_params.input = attn_scores.data();
-            softmax_params.output = weights.data();
-            softmax_params.rows = n_tokens;
-            softmax_params.cols = static_cast<int>(ctx_len);
-            backend->softmax(softmax_params);
+            for (int64_t i = 0; i < n_tokens; i++) {
+                AttnParams fa_params;
+                fa_params.Q = q_rope.data() + static_cast<int>(i) * head_dim;
+                fa_params.K = k_expanded.data();
+                fa_params.V = v_expanded.data();
+                fa_params.output = attn_out.data() + static_cast<int>(i) * head_dim;
+                fa_params.batch_size = 1;
+                fa_params.n_head = static_cast<int>(hparams.attention_head_count);
+                fa_params.head_dim = head_dim;
+                fa_params.ctx_len = ctx_len;
+                fa_params.freq_factors = nullptr;
 
-            for (int i = 0; i < n_tokens; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    float v_sum = 0.0f;
-                    for (int64_t j = 0; j < ctx_len; j++) {
-                        v_sum += weights[i * ctx_len + j] * model.kv_cache().value_buffer(layer, j)[d];
-                    }
-                    attn_out[i * head_dim + d] = v_sum;
-                }
+                backend->flash_attn(fa_params);
             }
 
             // Attention output projection
