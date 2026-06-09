@@ -1,7 +1,5 @@
 # RMS Normalization Kernel for AMD XDNA2 (AIE2P)
 
-RMS normalization kernel for GGNPU NPU inference engine.
-
 ## Operation
 
 RMSNorm: `y[i] = x[i] / sqrt(mean(x^2) + eps)`
@@ -30,6 +28,7 @@ aiecc.py --target=aie2p --npu-profile=6 \
 - **Control tile (0,0)**: DMA setup, sum-of-squares reduction, normalization factor computation
 - **Compute tile (1,0)**: Element-wise vector scaling `y = x * norm_inv`
 - **DMA channels**: 0 (input), 1 (output)
+- **Lock**: 0 (control -> compute)
 
 ## Guardrail Compliance
 

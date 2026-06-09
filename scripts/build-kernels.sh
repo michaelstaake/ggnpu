@@ -1,49 +1,57 @@
 #!/bin/bash
 # Build NPU kernels for GGNPU
-# Requires mlir-aie and Peano toolchains
+# Compiles MLIR kernel sources into .xclbin files for the AMD NPU
 #
 # Usage:
 #   ./scripts/build-kernels.sh              # Build with available tools
 #   AIE_HOME=/path/to/mlir-aie ./scripts/build-kernels.sh
 #   PEANO_HOME=/path/to/peano ./scripts/build-kernels.sh
+#   ./scripts/build-kernels.sh npu6         # Build only for npu6 (Krackan)
+#   ./scripts/build-kernels.sh matmul       # Build only matmul kernel
+#
+# Kernels built:
+#   - matmul: INT8 matrix multiplication (core bottleneck)
+#   - rmsnorm: RMS normalization
+#   - rope: Rotary positional embeddings
+#   - softmax: Softmax activation
+#   - silu: SiLU/Swish activation
+#   - flash_attn: FlashAttention v1 (decomposed)
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+KERNELS_DIR="$SCRIPT_DIR/kernels/amd"
 CACHE_DIR="${GGNPU_CACHE_DIR:-$HOME/.cache/ggnpu}"
 XCLBIN_DIR="$CACHE_DIR/xclbin"
-KERNELS_SRC="$PWD/kernels/amd/matmul_i8"
 
-# NPU profiles (Krackan = npu6, Strix Point = npu4/npu5)
-NPU_PROFILES=("4" "5" "6")
+# NPU profiles: 4=Strix Point, 5=Strix Point rev, 6=Krackan
+ALL_PROFILES=("4" "5" "6")
 
-# Common matmul shapes for Llama-family models
-# Format: MxNxK (output MxN, reduction K)
-SHAPES=(
-    "256x256x256"
-    "512x512x512"
-    "1024x1024x1024"
-    "2048x2048x2048"
-    "3072x3072x3072"
-    "4096x4096x4096"
-    "8192x8192x8192"
-)
-
-# Additional asymmetric shapes (FFN down projections)
-ASYM_SHAPES=(
-    "3072x8192x8192"
-    "8192x3072x8192"
-    "2048x4096x4096"
-    "4096x2048x4096"
-)
+# Default: build all profiles unless specified
+if [ $# -ge 1 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
+    PROFILES=("$1")
+elif [ $# -ge 1 ]; then
+    # Kernel name filter (e.g., "matmul")
+    KERNEL_FILTER="$1"
+    PROFILES=("${ALL_PROFILES[@]}")
+else
+    PROFILES=("${ALL_PROFILES[@]}")
+    KERNEL_FILTER=""
+fi
 
 mkdir -p "$XCLBIN_DIR"
 
 echo "=== GGNPU NPU Kernel Builder ==="
-echo "Cache dir: $CACHE_DIR"
+echo "Kernels source: $KERNELS_DIR"
+echo "Output directory: $XCLBIN_DIR"
+echo "NPU profiles: ${PROFILES[*]}"
+if [ -n "${KERNEL_FILTER:-}" ]; then
+    echo "Kernel filter: $KERNEL_FILTER"
+fi
 echo ""
 
 #====//
-# Check for required tools
+# Check for aiecc.py
 #====//
 AIECC_FOUND=false
 AIECC_PATH=""
@@ -52,195 +60,15 @@ if [ -n "${AIE_HOME:-}" ]; then
     if [ -f "$AIE_HOME/bin/aiecc.py" ]; then
         AIECC_FOUND=true
         AIECC_PATH="$AIE_HOME/bin/aiecc.py"
-        echo "  mlir-aie: found at $AIECC_PATH"
     else
-        echo "  WARNING: AIE_HOME=$AIE_HOME but aiecc.py not found"
+        echo "ERROR: AIE_HOME=$AIE_HOME but aiecc.py not found"
+        exit 1
     fi
+elif command -v aiecc.py >/dev/null 2>&1; then
+    AIECC_FOUND=true
+    AIECC_PATH="$(command -v aiecc.py)"
 else
-    if command -v aiecc.py >/dev/null 2>&1; then
-        AIECC_FOUND=true
-        AIECC_PATH="$(command -v aiecc.py)"
-        echo "  mlir-aie: found at $AIECC_PATH"
-    else
-        echo "  WARNING: mlir-aie (aiecc.py) not found"
-        echo "  Install mlir-aie or set AIE_HOME"
-        echo "  https://github.com/Xilinx/mlir-aie"
-    fi
-fi
-
-PEANO_FOUND=false
-if [ -n "${PEANO_HOME:-}" ]; then
-    if [ -f "$PEANO_HOME/bin/aie2p-none-unknown-elf-g++" ]; then
-        PEANO_FOUND=true
-        echo "  Peano: found at $PEANO_HOME"
-    else
-        echo "  WARNING: PEANO_HOME=$PEANO_HOME but aie2p-g++ not found"
-    fi
-elif command -v aie2p-none-unknown-elf-g++ >/dev/null 2>&1; then
-    PEANO_FOUND=true
-    echo "  Peano: found ($(command -v aie2p-none-unknown-elf-g++))"
-else
-    echo "  WARNING: Peano (aie2p-g++) not found"
-    echo "  Install Peano or set PEANO_HOME"
-    echo "  https://github.com/Xilinx/peano"
-fi
-
-echo ""
-
-#====//
-# Generate MLIR source for a given shape
-#====//
-generate_mlir() {
-    local M="$1"
-    local N="$2"
-    local K="$3"
-    local profile="$4"
-    local output_file="$5"
-
-    local tile_m=16
-    local tile_n=16
-    local vec_len=16
-
-    # Calculate number of compute tiles
-    local tiles_m=$(( (M + tile_m - 1) / tile_m ))
-    local tiles_n=$(( (N + tile_n - 1) / tile_n ))
-    local num_tiles=$(( tiles_m * tiles_n ))
-    if [ "$num_tiles" -gt 8 ]; then
-        num_tiles=8
-    fi
-    if [ "$num_tiles" -lt 1 ]; then
-        num_tiles=1
-    fi
-
-    # Calculate K chunks
-    local k_chunks=$(( (K + vec_len - 1) / vec_len ))
-
-    {
-        echo "// GGNPU auto-generated MLIR for INT8 matmul: ${M}x${N}x${K}"
-        echo "// NPU profile: npu${profile}"
-        echo "// Compute tiles: ${num_tiles}, K chunks: ${k_chunks}"
-        echo ""
-        echo 'module attributes {aie.device = "aie2p"} {'
-        echo ""
-        echo "    // DMA channels for data movement"
-        echo '    %dma_a = "aie.dma_acquire"() {'
-        echo "        channel_id = 0 : i32,"
-        echo '        direction = "host_to_tile" : string,'
-        echo '        tile = #aie.tile{row = 0, col = 0}'
-        echo "    } : () -> !aie.objectbox.stream"
-        echo ""
-        echo '    %dma_b = "aie.dma_acquire"() {'
-        echo "        channel_id = 1 : i32,"
-        echo '        direction = "host_to_tile" : string,'
-        echo '        tile = #aie.tile{row = 0, col = 0}'
-        echo "    } : () -> !aie.objectbox.stream"
-        echo ""
-        echo '    %dma_c = "aie.dma_acquire"() {'
-        echo "        channel_id = 2 : i32,"
-        echo '        direction = "tile_to_host" : string,'
-        echo '        tile = #aie.tile{row = 0, col = 0}'
-        echo "    } : () -> !aie.objectbox.stream"
-        echo ""
-        echo "    // Shim tile (0,0): DMA ports"
-        echo '    "aie.shimtile"(#aie.tile{row = 0, col = 0}) {'
-        echo '        "aie.dma_port"() { port = "A", direction = "input" } : () -> ()'
-        echo '        "aie.dma_port"() { port = "B", direction = "input" } : () -> ()'
-        echo '        "aie.dma_port"() { port = "C", direction = "output" } : () -> ()'
-        echo "    }"
-        echo ""
-        echo "    // Control tile: DMA setup and synchronization"
-        echo '    "aie.tile"(#aie.tile{row = 0, col = 0}) {'
-        echo "        // Lock for synchronization with compute tiles"
-        echo '        %lock_compute = "aie.lock"() {'
-        echo '            lock = #aie.lock{lock_id = 3, target = "tile",'
-        echo '                tile = #aie.tile{row = 1, col = 0}}'
-        echo "        } : () -> !aie.lock"
-        echo ""
-        echo "        // Start DMA transfers for A and B matrices"
-        echo "        \"aie.dma_start\"(%dma_a) { len = $(( M * K )) : i64 } : (!aie.objectbox.stream) -> ()"
-        echo "        \"aie.dma_start\"(%dma_b) { len = $(( K * N )) : i64 } : (!aie.objectbox.stream) -> ()"
-        echo ""
-        echo "        // Signal compute tiles to start"
-        echo '        "aie.lock"(%lock_compute) : (!aie.lock) -> ()'
-        echo ""
-        echo "        // Wait for output DMA to complete"
-        echo '        "aie.dma_wait"(%dma_c) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()'
-        echo "    }"
-        echo ""
-
-        for ((t=0; t<num_tiles; t++)); do
-            local col=$t
-            echo "    // Compute tile (1,${col})"
-            echo "    \"aie.tile\"(#aie.tile{row = 1, col = ${col}}) {"
-            echo "        %lock_start = \"aie.lock\"() {"
-            echo '            lock = #aie.lock{lock_id = 3, target = "tile",'
-            echo '                tile = #aie.tile{row = 1, col = 0}}'
-            echo "        } : () -> !aie.lock"
-            echo "        // Wait for control tile signal"
-            echo '        "aie.lock"(%lock_start) : (!aie.lock) -> ()'
-            echo ""
-            echo "        // Zero accumulator"
-            echo "        // vzero: %acc = zero vector (16xi32)"
-            echo ""
-            echo "        // K-dimension: ${k_chunks} chunks of ${vec_len} elements"
-            for ((k=0; k<k_chunks; k++)); do
-                local k_start=$(( k * vec_len ))
-                local k_end=$(( (k + 1) * vec_len - 1 ))
-                echo "        // K chunk ${k}: process elements [${k_start}..${k_end}]"
-                echo "        // Load A vector (16xi8) from local memory"
-                echo "        // %a_vec = aie.load(%ptr_a, offset=$(( k * vec_len * tile_m )))"
-                echo "        // Load B vector (16xi8) from local memory"
-                echo "        // %b_vec = aie.load(%ptr_b, offset=$(( k * vec_len )))"
-                echo "        // Multiply-accumulate: %acc = mlacc(%acc, %a_vec, %b_vec)"
-            done
-            echo ""
-            echo "        // Signal completion"
-            echo '        "aie.unlock"(%lock_start) : (!aie.lock) -> ()'
-            echo "    }"
-            echo ""
-        done
-
-        echo "}"
-    } > "$output_file"
-}
-
-#====//
-# Compile MLIR to xclbin
-#====//
-compile_xclbin() {
-    local mlir_file="$1"
-    local output_xclbin="$2"
-    local profile="$3"
-
-    local cmd="$AIECC_PATH --target=aie2p --npu-profile=$profile"
-
-    if [ "$PEANO_FOUND" = true ]; then
-        if [ -n "${PEANO_HOME:-}" ]; then
-            cmd+=" -I${PEANO_HOME}/include -L${PEANO_HOME}/lib"
-        else
-            cmd+=" -I$(dirname $(dirname $(which aie2p-none-unknown-elf-g++)))/include"
-            cmd+=" -L$(dirname $(dirname $(which aie2p-none-unknown-elf-g++)))/lib"
-        fi
-    fi
-
-    cmd+=" \"$mlir_file\" -o \"$output_xclbin\""
-
-    echo "    Compiling: $output_xclbin"
-    if eval "$cmd" 2>&1; then
-        local size=$(stat -c%s "$output_xclbin" 2>/dev/null || echo "unknown")
-        echo "    Success: ${size} bytes"
-        return 0
-    else
-        echo "    FAILED"
-        return 1
-    fi
-}
-
-#====//
-# Build kernels
-#====//
-if [ "$AIECC_FOUND" = false ]; then
-    echo "Cannot build kernels: mlir-aie not available"
+    echo "ERROR: mlir-aie (aiecc.py) not found"
     echo ""
     echo "To install mlir-aie:"
     echo "  git clone https://github.com/Xilinx/mlir-aie.git"
@@ -250,83 +78,141 @@ if [ "$AIECC_FOUND" = false ]; then
     echo "      -DMLIR_AIE_BUILD_TOOLS=ON"
     echo "  ninja"
     echo ""
-    echo "Or use prebuilt xclbins in ~/.cache/ggnpu/xclbin/"
+    echo "Or set AIE_HOME to an existing mlir-aie build."
+    echo "Alternatively, use prebuilt xclbins in $XCLBIN_DIR"
     exit 1
 fi
 
-echo "Building kernels for profiles: ${NPU_PROFILES[*]}"
+echo "mlir-aie: $AIECC_PATH"
+
+if [ -n "${PEANO_HOME:-}" ] && [ -f "$PEANO_HOME/bin/aie2p-none-unknown-elf-g++" ]; then
+    echo "Peano: $PEANO_HOME"
+    PEANO_FLAGS="-I${PEANO_HOME}/include -L${PEANO_HOME}/lib"
+elif command -v aie2p-none-unknown-elf-g++ >/dev/null 2>&1; then
+    PEANO_DIR="$(dirname "$(dirname "$(command -v aie2p-none-unknown-elf-g++)")")"
+    echo "Peano: $PEANO_DIR"
+    PEANO_FLAGS="-I${PEANO_DIR}/include -L${PEANO_DIR}/lib"
+else
+    echo "Peano: not found (tile ELF compilation may fail)"
+    PEANO_FLAGS=""
+fi
 echo ""
 
+#====//
+# Compile a single MLIR file to xclbin
+#====//
+compile_kernel() {
+    local mlir_file="$1"
+    local output_xclbin="$2"
+    local profile="$3"
+    local kernel_name="$4"
+
+    local cmd="$AIECC_PATH --target=aie2p --npu-profile=$profile"
+
+    if [ -n "$PEANO_FLAGS" ]; then
+        cmd+=" $PEANO_FLAGS"
+    fi
+
+    # Add AIE_HOME include path if set
+    if [ -n "${AIE_HOME:-}" ]; then
+        cmd+=" -I${AIE_HOME}/include"
+    fi
+
+    cmd+=" \"$mlir_file\" -o \"$output_xclbin\""
+
+    echo -n "  [$kernel_name npu$profile] "
+
+    if eval "$cmd" 2>&1; then
+        if [ -f "$output_xclbin" ]; then
+            local size
+            size=$(stat -c%s "$output_xclbin" 2>/dev/null || stat -f%z "$output_xclbin" 2>/dev/null || echo "?")
+            echo "OK (${size} bytes)"
+            return 0
+        fi
+    fi
+
+    echo "FAILED"
+    return 1
+}
+
+#====//
+# Build kernels
+#====//
 TOTAL=0
 SUCCESS=0
 FAILED=0
 
-# Build symmetric shapes
-for SHAPE in "${SHAPES[@]}"; do
-    IFS='x' read -r M N K <<< "$SHAPE"
-    TOTAL=$((TOTAL + 1))
+# Define kernels to build: name, mlir_file, output_prefix
+Kernels=(
+    "matmul:matmul_i8/matmul.mlir:matmul"
+    "rmsnorm:rmsnorm/rmsnorm.mlir:rmsnorm"
+    "rope:rope/rope.mlir:rope"
+    "softmax:softmax/softmax.mlir:softmax"
+    "silu:silu/silu.mlir:silu"
+    "flash_attn:fused_attn/flash_attn.mlir:flash_attn"
+)
 
-    for PROFILE in "${NPU_PROFILES[@]}"; do
-        PROFILE_STR="npu${PROFILE}"
-        XCLBIN_NAME="matmul_${PROFILE_STR}_${M}x${N}x${K}.xclbin"
-        XCLBIN_PATH="$XCLBIN_DIR/$XCLBIN_NAME"
+for kernel_def in "${Kernels[@]}"; do
+    IFS=':' read -r kernel_name mlir_rel output_prefix <<< "$kernel_def"
 
-        if [ -f "$XCLBIN_PATH" ]; then
-            echo "  $XCLBIN_NAME: already cached, skipping"
+    # Apply kernel filter if set
+    if [ -n "${KERNEL_FILTER:-}" ] && [ "$kernel_name" != "$KERNEL_FILTER" ]; then
+        continue
+    fi
+
+    mlir_file="$KERNELS_DIR/$mlir_rel"
+
+    if [ ! -f "$mlir_file" ]; then
+        echo "WARNING: MLIR source not found: $mlir_file (skipping $kernel_name)"
+        continue
+    fi
+
+    echo "Building kernel: $kernel_name"
+
+    for profile in "${PROFILES[@]}"; do
+        TOTAL=$((TOTAL + 1))
+        output_xclbin="$XCLBIN_DIR/${output_prefix}_npu${profile}.xclbin"
+
+        if [ -f "$output_xclbin" ]; then
+            echo "  [npu$profile] already exists, skipping"
             SUCCESS=$((SUCCESS + 1))
             continue
         fi
 
-        MLIR_TMP=$(mktemp /tmp/ggnpu_mlir_XXXXXX.mlir)
-        generate_mlir "$M" "$N" "$K" "$PROFILE" "$MLIR_TMP"
-
-        if compile_xclbin "$MLIR_TMP" "$XCLBIN_PATH" "$PROFILE"; then
+        if compile_kernel "$mlir_file" "$output_xclbin" "$profile" "$kernel_name"; then
             SUCCESS=$((SUCCESS + 1))
         else
             FAILED=$((FAILED + 1))
         fi
-
-        rm -f "$MLIR_TMP"
     done
+
+    echo ""
 done
 
-# Build asymmetric shapes
-for SHAPE in "${ASYM_SHAPES[@]}"; do
-    IFS='x' read -r M N K <<< "$SHAPE"
-    TOTAL=$((TOTAL + 1))
-
-    for PROFILE in "${NPU_PROFILES[@]}"; do
-        PROFILE_STR="npu${PROFILE}"
-        XCLBIN_NAME="matmul_${PROFILE_STR}_${M}x${N}x${K}.xclbin"
-        XCLBIN_PATH="$XCLBIN_DIR/$XCLBIN_NAME"
-
-        if [ -f "$XCLBIN_PATH" ]; then
-            echo "  $XCLBIN_NAME: already cached, skipping"
-            SUCCESS=$((SUCCESS + 1))
-            continue
-        fi
-
-        MLIR_TMP=$(mktemp /tmp/ggnpu_mlir_XXXXXX.mlir)
-        generate_mlir "$M" "$N" "$K" "$PROFILE" "$MLIR_TMP"
-
-        if compile_xclbin "$MLIR_TMP" "$XCLBIN_PATH" "$PROFILE"; then
-            SUCCESS=$((SUCCESS + 1))
-        else
-            FAILED=$((FAILED + 1))
-        fi
-
-        rm -f "$MLIR_TMP"
-    done
-done
-
-echo ""
+#====//
+# Summary
+#====//
 echo "=== Build Summary ==="
-echo "  Total: $TOTAL shapes x ${#NPU_PROFILES[@]} profiles"
+echo "  Total: $TOTAL"
 echo "  Success: $SUCCESS"
 echo "  Failed: $FAILED"
-echo "  Output: $XCLBIN_DIR"
 echo ""
-echo "To use prebuilt xclbins, copy them to:"
-echo "  ~/.cache/ggnpu/xclbin/"
+
+if [ "$FAILED" -gt 0 ]; then
+    echo "Some kernels failed to compile. Check the output above for errors."
+    echo "Common issues:"
+    echo "  - MLIR syntax errors in source files"
+    echo "  - Missing Peano toolchain for tile code"
+    echo "  - Insufficient memory during compilation"
+    echo ""
+    echo "You can still run ggnpu with prebuilt xclbins or CPU reference backend."
+    exit 1
+fi
+
+echo "All kernels built successfully!"
+echo "Output: $XCLBIN_DIR"
 echo ""
-echo "Or set GGNPU_CACHE_DIR to a custom location."
+echo "To use these xclbins with ggnpu, ensure they are in:"
+echo "  $XCLBIN_DIR"
+echo ""
+echo "Or set GGNPU_CACHE_DIR to the directory containing xclbins."

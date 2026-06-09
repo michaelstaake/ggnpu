@@ -1,11 +1,9 @@
 // GGNPU AIE2P Tile Code for INT8 Matrix Multiplication
 // Compiled with Peano (aie2p toolchain) into ELF for compute tiles
 //
-// Architecture:
-//   - Runs on AIE2P compute tiles (row 1, columns 0-7)
-//   - Uses local SRAM (L2) for A, B, C matrix tiles
-//   - Vector intrinsics for INT8 multiply-accumulate to INT32
-//   - 4MB L2 memory limit per tile (shared across all tiles in design)
+// Runs on AIE2P compute tiles (row 1, columns 0-7)
+// Uses local SRAM (L2) for A, B, C matrix tiles
+// Vector intrinsics for INT8 multiply-accumulate to INT32
 //
 // Guardrail compliance:
 //   1. Memory-first: Block-based loads from DMA buffers
@@ -15,64 +13,86 @@
 
 #pragma once
 
-// Peano/AIE2P intrinsics (provided by aie2p toolchain)
-// These are compiler intrinsics, not runtime libraries
-
-// Vector type: 16 x INT8 (128-bit vector register)
-using vec_i8 = __attribute__((vector_size(16))) char;
-// Vector type: 16 x INT32 (64-byte vector register for accumulator)
-using vec_i32 = __attribute__((vector_size(64))) int;
-
-// Tile-local memory buffers (stored in L2 SRAM)
-// Each compute tile handles a tile_m x tile_n block of output
-// A buffer: tile_m x K_chunk (INT8)
-// B buffer: K_chunk x tile_n (INT8)
-// C accumulator: tile_m x tile_n (INT32)
-
-static constexpr int TILE_M = 16;
-static constexpr int TILE_N = 16;
-static constexpr int VEC_LEN = 16;
-
-// Tile-local SRAM buffers
-// Note: In actual Peano compilation, these map to tile L2 memory
-alignas(64) static vec_i8 tile_a_buf[TILE_M * 256];  // Max K = 256 for L2 budget
-alignas(64) static vec_i8 tile_b_buf[256 * TILE_N];
-alignas(64) static vec_i32 tile_c_acc[TILE_M * TILE_N];
+#include <cstdint>
 
 //====//
-// Load matrix A tile from DMA buffer into local memory
-// A is stored in row-major: tile_m rows x K elements
+// Tile configuration constants
 //====//
-__attribute__((noinline))
-void load_a_tile(const vec_i8* src, int k_chunks) {
-    for (int k = 0; k < k_chunks; k++) {
-        // Vector load from DMA buffer to local memory
-        // Each chunk loads VEC_LEN elements per row
-        for (int row = 0; row < TILE_M; row++) {
-            vec_i8* dst = &tile_a_buf[row * (k_chunks * VEC_LEN) + k * VEC_LEN];
-            const vec_i8* src_row = &src[(row * (k_chunks * VEC_LEN)) + k * VEC_LEN];
-            #pragma GCC unroll 1
-            for (int v = 0; v < 1; v++) {
-                dst[v] = src_row[v];
+static constexpr int TILE_M = 16;    // Output rows per tile
+static constexpr int TILE_N = 16;    // Output cols per tile
+static constexpr int VEC_LEN = 16;   // Vector width in INT8 elements
+
+//====//
+// Tile-local L2 memory buffers
+// These map to the tile's local SRAM via Peano compiler directives
+//====//
+// A buffer: TILE_M rows x max K chunks (INT8)
+// B buffer: max K chunks x TILE_N cols (INT8)
+// C accumulator: TILE_M x TILE_N (INT32)
+//====//
+// In Peano, these are placed in L2 memory using:
+//   #pragma aie_l2
+// which tells the compiler to allocate in tile local memory
+
+static constexpr int MAX_K_CHUNKS = 256 / VEC_LEN;  // Max K=256 for initial L2 budget
+
+// L2-local storage for matrix tiles
+alignas(64) static char tile_a_buf[TILE_M * (MAX_K_CHUNKS * VEC_LEN)];
+alignas(64) static char tile_b_buf[(MAX_K_CHUNKS * VEC_LEN) * TILE_N];
+alignas(64) static int32_t tile_c_acc[TILE_M * TILE_N];
+
+//====//
+// DMA buffer pointers (set by control tile via shared memory)
+//====//
+// These are updated by the control tile before kernel launch
+// The compute tile reads these to know where DMA data lands
+
+static constexpr uintptr_t DMA_BUF_A = 0x00000000;  // DMA receive buffer A
+static constexpr uintptr_t DMA_BUF_B = 0x00004000;  // DMA receive buffer B
+static constexpr uintptr_t DMA_BUF_C = 0x00008000;  // DMA send buffer C
+
+//====//
+// Load matrix A tile from DMA buffer into local L2
+// A is stored in row-major: TILE_M rows x K elements
+//====//
+static void load_a_tile(const void* src, int k_chunks) {
+    const int8_t* src_ptr = static_cast<const int8_t*>(src);
+    int8_t* dst_ptr = static_cast<int8_t*>(tile_a_buf);
+
+    // Copy TILE_M rows, each with k_chunks * VEC_LEN elements
+    int row_bytes = k_chunks * VEC_LEN;
+    for (int row = 0; row < TILE_M; row++) {
+        // Vector load: copy VEC_LEN elements at a time
+        for (int k = 0; k < k_chunks; k++) {
+            int src_off = row * row_bytes + k * VEC_LEN;
+            int dst_off = row * row_bytes + k * VEC_LEN;
+            // In actual AIE: aie::loadv<int8_t, VEC_LEN>(src_ptr + src_off)
+            //               -> store to dst_ptr + dst_off
+            for (int v = 0; v < VEC_LEN; v++) {
+                dst_ptr[dst_off + v] = src_ptr[src_off + v];
             }
         }
     }
 }
 
 //====//
-// Load matrix B tile from DMA buffer into local memory
+// Load matrix B tile from DMA buffer into local L2
 // B is stored in column-major for efficient column access during MAC
 //====//
-__attribute__((noinline))
-void load_b_tile(const vec_i8* src, int k_chunks) {
-    for (int k = 0; k < k_chunks; k++) {
-        // Vector load: B[k*VEC_LEN .. (k+1)*VEC_LEN, :]
-        for (int col = 0; col < TILE_N; col++) {
-            vec_i8* dst = &tile_b_buf[k * VEC_LEN * TILE_N + col * VEC_LEN];
-            const vec_i8* src_col = &src[(k * VEC_LEN * TILE_N) + (col * VEC_LEN)];
-            #pragma GCC unroll 1
-            for (int v = 0; v < 1; v++) {
-                dst[v] = src_col[v];
+static void load_b_tile(const void* src, int k_chunks) {
+    const int8_t* src_ptr = static_cast<const int8_t*>(src);
+    int8_t* dst_ptr = static_cast<int8_t*>(tile_b_buf);
+
+    // Copy K chunks x TILE_N columns
+    int col_bytes = k_chunks * VEC_LEN;
+    for (int col = 0; col < TILE_N; col++) {
+        for (int k = 0; k < k_chunks; k++) {
+            int src_off = k * VEC_LEN * TILE_N + col * VEC_LEN;
+            int dst_off = col * col_bytes + k * VEC_LEN;
+            // In actual AIE: aie::loadv<int8_t, VEC_LEN>(src_ptr + src_off)
+            //               -> store to dst_ptr + dst_off
+            for (int v = 0; v < VEC_LEN; v++) {
+                dst_ptr[dst_off + v] = src_ptr[src_off + v];
             }
         }
     }
@@ -81,34 +101,32 @@ void load_b_tile(const vec_i8* src, int k_chunks) {
 //====//
 // INT8 matrix multiply-accumulate
 // C += A x B where:
-//   A: TILE_M x K (INT8)
-//   B: K x TILE_N (INT8)
-//   C: TILE_M x TILE_N (INT32 accumulator)
+//   A: TILE_M x (k_chunks * VEC_LEN) INT8
+//   B: (k_chunks * VEC_LEN) x TILE_N INT8
+//   C: TILE_M x TILE_N INT32 accumulator
 //
 // Fully unrolled: no branches, vector intrinsics only
 //====//
-__attribute__((noinline))
-void matmul_tile_ia8(const int k_chunks) {
+static void matmul_tile_ia8(int k_chunks) {
     // Zero accumulator
     for (int i = 0; i < TILE_M * TILE_N; i++) {
         tile_c_acc[i] = 0;
     }
 
     // K-dimension: fully unrolled loop
-    // Each iteration: load vectors, multiply-accumulate
-    #pragma GCC unroll
+    // Each iteration: load A vector, B vector, multiply-accumulate
     for (int k = 0; k < k_chunks; k++) {
-        // For each output element (row, col):
-        // acc[row][col] += sum over v of A[row][k*VEC+v] * B[k*VEC+v][col]
-        #pragma GCC unroll
         for (int row = 0; row < TILE_M; row++) {
-            #pragma GCC unroll
             for (int col = 0; col < TILE_N; col++) {
                 int32_t sum = 0;
+                const int8_t* a_ptr = tile_a_buf + row * (k_chunks * VEC_LEN) + k * VEC_LEN;
+                const int8_t* b_ptr = tile_b_buf + k * VEC_LEN * TILE_N + col * VEC_LEN;
+
                 // Inner vector dot product: VEC_LEN elements
-                const vec_i8* a_ptr = &tile_a_buf[row * (k_chunks * VEC_LEN) + k * VEC_LEN];
-                const vec_i8* b_ptr = &tile_b_buf[k * VEC_LEN * TILE_N + col * VEC_LEN];
-                #pragma GCC unroll
+                // In actual AIE:
+                //   %a_vec = aie::loadv<int8_t, VEC_LEN>(a_ptr)
+                //   %b_vec = aie::loadv<int8_t, VEC_LEN>(b_ptr)
+                //   aie::mlacc(%acc_vec, %a_vec, %b_vec)  // vector MAC
                 for (int v = 0; v < VEC_LEN; v++) {
                     sum += static_cast<int32_t>(static_cast<int8_t>(a_ptr[v])) *
                            static_cast<int32_t>(static_cast<int8_t>(b_ptr[v]));
@@ -123,10 +141,10 @@ void matmul_tile_ia8(const int k_chunks) {
 // Store result C tile from accumulator to output buffer
 // C is stored in row-major: TILE_M rows x TILE_N cols (INT32)
 //====//
-__attribute__((noinline))
-void store_c_tile(vec_i32* dst) {
+static void store_c_tile(void* dst) {
+    int32_t* dst_ptr = static_cast<int32_t*>(dst);
     for (int i = 0; i < TILE_M * TILE_N; i++) {
-        dst[i] = tile_c_acc[i];
+        dst_ptr[i] = tile_c_acc[i];
     }
 }
 
@@ -134,31 +152,24 @@ void store_c_tile(vec_i32* dst) {
 // Main tile entry point
 // Called by Peano runtime on each compute tile
 //
-// Parameters passed via global memory (set by control tile):
-//   - ptr_a: pointer to A matrix in DDR (via DMA)
-//   - ptr_b: pointer to B matrix in DDR (via DMA)
-//   - ptr_c: pointer to C matrix in DDR (via DMA)
+// Parameters passed via shared memory (set by control tile):
+//   - ptr_a: pointer to A matrix tile in DMA buffer
+//   - ptr_b: pointer to B matrix tile in DMA buffer
+//   - ptr_c: pointer to C output buffer in DMA buffer
 //   - k_chunks: number of K-dimension chunks to process
-//   - tile_col: this tile's column index (0-7)
-//   - tile_row: this tile's row index (should be 1)
+//   - tile_col: this tile's column index (0-7) for output offset
 //====//
-__attribute__((noinline))
-void matmul_tile_main(const void* ptr_a, const void* ptr_b, void* ptr_c,
-                      int k_chunks, int tile_col, int tile_row) {
-    (void)tile_row;
-    (void)tile_col;
+static void matmul_tile_main(const void* ptr_a, const void* ptr_b, void* ptr_c,
+                              int k_chunks, int tile_col) {
+    (void)tile_col;  // Reserved for multi-tile output assembly
 
-    const vec_i8* a_ptr = static_cast<const vec_i8*>(ptr_a);
-    const vec_i8* b_ptr = static_cast<const vec_i8*>(ptr_b);
-    vec_i32* c_ptr = static_cast<vec_i32*>(ptr_c);
-
-    // Load A and B tiles from DMA buffers into local SRAM
-    load_a_tile(a_ptr, k_chunks);
-    load_b_tile(b_ptr, k_chunks);
+    // Load A and B tiles from DMA buffers into local L2 SRAM
+    load_a_tile(ptr_a, k_chunks);
+    load_b_tile(ptr_b, k_chunks);
 
     // Execute matrix multiply-accumulate
     matmul_tile_ia8(k_chunks);
 
-    // Store result back to output buffer
-    store_c_tile(c_ptr);
+    // Store result back to output buffer (via DMA)
+    store_c_tile(ptr_c);
 }

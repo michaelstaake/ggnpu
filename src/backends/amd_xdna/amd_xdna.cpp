@@ -21,23 +21,6 @@ namespace ggnpu {
 
 namespace fs = std::filesystem;
 
-// Hash specializations for unordered_map keys
-template<>
-struct std::hash<std::pair<int, int>> {
-    size_t operator()(const std::pair<int, int>& p) const {
-        return std::hash<int>{}(p.first) ^ (std::hash<int>{}(p.second) << 1);
-    }
-};
-
-template<>
-struct std::hash<std::tuple<int, int, int64_t>> {
-    size_t operator()(const std::tuple<int, int, int64_t>& t) const {
-        return std::hash<int>{}(std::get<0>(t))
-             ^ (std::hash<int>{}(std::get<1>(t)) << 1)
-             ^ (std::hash<int64_t>{}(std::get<2>(t)) << 2);
-    }
-};
-
 // Forward declarations from kernels.cpp
 namespace detail {
     std::vector<uint8_t> load_xclbin_file(const std::string& path);
@@ -49,14 +32,15 @@ namespace detail {
     std::vector<uint8_t> jit_compile_silu(int size, int profile);
     std::vector<uint8_t> jit_compile_flash_attn(int n_head, int head_dim, int64_t ctx_len, int profile);
     std::string make_cache_key(const std::string& op, int M, int N, int K, const std::string& profile);
+    bool jit_compilation_available();
 }
 
-// Internal buffer wrapper
+// Internal buffer wrapper for XRT buffer objects
 class XrtBuffer {
 public:
     XrtBuffer() = default;
     XrtBuffer(xrt::device& dev, size_t size, xrt::bo::flags flags)
-        : bo_(dev, size, dev.get_device_membase(), flags) {}
+        : bo_(dev, size, flags) {}
 
     void* map() {
         if (!is_valid()) return nullptr;
@@ -77,13 +61,13 @@ private:
     xrt::bo bo_;
 };
 
-// Buffer manager
+// Buffer manager for allocating and tracking XRT buffers
 class BufferMgr {
 public:
     explicit BufferMgr(xrt::device& dev) : device_(dev) {}
 
     std::shared_ptr<XrtBuffer> alloc(size_t size, bool host_backed = false) {
-        xrt::bo::flags flags = host_backed ? xrt::bo::flags::host : xrt::bo::flags::flags_type::default_flags;
+        xrt::bo::flags flags = host_backed ? xrt::bo::flags::host : xrt::bo::flags::default_flags;
         auto buf = std::make_shared<XrtBuffer>(device_, size, flags);
         buffers_.push_back(buf);
         return buf;
@@ -112,46 +96,39 @@ private:
     std::vector<std::shared_ptr<XrtBuffer>> buffers_;
 };
 
-// Cached kernel for a specific (op, M, N, K) shape
-struct CachedKernel {
-    xrt::ip_handle ip_handle;
+// Cached kernel for matmul: holds xrt::run for a specific shape
+struct CachedMatmulKernel {
     xrt::run run;
     int M, N, K;
     GgmlType B_type;
 };
 
-// Cached kernel for RMS normalization
+// Cached kernel for RMSNorm
 struct CachedRmsNormKernel {
-    xrt::ip_handle ip_handle;
     xrt::run run;
     int N;
 };
 
 // Cached kernel for RoPE
 struct CachedRopeKernel {
-    xrt::ip_handle ip_handle;
     xrt::run run;
     int n_dims;
 };
 
 // Cached kernel for softmax
 struct CachedSoftmaxKernel {
-    xrt::ip_handle ip_handle;
     xrt::run run;
-    int rows;
-    int cols;
+    int rows, cols;
 };
 
 // Cached kernel for SiLU
 struct CachedSiluKernel {
-    xrt::ip_handle ip_handle;
     xrt::run run;
     int size;
 };
 
-// Cached kernel for Flash Attention
+// Cached kernel for FlashAttention
 struct CachedFlashAttnKernel {
-    xrt::ip_handle ip_handle;
     xrt::run run;
     int n_head;
     int head_dim;
@@ -199,23 +176,14 @@ public:
         // Initialize compile cache
         cache_ = std::make_unique<CompileCache>(cache_dir_);
 
-        // Load or compile matmul xclbin
-        load_matmul_xclbin();
-
-        // Load or compile rmsnorm xclbin
-        load_rmsnorm_xclbin();
-
-        // Load or compile rope xclbin
-        load_rope_xclbin();
-
-        // Load or compile softmax xclbin
-        load_softmax_xclbin();
-
-        // Load or compile silu xclbin
-        load_silu_xclbin();
-
-        // Load or compile flash_attn xclbin
-        load_flash_attn_xclbin();
+        // Try to load a base xclbin (matmul) - at least one kernel must work
+        bool any_kernel_loaded = load_matmul_xclbin() || load_rmsnorm_xclbin();
+        if (!any_kernel_loaded) {
+            std::cerr << "Warning: no NPU kernels available. Matmul and rmsnorm xclbins not found.\n";
+            std::cerr << "  Run with --dump-tensors to test GGUF parsing without NPU.\n";
+            std::cerr << "  Prebuilt xclbins are needed, or set AIE_HOME for JIT compilation.\n";
+            std::cerr << "  Use scripts/build-kernels.sh to compile kernels from source.\n";
+        }
     }
 
     ~AmdXdnaBackend() override = default;
@@ -230,17 +198,14 @@ public:
         int N = params.N;
         int K = params.K;
 
-        // Find or create cached kernel for this shape
-        auto key = std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K);
-        std::string cache_key = "matmul_" + key + "_" + profile_str_;
+        std::string cache_key = "matmul_" + std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K) + "_" + profile_str_;
 
         std::lock_guard<std::mutex> lock(mutex_);
 
         auto it = matmul_kernels_.find(cache_key);
         if (it == matmul_kernels_.end()) {
-            // Need to compile/load this kernel shape
             if (!ensure_matmul_kernel(M, N, K, params.B_type, cache_key)) {
-                last_status_ = Status::ERROR;
+                last_status_ = Status::NPU_UNAVAILABLE;
                 return last_status_;
             }
             it = matmul_kernels_.find(cache_key);
@@ -252,13 +217,10 @@ public:
         size_t size_a = M * K * sizeof(float);
         size_t size_c = M * N * sizeof(float);
 
-        // Calculate B buffer size based on type
         size_t size_b;
         if (params.B_type == GgmlType::I8) {
-            // Decoded INT8: 1 byte per element
             size_b = K * N;
         } else {
-            // Original quantized format (Q8_0, Q4_0, etc.)
             size_b = K * N * ggml_type_size(params.B_type) / ggml_blck_size(params.B_type);
         }
 
@@ -276,13 +238,12 @@ public:
         buf_mgr_->copy_to(*buf_a_, params.A, size_a);
         buf_mgr_->copy_to(*buf_b_, params.B, size_b);
 
-        // Set kernel arguments
-        // Kernel expects: A (buf), B (buf), C (buf), M, N, K
+        // Set kernel arguments: (buf_a, buf_b, buf_c, M, N, K)
         try {
             kernel.run(buf_a_->handle(), buf_b_->handle(), buf_c_->handle(),
                        static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K));
         } catch (const std::exception& e) {
-            std::cerr << "Error: kernel execution failed: " << e.what() << "\n";
+            std::cerr << "Error: matmul kernel execution failed: " << e.what() << "\n";
             last_status_ = Status::ERROR;
             return last_status_;
         }
@@ -518,7 +479,6 @@ public:
     void sync() override {
         std::lock_guard<std::mutex> lock(mutex_);
         // xrt::run::wait() is called implicitly by the run() call
-        // Additional sync can be added here if needed
     }
 
     bool is_available() const override {
@@ -567,18 +527,20 @@ private:
         }
 
         if (xclbin_path.empty()) {
-            // Try JIT compilation
-            std::vector<uint8_t> xclbin_data = detail::jit_compile_matmul(256, 256, 256, npu_profile_);
-            if (!xclbin_data.empty()) {
-                std::string cache_key = detail::make_cache_key("matmul", 256, 256, 256, profile_str_);
-                cache_->store_xclbin(cache_key, xclbin_data);
-                xclbin_path = cache_->get_xclbin_path(cache_key);
+            // Try JIT compilation with a common shape
+            if (detail::jit_compilation_available()) {
+                std::vector<uint8_t> xclbin_data = detail::jit_compile_matmul(256, 256, 256, npu_profile_);
+                if (!xclbin_data.empty()) {
+                    std::string cache_key = detail::make_cache_key("matmul", 256, 256, 256, profile_str_);
+                    cache_->store_xclbin(cache_key, xclbin_data);
+                    xclbin_path = cache_->get_xclbin_path(cache_key);
+                }
             }
         }
 
         if (xclbin_path.empty()) {
             std::cerr << "Warning: no matmul xclbin found for profile " << profile_str_ << "\n";
-            std::cerr << "  Place prebuilt xclbin at: " << xclbin_name << "\n";
+            std::cerr << "  Place prebuilt xclbin at: " << xclbin_path << "\n";
             std::cerr << "  Or build with mlir-aie to generate one.\n";
             return false;
         }
@@ -604,20 +566,28 @@ private:
         // Check if we have a cached xclbin for this shape
         if (cache_->has_xclbin(cache_key)) {
             std::string cached_path = cache_->get_xclbin_path(cache_key);
-            return load_kernel_for_shape(cached_path, M, N, K, B_type, cache_key);
+            return load_matmul_kernel_for_shape(cached_path, M, N, K, B_type, cache_key);
         }
 
-        // Try to find a generic xclbin that works for multiple shapes
-        // The matmul kernel should be dimension-agnostic (programmed at runtime)
-        if (matmul_kernels_.empty() && !xclbin_uuid_.is_none()) {
-            return create_kernel_from_loaded_xclbin(M, N, K, B_type, cache_key);
+        // Try to create kernel from the base loaded xclbin (works for any shape if kernel is dimension-agnostic)
+        if (!xclbin_uuid_.is_none()) {
+            return create_matmul_kernel_from_loaded_xclbin(M, N, K, B_type, cache_key);
+        }
+
+        // Try JIT compilation
+        if (detail::jit_compilation_available()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_matmul(M, N, K, npu_profile_);
+            if (!xclbin_data.empty()) {
+                cache_->store_xclbin(cache_key, xclbin_data);
+                return load_matmul_kernel_for_shape(cache_->get_xclbin_path(cache_key), M, N, K, B_type, cache_key);
+            }
         }
 
         std::cerr << "Error: no xclbin available for matmul " << M << "x" << N << "x" << K << "\n";
         return false;
     }
 
-    bool load_kernel_for_shape(const std::string& path, int M, int N, int K, GgmlType B_type, const std::string& cache_key) {
+    bool load_matmul_kernel_for_shape(const std::string& path, int M, int N, int K, GgmlType B_type, const std::string& cache_key) {
         try {
             auto data = detail::load_xclbin_file(path);
             if (data.empty()) return false;
@@ -628,28 +598,28 @@ private:
             xrt::ip_handle ip(tmp_device, tmp_uuid);
             xrt::run run(ip, "matmul");
 
-            matmul_kernels_[cache_key] = {ip, run, M, N, K, B_type};
+            matmul_kernels_[cache_key] = CachedMatmulKernel{run, M, N, K, B_type};
             return true;
         } catch (const std::exception& e) {
-            std::cerr << "Warning: failed to load kernel from cache: " << e.what() << "\n";
+            std::cerr << "Warning: failed to load matmul kernel from cache: " << e.what() << "\n";
             return false;
         }
     }
 
-    bool create_kernel_from_loaded_xclbin(int M, int N, int K, GgmlType B_type, const std::string& cache_key) {
+    bool create_matmul_kernel_from_loaded_xclbin(int M, int N, int K, GgmlType B_type, const std::string& cache_key) {
         try {
             xrt::ip_handle ip(*device_, xclbin_uuid_);
             xrt::run run(ip, "matmul");
 
-            matmul_kernels_[cache_key] = {ip, run, M, N, K, B_type};
+            matmul_kernels_[cache_key] = CachedMatmulKernel{run, M, N, K, B_type};
             return true;
         } catch (const std::exception& e) {
-            std::cerr << "Error: failed to create kernel: " << e.what() << "\n";
+            std::cerr << "Error: failed to create matmul kernel: " << e.what() << "\n";
             return false;
         }
     }
 
-    // Load or compile the rmsnorm xclbin for the target NPU profile
+    // Load or compile the rmsnorm xclbin
     bool load_rmsnorm_xclbin() {
         std::string xclbin_name = "rmsnorm_" + profile_str_ + ".xclbin";
         std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
@@ -659,11 +629,13 @@ private:
         }
 
         if (xclbin_path.empty()) {
-            std::vector<uint8_t> xclbin_data = detail::jit_compile_rmsnorm(4096, npu_profile_);
-            if (!xclbin_data.empty()) {
-                std::string cache_key = detail::make_cache_key("rmsnorm", 4096, 0, 0, profile_str_);
-                cache_->store_xclbin(cache_key, xclbin_data);
-                xclbin_path = cache_->get_xclbin_path(cache_key);
+            if (detail::jit_compilation_available()) {
+                std::vector<uint8_t> xclbin_data = detail::jit_compile_rmsnorm(4096, npu_profile_);
+                if (!xclbin_data.empty()) {
+                    std::string cache_key = detail::make_cache_key("rmsnorm", 4096, 0, 0, profile_str_);
+                    cache_->store_xclbin(cache_key, xclbin_data);
+                    xclbin_path = cache_->get_xclbin_path(cache_key);
+                }
             }
         }
 
@@ -680,7 +652,7 @@ private:
             }
 
             xclbin_uuid_rmsnorm_ = device_->load_xclbin(xclbin_data_rmsnorm_);
-            std::cout << "Loaded rmsnorm xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_rmsnorm_ << "\n";
+            std::cout << "Loaded rmsnorm xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to load rmsnorm xclbin: " << e.what() << "\n";
@@ -688,15 +660,22 @@ private:
         }
     }
 
-    // Ensure a rmsnorm kernel exists for the given dimension
     bool ensure_rmsnorm_kernel(int N, const std::string& cache_key) {
         if (cache_->has_xclbin(cache_key)) {
             std::string cached_path = cache_->get_xclbin_path(cache_key);
             return load_rmsnorm_kernel_for_shape(cached_path, N, cache_key);
         }
 
-        if (rmsnorm_kernels_.empty() && !xclbin_uuid_rmsnorm_.is_none()) {
+        if (!xclbin_uuid_rmsnorm_.is_none()) {
             return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
+        }
+
+        if (detail::jit_compilation_available()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_rmsnorm(N, npu_profile_);
+            if (!xclbin_data.empty()) {
+                cache_->store_xclbin(cache_key, xclbin_data);
+                return load_rmsnorm_kernel_for_shape(cache_->get_xclbin_path(cache_key), N, cache_key);
+            }
         }
 
         std::cerr << "Error: no xclbin available for rmsnorm N=" << N << "\n";
@@ -714,10 +693,10 @@ private:
             xrt::ip_handle ip(tmp_device, tmp_uuid);
             xrt::run run(ip, "rmsnorm");
 
-            rmsnorm_kernels_[N] = {ip, run, N};
+            rmsnorm_kernels_[N] = CachedRmsNormKernel{run, N};
             return true;
         } catch (const std::exception& e) {
-            std::cerr << "Warning: failed to load rmsnorm kernel from cache: " << e.what() << "\n";
+            std::cerr << "Warning: failed to load rmsnorm kernel: " << e.what() << "\n";
             return false;
         }
     }
@@ -727,7 +706,7 @@ private:
             xrt::ip_handle ip(*device_, xclbin_uuid_rmsnorm_);
             xrt::run run(ip, "rmsnorm");
 
-            rmsnorm_kernels_[N] = {ip, run, N};
+            rmsnorm_kernels_[N] = CachedRmsNormKernel{run, N};
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to create rmsnorm kernel: " << e.what() << "\n";
@@ -735,98 +714,7 @@ private:
         }
     }
 
-    // Load or compile the rope xclbin for the target NPU profile
-    bool load_rope_xclbin() {
-        std::string xclbin_name = "rope_" + profile_str_ + ".xclbin";
-        std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
-
-        if (xclbin_path.empty() && cache_->has_xclbin(xclbin_name)) {
-            xclbin_path = cache_->get_xclbin_path(xclbin_name);
-        }
-
-        if (xclbin_path.empty()) {
-            std::vector<uint8_t> xclbin_data = detail::jit_compile_rope(128, npu_profile_);
-            if (!xclbin_data.empty()) {
-                std::string cache_key = detail::make_cache_key("rope", 128, 0, 0, profile_str_);
-                cache_->store_xclbin(cache_key, xclbin_data);
-                xclbin_path = cache_->get_xclbin_path(cache_key);
-            }
-        }
-
-        if (xclbin_path.empty()) {
-            std::cerr << "Warning: no rope xclbin found for profile " << profile_str_ << "\n";
-            return false;
-        }
-
-        try {
-            xclbin_data_rope_ = detail::load_xclbin_file(xclbin_path);
-            if (xclbin_data_rope_.empty()) {
-                std::cerr << "Error: failed to read xclbin: " << xclbin_path << "\n";
-                return false;
-            }
-
-            xclbin_uuid_rope_ = device_->load_xclbin(xclbin_data_rope_);
-            std::cout << "Loaded rope xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_rope_ << "\n";
-            return true;
-        } catch (const std::exception& e) {
-            std::cerr << "Error: failed to load rope xclbin: " << e.what() << "\n";
-            return false;
-        }
-    }
-
-    bool ensure_rope_kernel(int n_dims, const std::string& cache_key) {
-        if (cache_->has_xclbin(cache_key)) {
-            std::string cached_path = cache_->get_xclbin_path(cache_key);
-            return load_rope_kernel_for_shape(cached_path, n_dims, cache_key);
-        }
-
-        if (rope_kernels_.empty() && !xclbin_uuid_rope_.is_none()) {
-            return create_rope_kernel_from_loaded_xclbin(n_dims, cache_key);
-        }
-
-        std::vector<uint8_t> xclbin_data = detail::jit_compile_rope(n_dims, npu_profile_);
-        if (!xclbin_data.empty()) {
-            cache_->store_xclbin(cache_key, xclbin_data);
-            return load_rope_kernel_for_shape(cache_->get_xclbin_path(cache_key), n_dims, cache_key);
-        }
-
-        std::cerr << "Error: no xclbin available for rope n_dims=" << n_dims << "\n";
-        return false;
-    }
-
-    bool load_rope_kernel_for_shape(const std::string& path, int n_dims, const std::string& cache_key) {
-        try {
-            auto data = detail::load_xclbin_file(path);
-            if (data.empty()) return false;
-
-            xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
-
-            xrt::ip_handle ip(tmp_device, tmp_uuid);
-            xrt::run run(ip, "rope");
-
-            rope_kernels_[n_dims] = {ip, run, n_dims};
-            return true;
-        } catch (const std::exception& e) {
-            std::cerr << "Warning: failed to load rope kernel from cache: " << e.what() << "\n";
-            return false;
-        }
-    }
-
-    bool create_rope_kernel_from_loaded_xclbin(int n_dims, const std::string& cache_key) {
-        try {
-            xrt::ip_handle ip(*device_, xclbin_uuid_rope_);
-            xrt::run run(ip, "rope");
-
-            rope_kernels_[n_dims] = {ip, run, n_dims};
-            return true;
-        } catch (const std::exception& e) {
-            std::cerr << "Error: failed to create rope kernel: " << e.what() << "\n";
-            return false;
-        }
-    }
-
-    // Load or compile the softmax xclbin for the target NPU profile
+    // Load or compile the softmax xclbin
     bool load_softmax_xclbin() {
         std::string xclbin_name = "softmax_" + profile_str_ + ".xclbin";
         std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
@@ -836,11 +724,13 @@ private:
         }
 
         if (xclbin_path.empty()) {
-            std::vector<uint8_t> xclbin_data = detail::jit_compile_softmax(1024, 1, npu_profile_);
-            if (!xclbin_data.empty()) {
-                std::string cache_key = detail::make_cache_key("softmax", 1, 1024, 0, profile_str_);
-                cache_->store_xclbin(cache_key, xclbin_data);
-                xclbin_path = cache_->get_xclbin_path(cache_key);
+            if (detail::jit_compilation_available()) {
+                std::vector<uint8_t> xclbin_data = detail::jit_compile_softmax(1024, 1, npu_profile_);
+                if (!xclbin_data.empty()) {
+                    std::string cache_key = detail::make_cache_key("softmax", 1, 1024, 0, profile_str_);
+                    cache_->store_xclbin(cache_key, xclbin_data);
+                    xclbin_path = cache_->get_xclbin_path(cache_key);
+                }
             }
         }
 
@@ -857,7 +747,7 @@ private:
             }
 
             xclbin_uuid_softmax_ = device_->load_xclbin(xclbin_data_softmax_);
-            std::cout << "Loaded softmax xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_softmax_ << "\n";
+            std::cout << "Loaded softmax xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to load softmax xclbin: " << e.what() << "\n";
@@ -871,14 +761,16 @@ private:
             return load_softmax_kernel_for_shape(cached_path, rows, cols, cache_key);
         }
 
-        if (softmax_kernels_.empty() && !xclbin_uuid_softmax_.is_none()) {
+        if (!xclbin_uuid_softmax_.is_none()) {
             return create_softmax_kernel_from_loaded_xclbin(rows, cols, cache_key);
         }
 
-        std::vector<uint8_t> xclbin_data = detail::jit_compile_softmax(cols, rows, npu_profile_);
-        if (!xclbin_data.empty()) {
-            cache_->store_xclbin(cache_key, xclbin_data);
-            return load_softmax_kernel_for_shape(cache_->get_xclbin_path(cache_key), rows, cols, cache_key);
+        if (detail::jit_compilation_available()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_softmax(cols, rows, npu_profile_);
+            if (!xclbin_data.empty()) {
+                cache_->store_xclbin(cache_key, xclbin_data);
+                return load_softmax_kernel_for_shape(cache_->get_xclbin_path(cache_key), rows, cols, cache_key);
+            }
         }
 
         std::cerr << "Error: no xclbin available for softmax " << rows << "x" << cols << "\n";
@@ -896,10 +788,10 @@ private:
             xrt::ip_handle ip(tmp_device, tmp_uuid);
             xrt::run run(ip, "softmax");
 
-            softmax_kernels_[std::make_pair(rows, cols)] = {ip, run, rows, cols};
+            softmax_kernels_[std::make_pair(rows, cols)] = CachedSoftmaxKernel{run, rows, cols};
             return true;
         } catch (const std::exception& e) {
-            std::cerr << "Warning: failed to load softmax kernel from cache: " << e.what() << "\n";
+            std::cerr << "Warning: failed to load softmax kernel: " << e.what() << "\n";
             return false;
         }
     }
@@ -909,7 +801,7 @@ private:
             xrt::ip_handle ip(*device_, xclbin_uuid_softmax_);
             xrt::run run(ip, "softmax");
 
-            softmax_kernels_[std::make_pair(rows, cols)] = {ip, run, rows, cols};
+            softmax_kernels_[std::make_pair(rows, cols)] = CachedSoftmaxKernel{run, rows, cols};
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to create softmax kernel: " << e.what() << "\n";
@@ -917,7 +809,7 @@ private:
         }
     }
 
-    // Load or compile the silu xclbin for the target NPU profile
+    // Load or compile the silu xclbin
     bool load_silu_xclbin() {
         std::string xclbin_name = "silu_" + profile_str_ + ".xclbin";
         std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
@@ -927,11 +819,13 @@ private:
         }
 
         if (xclbin_path.empty()) {
-            std::vector<uint8_t> xclbin_data = detail::jit_compile_silu(8192, npu_profile_);
-            if (!xclbin_data.empty()) {
-                std::string cache_key = detail::make_cache_key("silu", 8192, 0, 0, profile_str_);
-                cache_->store_xclbin(cache_key, xclbin_data);
-                xclbin_path = cache_->get_xclbin_path(cache_key);
+            if (detail::jit_compilation_available()) {
+                std::vector<uint8_t> xclbin_data = detail::jit_compile_silu(8192, npu_profile_);
+                if (!xclbin_data.empty()) {
+                    std::string cache_key = detail::make_cache_key("silu", 8192, 0, 0, profile_str_);
+                    cache_->store_xclbin(cache_key, xclbin_data);
+                    xclbin_path = cache_->get_xclbin_path(cache_key);
+                }
             }
         }
 
@@ -948,7 +842,7 @@ private:
             }
 
             xclbin_uuid_silu_ = device_->load_xclbin(xclbin_data_silu_);
-            std::cout << "Loaded silu xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_silu_ << "\n";
+            std::cout << "Loaded silu xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to load silu xclbin: " << e.what() << "\n";
@@ -962,14 +856,16 @@ private:
             return load_silu_kernel_for_shape(cached_path, size, cache_key);
         }
 
-        if (silu_kernels_.empty() && !xclbin_uuid_silu_.is_none()) {
+        if (!xclbin_uuid_silu_.is_none()) {
             return create_silu_kernel_from_loaded_xclbin(size, cache_key);
         }
 
-        std::vector<uint8_t> xclbin_data = detail::jit_compile_silu(size, npu_profile_);
-        if (!xclbin_data.empty()) {
-            cache_->store_xclbin(cache_key, xclbin_data);
-            return load_silu_kernel_for_shape(cache_->get_xclbin_path(cache_key), size, cache_key);
+        if (detail::jit_compilation_available()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_silu(size, npu_profile_);
+            if (!xclbin_data.empty()) {
+                cache_->store_xclbin(cache_key, xclbin_data);
+                return load_silu_kernel_for_shape(cache_->get_xclbin_path(cache_key), size, cache_key);
+            }
         }
 
         std::cerr << "Error: no xclbin available for silu size=" << size << "\n";
@@ -987,10 +883,10 @@ private:
             xrt::ip_handle ip(tmp_device, tmp_uuid);
             xrt::run run(ip, "silu");
 
-            silu_kernels_[size] = {ip, run, size};
+            silu_kernels_[size] = CachedSiluKernel{run, size};
             return true;
         } catch (const std::exception& e) {
-            std::cerr << "Warning: failed to load silu kernel from cache: " << e.what() << "\n";
+            std::cerr << "Warning: failed to load silu kernel: " << e.what() << "\n";
             return false;
         }
     }
@@ -1000,7 +896,7 @@ private:
             xrt::ip_handle ip(*device_, xclbin_uuid_silu_);
             xrt::run run(ip, "silu");
 
-            silu_kernels_[size] = {ip, run, size};
+            silu_kernels_[size] = CachedSiluKernel{run, size};
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to create silu kernel: " << e.what() << "\n";
@@ -1008,7 +904,7 @@ private:
         }
     }
 
-    // Load or compile the flash_attn xclbin for the target NPU profile
+    // Load or compile the flash_attn xclbin
     bool load_flash_attn_xclbin() {
         std::string xclbin_name = "flash_attn_" + profile_str_ + ".xclbin";
         std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
@@ -1018,11 +914,13 @@ private:
         }
 
         if (xclbin_path.empty()) {
-            std::vector<uint8_t> xclbin_data = detail::jit_compile_flash_attn(8, 128, 2048, npu_profile_);
-            if (!xclbin_data.empty()) {
-                std::string cache_key = detail::make_cache_key("flash_attn", 8, 128, 2048, profile_str_);
-                cache_->store_xclbin(cache_key, xclbin_data);
-                xclbin_path = cache_->get_xclbin_path(cache_key);
+            if (detail::jit_compilation_available()) {
+                std::vector<uint8_t> xclbin_data = detail::jit_compile_flash_attn(8, 128, 2048, npu_profile_);
+                if (!xclbin_data.empty()) {
+                    std::string cache_key = detail::make_cache_key("flash_attn", 8, 128, 2048, profile_str_);
+                    cache_->store_xclbin(cache_key, xclbin_data);
+                    xclbin_path = cache_->get_xclbin_path(cache_key);
+                }
             }
         }
 
@@ -1039,7 +937,7 @@ private:
             }
 
             xclbin_uuid_fa_ = device_->load_xclbin(xclbin_data_fa_);
-            std::cout << "Loaded flash_attn xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_fa_ << "\n";
+            std::cout << "Loaded flash_attn xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to load flash_attn xclbin: " << e.what() << "\n";
@@ -1053,14 +951,16 @@ private:
             return load_flash_attn_kernel_for_shape(cached_path, n_head, head_dim, ctx_len, cache_key);
         }
 
-        if (flash_attn_kernels_.empty() && !xclbin_uuid_fa_.is_none()) {
+        if (!xclbin_uuid_fa_.is_none()) {
             return create_flash_attn_kernel_from_loaded_xclbin(n_head, head_dim, ctx_len, cache_key);
         }
 
-        std::vector<uint8_t> xclbin_data = detail::jit_compile_flash_attn(n_head, head_dim, ctx_len, npu_profile_);
-        if (!xclbin_data.empty()) {
-            cache_->store_xclbin(cache_key, xclbin_data);
-            return load_flash_attn_kernel_for_shape(cache_->get_xclbin_path(cache_key), n_head, head_dim, ctx_len, cache_key);
+        if (detail::jit_compilation_available()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_flash_attn(n_head, head_dim, ctx_len, npu_profile_);
+            if (!xclbin_data.empty()) {
+                cache_->store_xclbin(cache_key, xclbin_data);
+                return load_flash_attn_kernel_for_shape(cache_->get_xclbin_path(cache_key), n_head, head_dim, ctx_len, cache_key);
+            }
         }
 
         std::cerr << "Error: no xclbin available for flash_attn " << n_head << "x" << head_dim << "x" << ctx_len << "\n";
@@ -1078,10 +978,10 @@ private:
             xrt::ip_handle ip(tmp_device, tmp_uuid);
             xrt::run run(ip, "flash_attn");
 
-            flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = {ip, run, n_head, head_dim, ctx_len};
+            flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = CachedFlashAttnKernel{run, n_head, head_dim, ctx_len};
             return true;
         } catch (const std::exception& e) {
-            std::cerr << "Warning: failed to load flash_attn kernel from cache: " << e.what() << "\n";
+            std::cerr << "Warning: failed to load flash_attn kernel: " << e.what() << "\n";
             return false;
         }
     }
@@ -1091,7 +991,7 @@ private:
             xrt::ip_handle ip(*device_, xclbin_uuid_fa_);
             xrt::run run(ip, "flash_attn");
 
-            flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = {ip, run, n_head, head_dim, ctx_len};
+            flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = CachedFlashAttnKernel{run, n_head, head_dim, ctx_len};
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to create flash_attn kernel: " << e.what() << "\n";
@@ -1109,9 +1009,6 @@ private:
     std::vector<uint8_t> xclbin_data_rmsnorm_;
     xrt::uuid xclbin_uuid_rmsnorm_;
 
-    std::vector<uint8_t> xclbin_data_rope_;
-    xrt::uuid xclbin_uuid_rope_;
-
     std::vector<uint8_t> xclbin_data_softmax_;
     xrt::uuid xclbin_uuid_softmax_;
 
@@ -1128,9 +1025,6 @@ private:
     std::shared_ptr<XrtBuffer> buf_rmsnorm_in_;
     std::shared_ptr<XrtBuffer> buf_rmsnorm_out_;
 
-    std::shared_ptr<XrtBuffer> buf_rope_in_;
-    std::shared_ptr<XrtBuffer> buf_rope_out_;
-
     std::shared_ptr<XrtBuffer> buf_softmax_in_;
     std::shared_ptr<XrtBuffer> buf_softmax_out_;
 
@@ -1142,9 +1036,8 @@ private:
     std::shared_ptr<XrtBuffer> buf_fa_v_;
     std::shared_ptr<XrtBuffer> buf_fa_out_;
 
-    std::unordered_map<std::string, CachedKernel> matmul_kernels_;
+    std::unordered_map<std::string, CachedMatmulKernel> matmul_kernels_;
     std::unordered_map<int, CachedRmsNormKernel> rmsnorm_kernels_;
-    std::unordered_map<int, CachedRopeKernel> rope_kernels_;
     std::unordered_map<std::pair<int, int>, CachedSoftmaxKernel, std::hash<std::pair<int, int>>> softmax_kernels_;
     std::unordered_map<int, CachedSiluKernel> silu_kernels_;
     std::unordered_map<std::tuple<int, int, int64_t>, CachedFlashAttnKernel, std::hash<std::tuple<int, int, int64_t>>> flash_attn_kernels_;

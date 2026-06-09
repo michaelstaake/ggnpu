@@ -158,11 +158,9 @@ install(TARGETS ggnpu DESTINATION bin)
 
 #====//
 # NPU Kernel Building (optional, requires mlir-aie + Peano)
+# Uses scripts/build-kernels.sh to compile all kernel types
 #====//
 if(GGNPU_BUILD_KERNELS)
-    find_package(Peano QUIET)
-
-    # Check for aiecc.py
     set(AIECC_FOUND OFF)
     set(AIE_HOME "" CACHE PATH "mlir-aie build directory")
 
@@ -173,7 +171,7 @@ if(GGNPU_BUILD_KERNELS)
         else()
             message(WARNING "AIE_HOME set to ${AIE_HOME} but aiecc.py not found")
         endif()
-    elseif(NOT Peano_FOUND)
+    else()
         find_program(AIECC_BIN aiecc.py)
         if(AIECC_BIN)
             set(AIECC_FOUND ON)
@@ -181,50 +179,23 @@ if(GGNPU_BUILD_KERNELS)
         endif()
     endif()
 
-    if(AIECC_FOUND AND Peano_FOUND)
-        message(STATUS "NPU kernel building enabled")
-
-        # Define kernel shapes to compile (typical Llama 3B shapes)
-        set(GGNPU_KERNEL_SHAPES
-            "256x256x256"
-            "512x512x512"
-            "1024x1024x1024"
-            "2048x2048x2048"
-            "3072x3072x3072"
-            "4096x4096x4096"
-            "8192x8192x8192"
-        )
+    if(AIECC_FOUND)
+        message(STATUS "NPU kernel building enabled (via scripts/build-kernels.sh)")
 
         # Create kernel output directory
         set(KERNEL_OUTPUT_DIR "${CMAKE_BINARY_DIR}/xclbin")
         file(MAKE_DIRECTORY "${KERNEL_OUTPUT_DIR}")
 
-        # Generate aie2p target for each shape
-        foreach(SHAPE ${GGNPU_KERNEL_SHAPES})
-            string(REPLACE "x" "_" SHAPE_NAME "${SHAPE}")
-            set(MLIR_SRC "${CMAKE_SOURCE_DIR}/kernels/amd/matmul_i8/matmul.mlir")
-            set(XCLBIN_OUT "${KERNEL_OUTPUT_DIR}/matmul_aie2p_${SHAPE_NAME}.xclbin")
-
-            add_custom_command(
-                OUTPUT "${XCLBIN_OUT}"
-                COMMAND ${CMAKE_COMMAND} -E make_directory "${KERNEL_OUTPUT_DIR}"
-                COMMAND ${AIECC_BIN}
-                    --target=aie2p
-                    --npu-profile=4
-                    -I"${Peano_INCLUDE_DIRS}"
-                    -L"${Peano_LIBRARIES}"
-                    "${MLIR_SRC}"
-                    -o "${XCLBIN_OUT}"
-                DEPENDS "${MLIR_SRC}"
-                COMMENT "Building NPU kernel: matmul ${SHAPE}"
-                VERBATIM
-            )
-
-            list(APPEND GGNPU_KERNEL_TARGETS "${XCLBIN_OUT}")
-        endforeach()
-
-        add_custom_target(build_npu_kernels ALL
-            DEPENDS ${GGNPU_KERNEL_TARGETS}
+        # Build all kernels using the shell script
+        add_custom_target(build_npu_kernels
+            COMMAND ${CMAKE_COMMAND} -E env
+                AIE_HOME=${AIE_HOME}
+                PEANO_HOME=${PEANO_HOME}
+                GGNPU_CACHE_DIR=${KERNEL_OUTPUT_DIR}
+            ${CMAKE_SOURCE_DIR}/scripts/build-kernels.sh
+            COMMENT "Building all NPU kernels (matmul, rmsnorm, rope, softmax, silu, flash_attn)"
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            VERBATIM
         )
 
         # Install kernels to prefix
@@ -233,8 +204,6 @@ if(GGNPU_BUILD_KERNELS)
             FILES_MATCHING PATTERN "*.xclbin"
         )
 
-    elseif(AIECC_FOUND)
-        message(WARNING "aiecc.py found but Peano not found. Kernel building may fail.")
     else()
         message(STATUS "NPU kernel building disabled (aiecc.py not found)")
         message(STATUS "  Install mlir-aie and set AIE_HOME, or enable prebuilt xclbins")
