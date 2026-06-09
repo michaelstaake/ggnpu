@@ -18,6 +18,7 @@
 #include "cache.h"
 #include "kv_cache.h"
 #include "tokenizer.h"
+#include "weight_cache.h"
 
 namespace ggnpu {
 
@@ -418,6 +419,11 @@ int main(int argc, char* argv[]) {
     std::cout << "Input tokens: " << input_tokens.size() << "\n";
     std::cout << "Prompt: " << params.prompt << "\n\n";
 
+    // Weight cache: decode GGUF quantized weights to INT8 for NPU
+    CompileCache compile_cache(cache_dir, !params.no_cache);
+    WeightCache weight_cache(compile_cache);
+    std::cout << "Weight cache initialized\n";
+
     // Setup working buffers
     int hidden_size = static_cast<int>(hparams.embedding_length);
     int ffn_size = static_cast<int>(hparams.feed_forward_length);
@@ -529,51 +535,63 @@ int main(int argc, char* argv[]) {
             const TensorView* attn_v = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", layer);
 
             if (attn_q) {
-                MulMatParams q_params;
-                q_params.A = inp_norm.data();
-                q_params.B = get_float_ptr(attn_q);
-                q_params.C = q_proj.data();
-                q_params.M = n_tokens;
-                q_params.N = hidden_size;
-                q_params.K = hidden_size;
-                q_params.lda = hidden_size;
-                q_params.ldb = hidden_size;
-                q_params.ldc = hidden_size;
-                q_params.n_batches = 1;
-                q_params.B_type = attn_q->type;
-                backend->mul_mat_q(q_params);
+                const int8_t* decoded_q = weight_cache.get_or_decode(attn_q->name,
+                    attn_q->data, attn_q->data_size(), attn_q->type);
+                if (decoded_q) {
+                    MulMatParams q_params;
+                    q_params.A = inp_norm.data();
+                    q_params.B = decoded_q;
+                    q_params.C = q_proj.data();
+                    q_params.M = n_tokens;
+                    q_params.N = hidden_size;
+                    q_params.K = hidden_size;
+                    q_params.lda = hidden_size;
+                    q_params.ldb = hidden_size;
+                    q_params.ldc = hidden_size;
+                    q_params.n_batches = 1;
+                    q_params.B_type = attn_q->type;
+                    backend->mul_mat_q(q_params);
+                }
             }
 
             if (attn_k) {
-                MulMatParams k_params;
-                k_params.A = inp_norm.data();
-                k_params.B = get_float_ptr(attn_k);
-                k_params.C = k_proj.data();
-                k_params.M = n_tokens;
-                k_params.N = num_kv_heads * head_dim;
-                k_params.K = hidden_size;
-                k_params.lda = hidden_size;
-                k_params.ldb = hidden_size;
-                k_params.ldc = num_kv_heads * head_dim;
-                k_params.n_batches = 1;
-                k_params.B_type = attn_k->type;
-                backend->mul_mat_q(k_params);
+                const int8_t* decoded_k = weight_cache.get_or_decode(attn_k->name,
+                    attn_k->data, attn_k->data_size(), attn_k->type);
+                if (decoded_k) {
+                    MulMatParams k_params;
+                    k_params.A = inp_norm.data();
+                    k_params.B = decoded_k;
+                    k_params.C = k_proj.data();
+                    k_params.M = n_tokens;
+                    k_params.N = num_kv_heads * head_dim;
+                    k_params.K = hidden_size;
+                    k_params.lda = hidden_size;
+                    k_params.ldb = hidden_size;
+                    k_params.ldc = num_kv_heads * head_dim;
+                    k_params.n_batches = 1;
+                    k_params.B_type = attn_k->type;
+                    backend->mul_mat_q(k_params);
+                }
             }
 
             if (attn_v) {
-                MulMatParams v_params;
-                v_params.A = inp_norm.data();
-                v_params.B = get_float_ptr(attn_v);
-                v_params.C = v_proj.data();
-                v_params.M = n_tokens;
-                v_params.N = num_kv_heads * head_dim;
-                v_params.K = hidden_size;
-                v_params.lda = hidden_size;
-                v_params.ldb = hidden_size;
-                v_params.ldc = num_kv_heads * head_dim;
-                v_params.n_batches = 1;
-                v_params.B_type = attn_v->type;
-                backend->mul_mat_q(v_params);
+                const int8_t* decoded_v = weight_cache.get_or_decode(attn_v->name,
+                    attn_v->data, attn_v->data_size(), attn_v->type);
+                if (decoded_v) {
+                    MulMatParams v_params;
+                    v_params.A = inp_norm.data();
+                    v_params.B = decoded_v;
+                    v_params.C = v_proj.data();
+                    v_params.M = n_tokens;
+                    v_params.N = num_kv_heads * head_dim;
+                    v_params.K = hidden_size;
+                    v_params.lda = hidden_size;
+                    v_params.ldb = hidden_size;
+                    v_params.ldc = num_kv_heads * head_dim;
+                    v_params.n_batches = 1;
+                    v_params.B_type = attn_v->type;
+                    backend->mul_mat_q(v_params);
+                }
             }
 
             backend->sync();
@@ -640,24 +658,28 @@ int main(int argc, char* argv[]) {
             const TensorView* attn_output_w = find_tensor_pattern(model, "blk.{layer}.attn_output.weight", layer);
             if (attn_output_w) {
                 std::fill(attn_output.begin(), attn_output.end(), 0.0f);
-                MulMatParams out_params;
-                out_params.A = attn_out.data();
-                out_params.B = get_float_ptr(attn_output_w);
-                out_params.C = attn_output.data();
-                out_params.M = n_tokens;
-                out_params.N = hidden_size;
-                out_params.K = hidden_size;
-                out_params.lda = head_dim;
-                out_params.ldb = hidden_size;
-                out_params.ldc = hidden_size;
-                out_params.n_batches = 1;
-                out_params.B_type = attn_output_w->type;
-                backend->mul_mat_q(out_params);
-                backend->sync();
+                const int8_t* decoded_attn_out = weight_cache.get_or_decode(attn_output_w->name,
+                    attn_output_w->data, attn_output_w->data_size(), attn_output_w->type);
+                if (decoded_attn_out) {
+                    MulMatParams out_params;
+                    out_params.A = attn_out.data();
+                    out_params.B = decoded_attn_out;
+                    out_params.C = attn_output.data();
+                    out_params.M = n_tokens;
+                    out_params.N = hidden_size;
+                    out_params.K = hidden_size;
+                    out_params.lda = head_dim;
+                    out_params.ldb = hidden_size;
+                    out_params.ldc = hidden_size;
+                    out_params.n_batches = 1;
+                    out_params.B_type = attn_output_w->type;
+                    backend->mul_mat_q(out_params);
+                    backend->sync();
 
-                // Add residual
-                for (int i = 0; i < hidden_size; i++) {
-                    inp_embd[i] += attn_output[i];
+                    // Add residual
+                    for (int i = 0; i < hidden_size; i++) {
+                        inp_embd[i] += attn_output[i];
+                    }
                 }
             }
 
@@ -669,35 +691,43 @@ int main(int argc, char* argv[]) {
             const TensorView* ffn_down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", layer);
 
             if (ffn_gate_w) {
-                MulMatParams gate_params;
-                gate_params.A = inp_norm.data();
-                gate_params.B = get_float_ptr(ffn_gate_w);
-                gate_params.C = ffn_gate.data();
-                gate_params.M = n_tokens;
-                gate_params.N = ffn_size;
-                gate_params.K = hidden_size;
-                gate_params.lda = hidden_size;
-                gate_params.ldb = ffn_size;
-                gate_params.ldc = ffn_size;
-                gate_params.n_batches = 1;
-                gate_params.B_type = ffn_gate_w->type;
-                backend->mul_mat_q(gate_params);
+                const int8_t* decoded_gate = weight_cache.get_or_decode(ffn_gate_w->name,
+                    ffn_gate_w->data, ffn_gate_w->data_size(), ffn_gate_w->type);
+                if (decoded_gate) {
+                    MulMatParams gate_params;
+                    gate_params.A = inp_norm.data();
+                    gate_params.B = decoded_gate;
+                    gate_params.C = ffn_gate.data();
+                    gate_params.M = n_tokens;
+                    gate_params.N = ffn_size;
+                    gate_params.K = hidden_size;
+                    gate_params.lda = hidden_size;
+                    gate_params.ldb = ffn_size;
+                    gate_params.ldc = ffn_size;
+                    gate_params.n_batches = 1;
+                    gate_params.B_type = ffn_gate_w->type;
+                    backend->mul_mat_q(gate_params);
+                }
             }
 
             if (ffn_up_w) {
-                MulMatParams up_params;
-                up_params.A = inp_norm.data();
-                up_params.B = get_float_ptr(ffn_up_w);
-                up_params.C = ffn_up.data();
-                up_params.M = n_tokens;
-                up_params.N = ffn_size;
-                up_params.K = hidden_size;
-                up_params.lda = hidden_size;
-                up_params.ldb = ffn_size;
-                up_params.ldc = ffn_size;
-                up_params.n_batches = 1;
-                up_params.B_type = ffn_up_w->type;
-                backend->mul_mat_q(up_params);
+                const int8_t* decoded_up = weight_cache.get_or_decode(ffn_up_w->name,
+                    ffn_up_w->data, ffn_up_w->data_size(), ffn_up_w->type);
+                if (decoded_up) {
+                    MulMatParams up_params;
+                    up_params.A = inp_norm.data();
+                    up_params.B = decoded_up;
+                    up_params.C = ffn_up.data();
+                    up_params.M = n_tokens;
+                    up_params.N = ffn_size;
+                    up_params.K = hidden_size;
+                    up_params.lda = hidden_size;
+                    up_params.ldb = ffn_size;
+                    up_params.ldc = ffn_size;
+                    up_params.n_batches = 1;
+                    up_params.B_type = ffn_up_w->type;
+                    backend->mul_mat_q(up_params);
+                }
             }
 
             backend->sync();
@@ -710,24 +740,28 @@ int main(int argc, char* argv[]) {
             // FFN down projection
             if (ffn_down_w) {
                 std::fill(ffn_down.begin(), ffn_down.end(), 0.0f);
-                MulMatParams down_params;
-                down_params.A = ffn_silu.data();
-                down_params.B = get_float_ptr(ffn_down_w);
-                down_params.C = ffn_down.data();
-                down_params.M = n_tokens;
-                down_params.N = hidden_size;
-                down_params.K = ffn_size;
-                down_params.lda = ffn_size;
-                down_params.ldb = hidden_size;
-                down_params.ldc = hidden_size;
-                down_params.n_batches = 1;
-                down_params.B_type = ffn_down_w->type;
-                backend->mul_mat_q(down_params);
-                backend->sync();
+                const int8_t* decoded_down = weight_cache.get_or_decode(ffn_down_w->name,
+                    ffn_down_w->data, ffn_down_w->data_size(), ffn_down_w->type);
+                if (decoded_down) {
+                    MulMatParams down_params;
+                    down_params.A = ffn_silu.data();
+                    down_params.B = decoded_down;
+                    down_params.C = ffn_down.data();
+                    down_params.M = n_tokens;
+                    down_params.N = hidden_size;
+                    down_params.K = ffn_size;
+                    down_params.lda = ffn_size;
+                    down_params.ldb = hidden_size;
+                    down_params.ldc = hidden_size;
+                    down_params.n_batches = 1;
+                    down_params.B_type = ffn_down_w->type;
+                    backend->mul_mat_q(down_params);
+                    backend->sync();
 
-                // Add residual
-                for (int i = 0; i < hidden_size; i++) {
-                    inp_embd[i] += ffn_down[i];
+                    // Add residual
+                    for (int i = 0; i < hidden_size; i++) {
+                        inp_embd[i] += ffn_down[i];
+                    }
                 }
             }
         }

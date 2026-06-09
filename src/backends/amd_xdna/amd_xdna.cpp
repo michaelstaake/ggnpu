@@ -175,8 +175,17 @@ public:
 
         // Allocate or reuse buffers
         size_t size_a = M * K * sizeof(float);
-        size_t size_b = K * N * ggml_type_size(params.B_type);
         size_t size_c = M * N * sizeof(float);
+
+        // Calculate B buffer size based on type
+        size_t size_b;
+        if (params.B_type == GgmlType::I8) {
+            // Decoded INT8: 1 byte per element
+            size_b = K * N;
+        } else {
+            // Original quantized format (Q8_0, Q4_0, etc.)
+            size_b = K * N * ggml_type_size(params.B_type) / ggml_blck_size(params.B_type);
+        }
 
         if (!buf_a_ || buf_a_->size() < size_a) {
             buf_a_ = buf_mgr_->alloc(size_a, true);
