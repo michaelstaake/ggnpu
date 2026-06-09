@@ -21,12 +21,33 @@ namespace ggnpu {
 
 namespace fs = std::filesystem;
 
+// Hash specializations for unordered_map keys
+template<>
+struct std::hash<std::pair<int, int>> {
+    size_t operator()(const std::pair<int, int>& p) const {
+        return std::hash<int>{}(p.first) ^ (std::hash<int>{}(p.second) << 1);
+    }
+};
+
+template<>
+struct std::hash<std::tuple<int, int, int64_t>> {
+    size_t operator()(const std::tuple<int, int, int64_t>& t) const {
+        return std::hash<int>{}(std::get<0>(t))
+             ^ (std::hash<int>{}(std::get<1>(t)) << 1)
+             ^ (std::hash<int64_t>{}(std::get<2>(t)) << 2);
+    }
+};
+
 // Forward declarations from kernels.cpp
 namespace detail {
     std::vector<uint8_t> load_xclbin_file(const std::string& path);
     std::string find_prebuilt_xclbin(const std::string& xclbin_name, const std::string& cache_dir);
     std::vector<uint8_t> jit_compile_matmul(int M, int N, int K, int profile);
     std::vector<uint8_t> jit_compile_rmsnorm(int N, int profile);
+    std::vector<uint8_t> jit_compile_rope(int n_dims, int profile);
+    std::vector<uint8_t> jit_compile_softmax(int cols, int rows, int profile);
+    std::vector<uint8_t> jit_compile_silu(int size, int profile);
+    std::vector<uint8_t> jit_compile_flash_attn(int n_head, int head_dim, int64_t ctx_len, int profile);
     std::string make_cache_key(const std::string& op, int M, int N, int K, const std::string& profile);
 }
 
@@ -106,6 +127,37 @@ struct CachedRmsNormKernel {
     int N;
 };
 
+// Cached kernel for RoPE
+struct CachedRopeKernel {
+    xrt::ip_handle ip_handle;
+    xrt::run run;
+    int n_dims;
+};
+
+// Cached kernel for softmax
+struct CachedSoftmaxKernel {
+    xrt::ip_handle ip_handle;
+    xrt::run run;
+    int rows;
+    int cols;
+};
+
+// Cached kernel for SiLU
+struct CachedSiluKernel {
+    xrt::ip_handle ip_handle;
+    xrt::run run;
+    int size;
+};
+
+// Cached kernel for Flash Attention
+struct CachedFlashAttnKernel {
+    xrt::ip_handle ip_handle;
+    xrt::run run;
+    int n_head;
+    int head_dim;
+    int64_t ctx_len;
+};
+
 // AMD XDNA NPU backend
 class AmdXdnaBackend : public Backend {
 public:
@@ -152,6 +204,18 @@ public:
 
         // Load or compile rmsnorm xclbin
         load_rmsnorm_xclbin();
+
+        // Load or compile rope xclbin
+        load_rope_xclbin();
+
+        // Load or compile softmax xclbin
+        load_softmax_xclbin();
+
+        // Load or compile silu xclbin
+        load_silu_xclbin();
+
+        // Load or compile flash_attn xclbin
+        load_flash_attn_xclbin();
     }
 
     ~AmdXdnaBackend() override = default;
@@ -240,19 +304,9 @@ public:
         auto it = rmsnorm_kernels_.find(N);
         if (it == rmsnorm_kernels_.end()) {
             if (!ensure_rmsnorm_kernel(N, cache_key)) {
-                // Fall back to CPU if NPU kernel unavailable
-                std::cerr << "Warning: rmsnorm NPU kernel unavailable, using CPU fallback\n";
-                float variance = 0.0f;
-                for (int i = 0; i < params.size; i++) {
-                    variance += params.input[i] * params.input[i];
-                }
-                variance /= params.size;
-                variance += params.eps;
-                float inv_std = 1.0f / std::sqrt(variance);
-                for (int i = 0; i < params.size; i++) {
-                    params.output[i] = params.input[i] * inv_std;
-                }
-                return Status::OK;
+                std::cerr << "Error: rmsnorm NPU kernel unavailable for N=" << N << "\n";
+                last_status_ = Status::NPU_UNAVAILABLE;
+                return last_status_;
             }
             it = rmsnorm_kernels_.find(N);
         }
@@ -284,7 +338,8 @@ public:
     }
 
     Status rope(const RopeParams& params) override {
-        // Stub: compute on host for now, NPU kernel to be added in Phase 4
+        // RoPE is relatively cheap (O(n_dims) per head) compared to matmul.
+        // Keep on CPU for now; the NPU kernel infrastructure is in place for Phase 6+.
         for (int64_t i = 0; i < params.rope_dims; i += 2) {
             float ratio = 1.0f / std::pow(10000.0f, static_cast<float>(i) / params.n_dims);
             float val = params.offset * ratio * params.freq_scale;
@@ -300,40 +355,164 @@ public:
     }
 
     Status softmax(const SoftmaxParams& params) override {
-        // Stub: compute on host for now, NPU kernel to be added in Phase 4
-        for (int r = 0; r < params.rows; r++) {
-            float max_val = -INFINITY;
-            for (int c = 0; c < params.cols; c++) {
-                float val = params.input[r * params.cols + c];
-                if (val > max_val) max_val = val;
-            }
-
-            float sum = 0.0f;
-            for (int c = 0; c < params.cols; c++) {
-                params.output[r * params.cols + c] = std::exp(params.input[r * params.cols + c] - max_val);
-                sum += params.output[r * params.cols + c];
-            }
-
-            for (int c = 0; c < params.cols; c++) {
-                params.output[r * params.cols + c] /= sum;
-            }
+        if (!params.input || !params.output || params.rows <= 0 || params.cols <= 0) {
+            last_status_ = Status::INVALID_PARAM;
+            return last_status_;
         }
+
+        int rows = params.rows;
+        int cols = params.cols;
+        std::string cache_key = "softmax_" + std::to_string(rows) + "x" + std::to_string(cols) + "_" + profile_str_;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto key = std::make_pair(rows, cols);
+        auto it = softmax_kernels_.find(key);
+        if (it == softmax_kernels_.end()) {
+            if (!ensure_softmax_kernel(rows, cols, cache_key)) {
+                std::cerr << "Error: softmax NPU kernel unavailable for " << rows << "x" << cols << "\n";
+                last_status_ = Status::NPU_UNAVAILABLE;
+                return last_status_;
+            }
+            it = softmax_kernels_.find(key);
+        }
+
+        auto& kernel = it->second;
+
+        size_t size_bytes = rows * cols * sizeof(float);
+        if (!buf_softmax_in_ || buf_softmax_in_->size() < size_bytes) {
+            buf_softmax_in_ = buf_mgr_->alloc(size_bytes, true);
+        }
+        if (!buf_softmax_out_ || buf_softmax_out_->size() < size_bytes) {
+            buf_softmax_out_ = buf_mgr_->alloc(size_bytes, true);
+        }
+
+        buf_mgr_->copy_to(*buf_softmax_in_, params.input, size_bytes);
+
+        try {
+            kernel.run(buf_softmax_in_->handle(), buf_softmax_out_->handle(),
+                       static_cast<uint32_t>(rows), static_cast<uint32_t>(cols));
+        } catch (const std::exception& e) {
+            std::cerr << "Error: softmax kernel execution failed: " << e.what() << "\n";
+            last_status_ = Status::ERROR;
+            return last_status_;
+        }
+
+        buf_mgr_->copy_from(*buf_softmax_out_, params.output, size_bytes);
+
         return Status::OK;
     }
 
     Status silu(const SiluParams& params) override {
-        // Stub: compute on host for now, NPU kernel to be added in Phase 4
-        for (int i = 0; i < params.size; i++) {
-            float x = params.input[i];
-            params.output[i] = x / (1.0f + std::exp(-x));
+        if (!params.input || !params.output || params.size <= 0) {
+            last_status_ = Status::INVALID_PARAM;
+            return last_status_;
         }
+
+        int size = params.size;
+        std::string cache_key = "silu_" + std::to_string(size) + "_" + profile_str_;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = silu_kernels_.find(size);
+        if (it == silu_kernels_.end()) {
+            if (!ensure_silu_kernel(size, cache_key)) {
+                std::cerr << "Error: silu NPU kernel unavailable for size=" << size << "\n";
+                last_status_ = Status::NPU_UNAVAILABLE;
+                return last_status_;
+            }
+            it = silu_kernels_.find(size);
+        }
+
+        auto& kernel = it->second;
+
+        size_t size_bytes = size * sizeof(float);
+        if (!buf_silu_in_ || buf_silu_in_->size() < size_bytes) {
+            buf_silu_in_ = buf_mgr_->alloc(size_bytes, true);
+        }
+        if (!buf_silu_out_ || buf_silu_out_->size() < size_bytes) {
+            buf_silu_out_ = buf_mgr_->alloc(size_bytes, true);
+        }
+
+        buf_mgr_->copy_to(*buf_silu_in_, params.input, size_bytes);
+
+        try {
+            kernel.run(buf_silu_in_->handle(), buf_silu_out_->handle(),
+                       static_cast<uint32_t>(size));
+        } catch (const std::exception& e) {
+            std::cerr << "Error: silu kernel execution failed: " << e.what() << "\n";
+            last_status_ = Status::ERROR;
+            return last_status_;
+        }
+
+        buf_mgr_->copy_from(*buf_silu_out_, params.output, size_bytes);
+
         return Status::OK;
     }
 
     Status flash_attn(const AttnParams& params) override {
-        // Stub: not yet implemented for NPU
-        last_status_ = Status::NOT_FOUND;
-        return last_status_;
+        if (!params.Q || !params.K || !params.V || !params.output || params.n_head <= 0 || params.head_dim <= 0) {
+            last_status_ = Status::INVALID_PARAM;
+            return last_status_;
+        }
+
+        int n_head = params.n_head;
+        int head_dim = params.head_dim;
+        int64_t ctx_len = params.ctx_len;
+        std::string cache_key = "flash_attn_" + std::to_string(n_head) + "x" + std::to_string(head_dim) + "x" + std::to_string(ctx_len) + "_" + profile_str_;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto key = std::make_tuple(n_head, head_dim, ctx_len);
+        auto it = flash_attn_kernels_.find(key);
+        if (it == flash_attn_kernels_.end()) {
+            if (!ensure_flash_attn_kernel(n_head, head_dim, ctx_len, cache_key)) {
+                std::cerr << "Error: flash_attn NPU kernel unavailable for " << n_head << "x" << head_dim << "x" << ctx_len << "\n";
+                last_status_ = Status::NPU_UNAVAILABLE;
+                return last_status_;
+            }
+            it = flash_attn_kernels_.find(key);
+        }
+
+        auto& kernel = it->second;
+
+        size_t size_q = n_head * head_dim * sizeof(float);
+        size_t size_k = ctx_len * head_dim * sizeof(float);
+        size_t size_v = ctx_len * head_dim * sizeof(float);
+        size_t size_out = n_head * head_dim * sizeof(float);
+
+        if (!buf_fa_q_ || buf_fa_q_->size() < size_q) {
+            buf_fa_q_ = buf_mgr_->alloc(size_q, true);
+        }
+        if (!buf_fa_k_ || buf_fa_k_->size() < size_k) {
+            buf_fa_k_ = buf_mgr_->alloc(size_k, true);
+        }
+        if (!buf_fa_v_ || buf_fa_v_->size() < size_v) {
+            buf_fa_v_ = buf_mgr_->alloc(size_v, true);
+        }
+        if (!buf_fa_out_ || buf_fa_out_->size() < size_out) {
+            buf_fa_out_ = buf_mgr_->alloc(size_out, true);
+        }
+
+        buf_mgr_->copy_to(*buf_fa_q_, params.Q, size_q);
+        buf_mgr_->copy_to(*buf_fa_k_, params.K, size_k);
+        buf_mgr_->copy_to(*buf_fa_v_, params.V, size_v);
+
+        try {
+            kernel.run(buf_fa_q_->handle(), buf_fa_k_->handle(), buf_fa_v_->handle(),
+                       buf_fa_out_->handle(),
+                       static_cast<uint32_t>(n_head),
+                       static_cast<uint32_t>(head_dim),
+                       static_cast<uint32_t>(ctx_len));
+        } catch (const std::exception& e) {
+            std::cerr << "Error: flash_attn kernel execution failed: " << e.what() << "\n";
+            last_status_ = Status::ERROR;
+            return last_status_;
+        }
+
+        buf_mgr_->copy_from(*buf_fa_out_, params.output, size_out);
+
+        return Status::OK;
     }
 
     void sync() override {
@@ -556,6 +735,370 @@ private:
         }
     }
 
+    // Load or compile the rope xclbin for the target NPU profile
+    bool load_rope_xclbin() {
+        std::string xclbin_name = "rope_" + profile_str_ + ".xclbin";
+        std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
+
+        if (xclbin_path.empty() && cache_->has_xclbin(xclbin_name)) {
+            xclbin_path = cache_->get_xclbin_path(xclbin_name);
+        }
+
+        if (xclbin_path.empty()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_rope(128, npu_profile_);
+            if (!xclbin_data.empty()) {
+                std::string cache_key = detail::make_cache_key("rope", 128, 0, 0, profile_str_);
+                cache_->store_xclbin(cache_key, xclbin_data);
+                xclbin_path = cache_->get_xclbin_path(cache_key);
+            }
+        }
+
+        if (xclbin_path.empty()) {
+            std::cerr << "Warning: no rope xclbin found for profile " << profile_str_ << "\n";
+            return false;
+        }
+
+        try {
+            xclbin_data_rope_ = detail::load_xclbin_file(xclbin_path);
+            if (xclbin_data_rope_.empty()) {
+                std::cerr << "Error: failed to read xclbin: " << xclbin_path << "\n";
+                return false;
+            }
+
+            xclbin_uuid_rope_ = device_->load_xclbin(xclbin_data_rope_);
+            std::cout << "Loaded rope xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_rope_ << "\n";
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to load rope xclbin: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool ensure_rope_kernel(int n_dims, const std::string& cache_key) {
+        if (cache_->has_xclbin(cache_key)) {
+            std::string cached_path = cache_->get_xclbin_path(cache_key);
+            return load_rope_kernel_for_shape(cached_path, n_dims, cache_key);
+        }
+
+        if (rope_kernels_.empty() && !xclbin_uuid_rope_.is_none()) {
+            return create_rope_kernel_from_loaded_xclbin(n_dims, cache_key);
+        }
+
+        std::vector<uint8_t> xclbin_data = detail::jit_compile_rope(n_dims, npu_profile_);
+        if (!xclbin_data.empty()) {
+            cache_->store_xclbin(cache_key, xclbin_data);
+            return load_rope_kernel_for_shape(cache_->get_xclbin_path(cache_key), n_dims, cache_key);
+        }
+
+        std::cerr << "Error: no xclbin available for rope n_dims=" << n_dims << "\n";
+        return false;
+    }
+
+    bool load_rope_kernel_for_shape(const std::string& path, int n_dims, const std::string& cache_key) {
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) return false;
+
+            xrt::device tmp_device(*device_);
+            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
+
+            xrt::ip_handle ip(tmp_device, tmp_uuid);
+            xrt::run run(ip, "rope");
+
+            rope_kernels_[n_dims] = {ip, run, n_dims};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load rope kernel from cache: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool create_rope_kernel_from_loaded_xclbin(int n_dims, const std::string& cache_key) {
+        try {
+            xrt::ip_handle ip(*device_, xclbin_uuid_rope_);
+            xrt::run run(ip, "rope");
+
+            rope_kernels_[n_dims] = {ip, run, n_dims};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to create rope kernel: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    // Load or compile the softmax xclbin for the target NPU profile
+    bool load_softmax_xclbin() {
+        std::string xclbin_name = "softmax_" + profile_str_ + ".xclbin";
+        std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
+
+        if (xclbin_path.empty() && cache_->has_xclbin(xclbin_name)) {
+            xclbin_path = cache_->get_xclbin_path(xclbin_name);
+        }
+
+        if (xclbin_path.empty()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_softmax(1024, 1, npu_profile_);
+            if (!xclbin_data.empty()) {
+                std::string cache_key = detail::make_cache_key("softmax", 1, 1024, 0, profile_str_);
+                cache_->store_xclbin(cache_key, xclbin_data);
+                xclbin_path = cache_->get_xclbin_path(cache_key);
+            }
+        }
+
+        if (xclbin_path.empty()) {
+            std::cerr << "Warning: no softmax xclbin found for profile " << profile_str_ << "\n";
+            return false;
+        }
+
+        try {
+            xclbin_data_softmax_ = detail::load_xclbin_file(xclbin_path);
+            if (xclbin_data_softmax_.empty()) {
+                std::cerr << "Error: failed to read xclbin: " << xclbin_path << "\n";
+                return false;
+            }
+
+            xclbin_uuid_softmax_ = device_->load_xclbin(xclbin_data_softmax_);
+            std::cout << "Loaded softmax xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_softmax_ << "\n";
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to load softmax xclbin: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool ensure_softmax_kernel(int rows, int cols, const std::string& cache_key) {
+        if (cache_->has_xclbin(cache_key)) {
+            std::string cached_path = cache_->get_xclbin_path(cache_key);
+            return load_softmax_kernel_for_shape(cached_path, rows, cols, cache_key);
+        }
+
+        if (softmax_kernels_.empty() && !xclbin_uuid_softmax_.is_none()) {
+            return create_softmax_kernel_from_loaded_xclbin(rows, cols, cache_key);
+        }
+
+        std::vector<uint8_t> xclbin_data = detail::jit_compile_softmax(cols, rows, npu_profile_);
+        if (!xclbin_data.empty()) {
+            cache_->store_xclbin(cache_key, xclbin_data);
+            return load_softmax_kernel_for_shape(cache_->get_xclbin_path(cache_key), rows, cols, cache_key);
+        }
+
+        std::cerr << "Error: no xclbin available for softmax " << rows << "x" << cols << "\n";
+        return false;
+    }
+
+    bool load_softmax_kernel_for_shape(const std::string& path, int rows, int cols, const std::string& cache_key) {
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) return false;
+
+            xrt::device tmp_device(*device_);
+            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
+
+            xrt::ip_handle ip(tmp_device, tmp_uuid);
+            xrt::run run(ip, "softmax");
+
+            softmax_kernels_[std::make_pair(rows, cols)] = {ip, run, rows, cols};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load softmax kernel from cache: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool create_softmax_kernel_from_loaded_xclbin(int rows, int cols, const std::string& cache_key) {
+        try {
+            xrt::ip_handle ip(*device_, xclbin_uuid_softmax_);
+            xrt::run run(ip, "softmax");
+
+            softmax_kernels_[std::make_pair(rows, cols)] = {ip, run, rows, cols};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to create softmax kernel: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    // Load or compile the silu xclbin for the target NPU profile
+    bool load_silu_xclbin() {
+        std::string xclbin_name = "silu_" + profile_str_ + ".xclbin";
+        std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
+
+        if (xclbin_path.empty() && cache_->has_xclbin(xclbin_name)) {
+            xclbin_path = cache_->get_xclbin_path(xclbin_name);
+        }
+
+        if (xclbin_path.empty()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_silu(8192, npu_profile_);
+            if (!xclbin_data.empty()) {
+                std::string cache_key = detail::make_cache_key("silu", 8192, 0, 0, profile_str_);
+                cache_->store_xclbin(cache_key, xclbin_data);
+                xclbin_path = cache_->get_xclbin_path(cache_key);
+            }
+        }
+
+        if (xclbin_path.empty()) {
+            std::cerr << "Warning: no silu xclbin found for profile " << profile_str_ << "\n";
+            return false;
+        }
+
+        try {
+            xclbin_data_silu_ = detail::load_xclbin_file(xclbin_path);
+            if (xclbin_data_silu_.empty()) {
+                std::cerr << "Error: failed to read xclbin: " << xclbin_path << "\n";
+                return false;
+            }
+
+            xclbin_uuid_silu_ = device_->load_xclbin(xclbin_data_silu_);
+            std::cout << "Loaded silu xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_silu_ << "\n";
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to load silu xclbin: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool ensure_silu_kernel(int size, const std::string& cache_key) {
+        if (cache_->has_xclbin(cache_key)) {
+            std::string cached_path = cache_->get_xclbin_path(cache_key);
+            return load_silu_kernel_for_shape(cached_path, size, cache_key);
+        }
+
+        if (silu_kernels_.empty() && !xclbin_uuid_silu_.is_none()) {
+            return create_silu_kernel_from_loaded_xclbin(size, cache_key);
+        }
+
+        std::vector<uint8_t> xclbin_data = detail::jit_compile_silu(size, npu_profile_);
+        if (!xclbin_data.empty()) {
+            cache_->store_xclbin(cache_key, xclbin_data);
+            return load_silu_kernel_for_shape(cache_->get_xclbin_path(cache_key), size, cache_key);
+        }
+
+        std::cerr << "Error: no xclbin available for silu size=" << size << "\n";
+        return false;
+    }
+
+    bool load_silu_kernel_for_shape(const std::string& path, int size, const std::string& cache_key) {
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) return false;
+
+            xrt::device tmp_device(*device_);
+            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
+
+            xrt::ip_handle ip(tmp_device, tmp_uuid);
+            xrt::run run(ip, "silu");
+
+            silu_kernels_[size] = {ip, run, size};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load silu kernel from cache: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool create_silu_kernel_from_loaded_xclbin(int size, const std::string& cache_key) {
+        try {
+            xrt::ip_handle ip(*device_, xclbin_uuid_silu_);
+            xrt::run run(ip, "silu");
+
+            silu_kernels_[size] = {ip, run, size};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to create silu kernel: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    // Load or compile the flash_attn xclbin for the target NPU profile
+    bool load_flash_attn_xclbin() {
+        std::string xclbin_name = "flash_attn_" + profile_str_ + ".xclbin";
+        std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
+
+        if (xclbin_path.empty() && cache_->has_xclbin(xclbin_name)) {
+            xclbin_path = cache_->get_xclbin_path(xclbin_name);
+        }
+
+        if (xclbin_path.empty()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_flash_attn(8, 128, 2048, npu_profile_);
+            if (!xclbin_data.empty()) {
+                std::string cache_key = detail::make_cache_key("flash_attn", 8, 128, 2048, profile_str_);
+                cache_->store_xclbin(cache_key, xclbin_data);
+                xclbin_path = cache_->get_xclbin_path(cache_key);
+            }
+        }
+
+        if (xclbin_path.empty()) {
+            std::cerr << "Warning: no flash_attn xclbin found for profile " << profile_str_ << "\n";
+            return false;
+        }
+
+        try {
+            xclbin_data_fa_ = detail::load_xclbin_file(xclbin_path);
+            if (xclbin_data_fa_.empty()) {
+                std::cerr << "Error: failed to read xclbin: " << xclbin_path << "\n";
+                return false;
+            }
+
+            xclbin_uuid_fa_ = device_->load_xclbin(xclbin_data_fa_);
+            std::cout << "Loaded flash_attn xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_fa_ << "\n";
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to load flash_attn xclbin: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool ensure_flash_attn_kernel(int n_head, int head_dim, int64_t ctx_len, const std::string& cache_key) {
+        if (cache_->has_xclbin(cache_key)) {
+            std::string cached_path = cache_->get_xclbin_path(cache_key);
+            return load_flash_attn_kernel_for_shape(cached_path, n_head, head_dim, ctx_len, cache_key);
+        }
+
+        if (flash_attn_kernels_.empty() && !xclbin_uuid_fa_.is_none()) {
+            return create_flash_attn_kernel_from_loaded_xclbin(n_head, head_dim, ctx_len, cache_key);
+        }
+
+        std::vector<uint8_t> xclbin_data = detail::jit_compile_flash_attn(n_head, head_dim, ctx_len, npu_profile_);
+        if (!xclbin_data.empty()) {
+            cache_->store_xclbin(cache_key, xclbin_data);
+            return load_flash_attn_kernel_for_shape(cache_->get_xclbin_path(cache_key), n_head, head_dim, ctx_len, cache_key);
+        }
+
+        std::cerr << "Error: no xclbin available for flash_attn " << n_head << "x" << head_dim << "x" << ctx_len << "\n";
+        return false;
+    }
+
+    bool load_flash_attn_kernel_for_shape(const std::string& path, int n_head, int head_dim, int64_t ctx_len, const std::string& cache_key) {
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) return false;
+
+            xrt::device tmp_device(*device_);
+            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
+
+            xrt::ip_handle ip(tmp_device, tmp_uuid);
+            xrt::run run(ip, "flash_attn");
+
+            flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = {ip, run, n_head, head_dim, ctx_len};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load flash_attn kernel from cache: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool create_flash_attn_kernel_from_loaded_xclbin(int n_head, int head_dim, int64_t ctx_len, const std::string& cache_key) {
+        try {
+            xrt::ip_handle ip(*device_, xclbin_uuid_fa_);
+            xrt::run run(ip, "flash_attn");
+
+            flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = {ip, run, n_head, head_dim, ctx_len};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to create flash_attn kernel: " << e.what() << "\n";
+            return false;
+        }
+    }
+
     std::shared_ptr<xrt::device> device_;
     std::shared_ptr<BufferMgr> buf_mgr_;
     std::unique_ptr<CompileCache> cache_;
@@ -566,6 +1109,18 @@ private:
     std::vector<uint8_t> xclbin_data_rmsnorm_;
     xrt::uuid xclbin_uuid_rmsnorm_;
 
+    std::vector<uint8_t> xclbin_data_rope_;
+    xrt::uuid xclbin_uuid_rope_;
+
+    std::vector<uint8_t> xclbin_data_softmax_;
+    xrt::uuid xclbin_uuid_softmax_;
+
+    std::vector<uint8_t> xclbin_data_silu_;
+    xrt::uuid xclbin_uuid_silu_;
+
+    std::vector<uint8_t> xclbin_data_fa_;
+    xrt::uuid xclbin_uuid_fa_;
+
     std::shared_ptr<XrtBuffer> buf_a_;
     std::shared_ptr<XrtBuffer> buf_b_;
     std::shared_ptr<XrtBuffer> buf_c_;
@@ -573,8 +1128,26 @@ private:
     std::shared_ptr<XrtBuffer> buf_rmsnorm_in_;
     std::shared_ptr<XrtBuffer> buf_rmsnorm_out_;
 
+    std::shared_ptr<XrtBuffer> buf_rope_in_;
+    std::shared_ptr<XrtBuffer> buf_rope_out_;
+
+    std::shared_ptr<XrtBuffer> buf_softmax_in_;
+    std::shared_ptr<XrtBuffer> buf_softmax_out_;
+
+    std::shared_ptr<XrtBuffer> buf_silu_in_;
+    std::shared_ptr<XrtBuffer> buf_silu_out_;
+
+    std::shared_ptr<XrtBuffer> buf_fa_q_;
+    std::shared_ptr<XrtBuffer> buf_fa_k_;
+    std::shared_ptr<XrtBuffer> buf_fa_v_;
+    std::shared_ptr<XrtBuffer> buf_fa_out_;
+
     std::unordered_map<std::string, CachedKernel> matmul_kernels_;
     std::unordered_map<int, CachedRmsNormKernel> rmsnorm_kernels_;
+    std::unordered_map<int, CachedRopeKernel> rope_kernels_;
+    std::unordered_map<std::pair<int, int>, CachedSoftmaxKernel, std::hash<std::pair<int, int>>> softmax_kernels_;
+    std::unordered_map<int, CachedSiluKernel> silu_kernels_;
+    std::unordered_map<std::tuple<int, int, int64_t>, CachedFlashAttnKernel, std::hash<std::tuple<int, int, int64_t>>> flash_attn_kernels_;
 
     int npu_profile_ = 6;
     std::string profile_str_ = "npu6";

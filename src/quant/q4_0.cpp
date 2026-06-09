@@ -11,8 +11,7 @@ namespace ggnpu {
 // Dequantize a single Q4_0 block to float
 static void dequantize_q4_0_block(const uint8_t* block, float* out) {
     const Q4_0Block* qb = reinterpret_cast<const Q4_0Block*>(block);
-    int16_t d_signed = static_cast<int16_t>(qb->d);
-    float d = d_signed;
+    float d = static_cast<float>(qb->d);
 
     for (int i = 0; i < 16; i++) {
         uint8_t nibble = (i % 2 == 0) ? (qb->qs[i / 2] & 0x0F) : (qb->qs[i / 2] >> 4);
@@ -32,8 +31,7 @@ void decode_q4_0_for_npu(const uint8_t* gguf_data, size_t data_size,
     for (int i = 0; i < num_blocks; i++) {
         const uint8_t* block = gguf_data + i * sizeof(Q4_0Block);
         const Q4_0Block* qb = reinterpret_cast<const Q4_0Block*>(block);
-        int16_t d_signed = static_cast<int16_t>(qb->d);
-        scales_output[i] = d_signed;
+        scales_output[i] = static_cast<float>(qb->d);
 
         for (int j = 0; j < 16; j++) {
             uint8_t nibble = (j % 2 == 0) ? (qb->qs[j / 2] & 0x0F) : (qb->qs[j / 2] >> 4);

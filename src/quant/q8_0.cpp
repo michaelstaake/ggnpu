@@ -1,4 +1,5 @@
 #include "tensor.h"
+#include "quant/q8_0.h"
 #include <vector>
 #include <cstdint>
 #include <cstring>
@@ -6,21 +7,10 @@
 
 namespace ggnpu {
 
-// Q8_0 quantization: 32 values per block, 34 bytes
-// Block structure:
-//   int16_t d (scale)
-//   int8_t  qs[32] (quantized values, range -128 to 127)
-
-struct Q8_0Block {
-    int16_t d;
-    int8_t qs[32];
-};
-
 // Dequantize a single Q8_0 block to float
 static void dequantize_q8_0_block(const uint8_t* block, float* out) {
-    Q8_0Block* qb = reinterpret_cast<Q8_0Block*>(const_cast<uint8_t*>(block));
-    int16_t d_signed = static_cast<int16_t>(qb->d);
-    float d = d_signed;
+    const Q8_0Block* qb = reinterpret_cast<const Q8_0Block*>(block);
+    float d = static_cast<float>(qb->d);
 
     for (int i = 0; i < 32; i++) {
         out[i] = static_cast<float>(qb->qs[i]) * d;
@@ -28,7 +18,7 @@ static void dequantize_q8_0_block(const uint8_t* block, float* out) {
 }
 
 // Quantize a block of floats to Q8_0
-static void quantize_q8_0_block(const float* input, uint8_t* output, int size = 32) {
+static void quantize_q8_0_block(const float* input, uint8_t* output, int size) {
     Q8_0Block* qb = reinterpret_cast<Q8_0Block*>(output);
     float max_val = 0.0f;
 
@@ -56,10 +46,9 @@ void decode_q8_0_for_npu(const uint8_t* gguf_data, size_t data_size,
 
     for (int i = 0; i < num_blocks; i++) {
         const uint8_t* block = gguf_data + i * sizeof(Q8_0Block);
-        Q8_0Block* qb = reinterpret_cast<Q8_0Block*>(const_cast<uint8_t*>(block));
+        const Q8_0Block* qb = reinterpret_cast<const Q8_0Block*>(block);
 
-        int16_t d_signed = static_cast<int16_t>(qb->d);
-        scales_output[i] = d_signed;
+        scales_output[i] = static_cast<float>(qb->d);
 
         std::memcpy(int8_output.data() + i * 32, qb->qs, 32);
     }

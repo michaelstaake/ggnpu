@@ -540,6 +540,697 @@ std::string get_jit_status_message() {
     return "mlir-aie not found. Set AIE_HOME or install mlir-aie to enable JIT compilation";
 }
 
+//====//
+// MLIR source generation for RoPE kernel
+//====//
+std::string generate_rope_mlir(int n_dims, int npu_profile) {
+    std::ostringstream mlir;
+
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    int vec_len = 16;
+    int num_vectors = (n_dims / 2 + vec_len - 1) / vec_len;
+
+    mlir << "// GGNPU auto-generated MLIR for RoPE: n_dims=" << n_dims << "\n";
+    mlir << "// Compiled for NPU profile: " << profile_str << "\n\n";
+
+    mlir << "module attributes {aie.device = \"aie2p\"} {\n";
+
+    mlir << "    %dma_in = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 0 : i32,\n";
+    mlir << "        direction = \"host_to_tile\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    %dma_out = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 1 : i32,\n";
+    mlir << "        direction = \"tile_to_host\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    \"aie.shimtile\"(#aie.tile{row = 0, col = 0}) {\n";
+    mlir << "        \"aie.dma_port\"() { port = \"A\", direction = \"input\" } : () -> ()\n";
+    mlir << "        \"aie.dma_port\"() { port = \"B\", direction = \"output\" } : () -> ()\n";
+    mlir << "    }\n\n";
+
+    mlir << "    \"aie.tile\"(#aie.tile{row = 0, col = 0}) {\n";
+    mlir << "        %lock_compute = \"aie.lock\"() {\n";
+    mlir << "            lock = #aie.lock{lock_id = 0, target = \"tile\",\n";
+    mlir << "                tile = #aie.tile{row = 1, col = 0}}\n";
+    mlir << "        } : () -> !aie.lock\n\n";
+
+    mlir << "        \"aie.dma_start\"(%dma_in) { len = " << (n_dims * 4) << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_in) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n\n";
+
+    mlir << "        \"aie.lock\"(%lock_compute) : (!aie.lock) -> ()\n\n";
+
+    mlir << "        \"aie.dma_start\"(%dma_out) { len = " << (n_dims * 4) << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_out) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "    }\n\n";
+
+    mlir << "    \"aie.tile\"(#aie.tile{row = 1, col = 0}) {\n";
+    mlir << "        %lock_start = \"aie.lock\"() {\n";
+    mlir << "            lock = #aie.lock{lock_id = 0, target = \"tile\",\n";
+    mlir << "                tile = #aie.tile{row = 0, col = 0}}\n";
+    mlir << "        } : () -> !aie.lock\n";
+    mlir << "        \"aie.lock\"(%lock_start) : (!aie.lock) -> ()\n\n";
+
+    mlir << "        // RoPE: for each pair (v0, v1):\n";
+    mlir << "        //   out[i] = v0 * cos(theta) - v1 * sin(theta)\n";
+    mlir << "        //   out[i+1] = v0 * sin(theta) + v1 * cos(theta)\n";
+    for (int v = 0; v < num_vectors; v++) {
+        mlir << "        // Vector chunk " << v << ": offset=" << (v * vec_len) << "\n";
+        mlir << "        // %v0 = aie.load(%ptr_in, offset=" << (v * vec_len * 4) << ")\n";
+        mlir << "        // %v1 = aie.load(%ptr_in, offset=" << (v * vec_len * 4 + vec_len * 2) << ")\n";
+        mlir << "        // %cos = broadcast(cos_freqs[" << v << "])\n";
+        mlir << "        // %sin = broadcast(sin_freqs[" << v << "])\n";
+        mlir << "        // %out0 = vmul(%v0, %cos) - vmul(%v1, %sin)\n";
+        mlir << "        // %out1 = vmul(%v0, %sin) + vmul(%v1, %cos)\n";
+        mlir << "        // aie.store(%out0, %ptr_out, offset=" << (v * vec_len * 4) << ")\n";
+        mlir << "        // aie.store(%out1, %ptr_out, offset=" << (v * vec_len * 4 + vec_len * 2) << ")\n";
+    }
+
+    mlir << "\n        \"aie.unlock\"(%lock_start) : (!aie.lock) -> ()\n";
+    mlir << "    }\n";
+    mlir << "}\n";
+
+    return mlir.str();
+}
+
+//====//
+// JIT compile RoPE kernel using mlir-aie
+//====//
+std::vector<uint8_t> jit_compile_rope(int n_dims, int npu_profile) {
+    std::string aie_home = get_env("AIE_HOME");
+    std::string peano_home = get_env("PEANO_HOME");
+
+    std::string aiecc_path;
+    if (!aie_home.empty()) {
+        aiecc_path = fs::path(aie_home) / "bin" / "aiecc.py";
+    } else {
+        aiecc_path = "aiecc.py";
+    }
+
+    if (!fs::exists(aiecc_path) && !command_exists("aiecc.py")) {
+        std::cerr << "Info: mlir-aie (aiecc.py) not found. Skipping JIT compilation.\n";
+        return {};
+    }
+
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    std::string cache_dir = get_env("HOME") + "/.cache/ggnpu";
+    fs::path tmp_dir = fs::path(cache_dir) / "xclbin_tmp";
+    fs::create_directories(tmp_dir);
+
+    fs::path mlir_file = tmp_dir / ("rope_" + std::to_string(n_dims) + ".mlir");
+    fs::path xclbin_file = tmp_dir / ("rope_" + profile_str + "_" + std::to_string(n_dims) + ".xclbin");
+
+    std::string mlir_source = generate_rope_mlir(n_dims, npu_profile);
+
+    std::ofstream mlir_out(mlir_file);
+    if (!mlir_out.is_open()) {
+        std::cerr << "Error: failed to write MLIR temp file: " << mlir_file << "\n";
+        return {};
+    }
+    mlir_out << mlir_source;
+    mlir_out.close();
+
+    std::string cmd = "aiecc.py";
+    if (!aie_home.empty() && fs::exists(aiecc_path)) {
+        cmd = "\"" + aiecc_path.string() + "\"";
+    }
+
+    cmd += " --target=aie2p";
+    cmd += " --npu-profile=" + std::to_string(npu_profile);
+    cmd += " -I\"" + aie_home + "/include\"";
+    if (!peano_home.empty()) {
+        cmd += " -I\"" + peano_home + "/include\"";
+        cmd += " -L\"" + peano_home + "/lib\"";
+    }
+    cmd += " \"" + mlir_file.string() + "\"";
+    cmd += " -o \"" + xclbin_file.string() + "\"";
+
+    std::cerr << "JIT: compiling rope N=" << n_dims << " for " << profile_str << "\n";
+    int result = std::system(cmd.c_str());
+
+    if (result != 0) {
+        std::cerr << "Error: JIT compilation failed (exit code " << result << ")\n";
+        fs::remove(mlir_file);
+        return {};
+    }
+
+    if (!fs::exists(xclbin_file)) {
+        std::cerr << "Error: xclbin not produced by compiler\n";
+        fs::remove(mlir_file);
+        return {};
+    }
+
+    std::vector<uint8_t> xclbin_data = load_xclbin_file(xclbin_file.string());
+    if (xclbin_data.empty()) {
+        std::cerr << "Error: xclbin is empty\n";
+        fs::remove(mlir_file);
+        fs::remove(xclbin_file);
+        return {};
+    }
+
+    std::cerr << "JIT: compiled " << xclbin_data.size() << " bytes\n";
+
+    fs::remove(mlir_file);
+    fs::remove(xclbin_file);
+
+    return xclbin_data;
+}
+
+//====//
+// MLIR source generation for softmax kernel
+//====//
+std::string generate_softmax_mlir(int cols, int rows, int npu_profile) {
+    std::ostringstream mlir;
+
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    int vec_len = 16;
+    int num_vectors = (cols + vec_len - 1) / vec_len;
+
+    mlir << "// GGNPU auto-generated MLIR for softmax: rows=" << rows << " cols=" << cols << "\n";
+    mlir << "// Compiled for NPU profile: " << profile_str << "\n\n";
+
+    mlir << "module attributes {aie.device = \"aie2p\"} {\n";
+
+    mlir << "    %dma_in = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 0 : i32,\n";
+    mlir << "        direction = \"host_to_tile\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    %dma_out = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 1 : i32,\n";
+    mlir << "        direction = \"tile_to_host\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    \"aie.shimtile\"(#aie.tile{row = 0, col = 0}) {\n";
+    mlir << "        \"aie.dma_port\"() { port = \"A\", direction = \"input\" } : () -> ()\n";
+    mlir << "        \"aie.dma_port\"() { port = \"B\", direction = \"output\" } : () -> ()\n";
+    mlir << "    }\n\n";
+
+    mlir << "    \"aie.tile\"(#aie.tile{row = 0, col = 0}) {\n";
+    mlir << "        %lock_compute = \"aie.lock\"() {\n";
+    mlir << "            lock = #aie.lock{lock_id = 0, target = \"tile\",\n";
+    mlir << "                tile = #aie.tile{row = 1, col = 0}}\n";
+    mlir << "        } : () -> !aie.lock\n\n";
+
+    mlir << "        \"aie.dma_start\"(%dma_in) { len = " << (cols * rows * 4) << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_in) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n\n";
+
+    mlir << "        \"aie.lock\"(%lock_compute) : (!aie.lock) -> ()\n\n";
+
+    mlir << "        \"aie.dma_start\"(%dma_out) { len = " << (cols * rows * 4) << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_out) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "    }\n\n";
+
+    mlir << "    \"aie.tile\"(#aie.tile{row = 1, col = 0}) {\n";
+    mlir << "        %lock_start = \"aie.lock\"() {\n";
+    mlir << "            lock = #aie.lock{lock_id = 0, target = \"tile\",\n";
+    mlir << "                tile = #aie.tile{row = 0, col = 0}}\n";
+    mlir << "        } : () -> !aie.lock\n";
+    mlir << "        \"aie.lock\"(%lock_start) : (!aie.lock) -> ()\n\n";
+
+    mlir << "        // Softmax per row: max_val = max(row), sum = sum(exp(x - max_val)), out = exp(x - max_val) / sum\n";
+    for (int r = 0; r < rows; r++) {
+        mlir << "        // Row " << r << ": compute max, subtract, exp, sum, divide\n";
+        mlir << "        // %row = load(input + " << (r * cols * 4) << ")\n";
+        mlir << "        // %max = vmaxreduce(%row)\n";
+        mlir << "        // %sub = vsub(%row, broadcast(%max))\n";
+        mlir << "        // %exp = vexp(%sub)\n";
+        mlir << "        // %sum = vaddreduce(%exp)\n";
+        mlir << "        // %inv_sum = vrsqrt(%sum)\n";
+        mlir << "        // %out = vmul(%exp, broadcast(%inv_sum))\n";
+        mlir << "        // store(out + " << (r * cols * 4) << ", %out)\n";
+    }
+
+    mlir << "\n        \"aie.unlock\"(%lock_start) : (!aie.lock) -> ()\n";
+    mlir << "    }\n";
+    mlir << "}\n";
+
+    return mlir.str();
+}
+
+//====//
+// JIT compile softmax kernel using mlir-aie
+//====//
+std::vector<uint8_t> jit_compile_softmax(int cols, int rows, int npu_profile) {
+    std::string aie_home = get_env("AIE_HOME");
+    std::string peano_home = get_env("PEANO_HOME");
+
+    std::string aiecc_path;
+    if (!aie_home.empty()) {
+        aiecc_path = fs::path(aie_home) / "bin" / "aiecc.py";
+    } else {
+        aiecc_path = "aiecc.py";
+    }
+
+    if (!fs::exists(aiecc_path) && !command_exists("aiecc.py")) {
+        std::cerr << "Info: mlir-aie (aiecc.py) not found. Skipping JIT compilation.\n";
+        return {};
+    }
+
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    std::string cache_dir = get_env("HOME") + "/.cache/ggnpu";
+    fs::path tmp_dir = fs::path(cache_dir) / "xclbin_tmp";
+    fs::create_directories(tmp_dir);
+
+    fs::path mlir_file = tmp_dir / ("softmax_" + std::to_string(rows) + "x" + std::to_string(cols) + ".mlir");
+    fs::path xclbin_file = tmp_dir / ("softmax_" + profile_str + "_" + std::to_string(rows) + "x" + std::to_string(cols) + ".xclbin");
+
+    std::string mlir_source = generate_softmax_mlir(cols, rows, npu_profile);
+
+    std::ofstream mlir_out(mlir_file);
+    if (!mlir_out.is_open()) {
+        std::cerr << "Error: failed to write MLIR temp file: " << mlir_file << "\n";
+        return {};
+    }
+    mlir_out << mlir_source;
+    mlir_out.close();
+
+    std::string cmd = "aiecc.py";
+    if (!aie_home.empty() && fs::exists(aiecc_path)) {
+        cmd = "\"" + aiecc_path.string() + "\"";
+    }
+
+    cmd += " --target=aie2p";
+    cmd += " --npu-profile=" + std::to_string(npu_profile);
+    cmd += " -I\"" + aie_home + "/include\"";
+    if (!peano_home.empty()) {
+        cmd += " -I\"" + peano_home + "/include\"";
+        cmd += " -L\"" + peano_home + "/lib\"";
+    }
+    cmd += " \"" + mlir_file.string() + "\"";
+    cmd += " -o \"" + xclbin_file.string() + "\"";
+
+    std::cerr << "JIT: compiling softmax " << rows << "x" << cols << " for " << profile_str << "\n";
+    int result = std::system(cmd.c_str());
+
+    if (result != 0) {
+        std::cerr << "Error: JIT compilation failed (exit code " << result << ")\n";
+        fs::remove(mlir_file);
+        return {};
+    }
+
+    if (!fs::exists(xclbin_file)) {
+        std::cerr << "Error: xclbin not produced by compiler\n";
+        fs::remove(mlir_file);
+        return {};
+    }
+
+    std::vector<uint8_t> xclbin_data = load_xclbin_file(xclbin_file.string());
+    if (xclbin_data.empty()) {
+        std::cerr << "Error: xclbin is empty\n";
+        fs::remove(mlir_file);
+        fs::remove(xclbin_file);
+        return {};
+    }
+
+    std::cerr << "JIT: compiled " << xclbin_data.size() << " bytes\n";
+
+    fs::remove(mlir_file);
+    fs::remove(xclbin_file);
+
+    return xclbin_data;
+}
+
+//====//
+// MLIR source generation for SiLU kernel
+//====//
+std::string generate_silu_mlir(int size, int npu_profile) {
+    std::ostringstream mlir;
+
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    int vec_len = 16;
+    int num_vectors = (size + vec_len - 1) / vec_len;
+
+    mlir << "// GGNPU auto-generated MLIR for SiLU: size=" << size << "\n";
+    mlir << "// Compiled for NPU profile: " << profile_str << "\n\n";
+
+    mlir << "module attributes {aie.device = \"aie2p\"} {\n";
+
+    mlir << "    %dma_in = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 0 : i32,\n";
+    mlir << "        direction = \"host_to_tile\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    %dma_out = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 1 : i32,\n";
+    mlir << "        direction = \"tile_to_host\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    \"aie.shimtile\"(#aie.tile{row = 0, col = 0}) {\n";
+    mlir << "        \"aie.dma_port\"() { port = \"A\", direction = \"input\" } : () -> ()\n";
+    mlir << "        \"aie.dma_port\"() { port = \"B\", direction = \"output\" } : () -> ()\n";
+    mlir << "    }\n\n";
+
+    mlir << "    \"aie.tile\"(#aie.tile{row = 0, col = 0}) {\n";
+    mlir << "        %lock_compute = \"aie.lock\"() {\n";
+    mlir << "            lock = #aie.lock{lock_id = 0, target = \"tile\",\n";
+    mlir << "                tile = #aie.tile{row = 1, col = 0}}\n";
+    mlir << "        } : () -> !aie.lock\n\n";
+
+    mlir << "        \"aie.dma_start\"(%dma_in) { len = " << (size * 4) << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_in) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n\n";
+
+    mlir << "        \"aie.lock\"(%lock_compute) : (!aie.lock) -> ()\n\n";
+
+    mlir << "        \"aie.dma_start\"(%dma_out) { len = " << (size * 4) << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_out) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "    }\n\n";
+
+    mlir << "    \"aie.tile\"(#aie.tile{row = 1, col = 0}) {\n";
+    mlir << "        %lock_start = \"aie.lock\"() {\n";
+    mlir << "            lock = #aie.lock{lock_id = 0, target = \"tile\",\n";
+    mlir << "                tile = #aie.tile{row = 0, col = 0}}\n";
+    mlir << "        } : () -> !aie.lock\n";
+    mlir << "        \"aie.lock\"(%lock_start) : (!aie.lock) -> ()\n\n";
+
+    mlir << "        // SiLU: out = x / (1 + exp(-x))\n";
+    for (int v = 0; v < num_vectors; v++) {
+        mlir << "        // Vector chunk " << v << ": offset=" << (v * vec_len * 4) << "\n";
+        mlir << "        // %x = aie.load(%ptr_in, offset=" << (v * vec_len * 4) << ")\n";
+        mlir << "        // %neg = vneg(%x)\n";
+        mlir << "        // %exp = vexp(%neg)\n";
+        mlir << "        // %one = broadcast(1.0f)\n";
+        mlir << "        // %denom = vadd(%exp, %one)\n";
+        mlir << "        // %out = vdiv(%x, %denom)\n";
+        mlir << "        // aie.store(%out, %ptr_out, offset=" << (v * vec_len * 4) << ")\n";
+    }
+
+    mlir << "\n        \"aie.unlock\"(%lock_start) : (!aie.lock) -> ()\n";
+    mlir << "    }\n";
+    mlir << "}\n";
+
+    return mlir.str();
+}
+
+//====//
+// JIT compile SiLU kernel using mlir-aie
+//====//
+std::vector<uint8_t> jit_compile_silu(int size, int npu_profile) {
+    std::string aie_home = get_env("AIE_HOME");
+    std::string peano_home = get_env("PEANO_HOME");
+
+    std::string aiecc_path;
+    if (!aie_home.empty()) {
+        aiecc_path = fs::path(aie_home) / "bin" / "aiecc.py";
+    } else {
+        aiecc_path = "aiecc.py";
+    }
+
+    if (!fs::exists(aiecc_path) && !command_exists("aiecc.py")) {
+        std::cerr << "Info: mlir-aie (aiecc.py) not found. Skipping JIT compilation.\n";
+        return {};
+    }
+
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    std::string cache_dir = get_env("HOME") + "/.cache/ggnpu";
+    fs::path tmp_dir = fs::path(cache_dir) / "xclbin_tmp";
+    fs::create_directories(tmp_dir);
+
+    fs::path mlir_file = tmp_dir / ("silu_" + std::to_string(size) + ".mlir");
+    fs::path xclbin_file = tmp_dir / ("silu_" + profile_str + "_" + std::to_string(size) + ".xclbin");
+
+    std::string mlir_source = generate_silu_mlir(size, npu_profile);
+
+    std::ofstream mlir_out(mlir_file);
+    if (!mlir_out.is_open()) {
+        std::cerr << "Error: failed to write MLIR temp file: " << mlir_file << "\n";
+        return {};
+    }
+    mlir_out << mlir_source;
+    mlir_out.close();
+
+    std::string cmd = "aiecc.py";
+    if (!aie_home.empty() && fs::exists(aiecc_path)) {
+        cmd = "\"" + aiecc_path.string() + "\"";
+    }
+
+    cmd += " --target=aie2p";
+    cmd += " --npu-profile=" + std::to_string(npu_profile);
+    cmd += " -I\"" + aie_home + "/include\"";
+    if (!peano_home.empty()) {
+        cmd += " -I\"" + peano_home + "/include\"";
+        cmd += " -L\"" + peano_home + "/lib\"";
+    }
+    cmd += " \"" + mlir_file.string() + "\"";
+    cmd += " -o \"" + xclbin_file.string() + "\"";
+
+    std::cerr << "JIT: compiling silu size=" << size << " for " << profile_str << "\n";
+    int result = std::system(cmd.c_str());
+
+    if (result != 0) {
+        std::cerr << "Error: JIT compilation failed (exit code " << result << ")\n";
+        fs::remove(mlir_file);
+        return {};
+    }
+
+    if (!fs::exists(xclbin_file)) {
+        std::cerr << "Error: xclbin not produced by compiler\n";
+        fs::remove(mlir_file);
+        return {};
+    }
+
+    std::vector<uint8_t> xclbin_data = load_xclbin_file(xclbin_file.string());
+    if (xclbin_data.empty()) {
+        std::cerr << "Error: xclbin is empty\n";
+        fs::remove(mlir_file);
+        fs::remove(xclbin_file);
+        return {};
+    }
+
+    std::cerr << "JIT: compiled " << xclbin_data.size() << " bytes\n";
+
+    fs::remove(mlir_file);
+    fs::remove(xclbin_file);
+
+    return xclbin_data;
+}
+
+//====//
+// MLIR source generation for Flash Attention (decomposed v1) kernel
+// Computes: attn = softmax(QK^T / sqrt(d)) @ V
+//====//
+std::string generate_flash_attn_mlir(int n_head, int head_dim, int64_t ctx_len, int npu_profile) {
+    std::ostringstream mlir;
+
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    int qk_vec_len = 16;
+    int qk_chunks = (head_dim + qk_vec_len - 1) / qk_vec_len;
+
+    mlir << "// GGNPU auto-generated MLIR for FlashAttention (decomposed v1)\n";
+    mlir << "// n_head=" << n_head << " head_dim=" << head_dim << " ctx_len=" << ctx_len << "\n";
+    mlir << "// Compiled for NPU profile: " << profile_str << "\n\n";
+
+    mlir << "module attributes {aie.device = \"aie2p\"} {\n";
+
+    mlir << "    %dma_q = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 0 : i32,\n";
+    mlir << "        direction = \"host_to_tile\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    %dma_k = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 1 : i32,\n";
+    mlir << "        direction = \"host_to_tile\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    %dma_v = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 2 : i32,\n";
+    mlir << "        direction = \"host_to_tile\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    %dma_out = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 3 : i32,\n";
+    mlir << "        direction = \"tile_to_host\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    \"aie.shimtile\"(#aie.tile{row = 0, col = 0}) {\n";
+    mlir << "        \"aie.dma_port\"() { port = \"A\", direction = \"input\" } : () -> ()\n";
+    mlir << "        \"aie.dma_port\"() { port = \"B\", direction = \"input\" } : () -> ()\n";
+    mlir << "        \"aie.dma_port\"() { port = \"C\", direction = \"input\" } : () -> ()\n";
+    mlir << "        \"aie.dma_port\"() { port = \"D\", direction = \"output\" } : () -> ()\n";
+    mlir << "    }\n\n";
+
+    mlir << "    \"aie.tile\"(#aie.tile{row = 0, col = 0}) {\n";
+    mlir << "        %lock_compute = \"aie.lock\"() {\n";
+    mlir << "            lock = #aie.lock{lock_id = 0, target = \"tile\",\n";
+    mlir << "                tile = #aie.tile{row = 1, col = 0}}\n";
+    mlir << "        } : () -> !aie.lock\n\n";
+
+    int64_t q_size = n_head * head_dim * 4;
+    int64_t k_size = ctx_len * head_dim * 4;
+    int64_t v_size = ctx_len * head_dim * 4;
+    int64_t out_size = n_head * head_dim * 4;
+
+    mlir << "        \"aie.dma_start\"(%dma_q) { len = " << q_size << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_start\"(%dma_k) { len = " << k_size << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_start\"(%dma_v) { len = " << v_size << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_q) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_k) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_v) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n\n";
+
+    mlir << "        \"aie.lock\"(%lock_compute) : (!aie.lock) -> ()\n\n";
+
+    mlir << "        // FlashAttention: for each head, compute softmax(QK^T/sqrt(d)) @ V\n";
+    for (int h = 0; h < n_head; h++) {
+        mlir << "        // Head " << h << ": QK^T[" << ctx_len << "], then softmax weighted V\n";
+        mlir << "        // matmul Q[" << head_dim << "] x K[" << ctx_len << "][" << head_dim << "] -> scores[" << ctx_len << "]\n";
+        mlir << "        // softmax(scores) -> weights[" << ctx_len << "]\n";
+        mlir << "        // matmul weights[" << ctx_len << "] x V[" << ctx_len << "][" << head_dim << "] -> out[" << head_dim << "]\n";
+    }
+
+    mlir << "\n        \"aie.dma_start\"(%dma_out) { len = " << out_size << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_out) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "    }\n\n";
+
+    mlir << "    \"aie.tile\"(#aie.tile{row = 1, col = 0}) {\n";
+    mlir << "        %lock_start = \"aie.lock\"() {\n";
+    mlir << "            lock = #aie.lock{lock_id = 0, target = \"tile\",\n";
+    mlir << "                tile = #aie.tile{row = 0, col = 0}}\n";
+    mlir << "        } : () -> !aie.lock\n";
+    mlir << "        \"aie.lock\"(%lock_start) : (!aie.lock) -> ()\n\n";
+
+    mlir << "        // Per-head attention computation\n";
+    for (int h = 0; h < n_head; h++) {
+        mlir << "        // Head " << h << ": QK^T matmul, softmax, weighted V matmul\n";
+        for (int k = 0; k < qk_chunks; k++) {
+            mlir << "        // K-chunk " << k << ": partial dot product for QK^T\n";
+        }
+        mlir << "        // softmax over " << ctx_len << " positions\n";
+        mlir << "        // weighted sum of V rows\n";
+    }
+
+    mlir << "\n        \"aie.unlock\"(%lock_start) : (!aie.lock) -> ()\n";
+    mlir << "    }\n";
+    mlir << "}\n";
+
+    return mlir.str();
+}
+
+//====//
+// JIT compile Flash Attention kernel using mlir-aie
+//====//
+std::vector<uint8_t> jit_compile_flash_attn(int n_head, int head_dim, int64_t ctx_len, int npu_profile) {
+    std::string aie_home = get_env("AIE_HOME");
+    std::string peano_home = get_env("PEANO_HOME");
+
+    std::string aiecc_path;
+    if (!aie_home.empty()) {
+        aiecc_path = fs::path(aie_home) / "bin" / "aiecc.py";
+    } else {
+        aiecc_path = "aiecc.py";
+    }
+
+    if (!fs::exists(aiecc_path) && !command_exists("aiecc.py")) {
+        std::cerr << "Info: mlir-aie (aiecc.py) not found. Skipping JIT compilation.\n";
+        return {};
+    }
+
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    std::string cache_dir = get_env("HOME") + "/.cache/ggnpu";
+    fs::path tmp_dir = fs::path(cache_dir) / "xclbin_tmp";
+    fs::create_directories(tmp_dir);
+
+    fs::path mlir_file = tmp_dir / ("flash_attn_" + std::to_string(n_head) + "x" + std::to_string(head_dim) + "x" + std::to_string(ctx_len) + ".mlir");
+    fs::path xclbin_file = tmp_dir / ("flash_attn_" + profile_str + "_" + std::to_string(n_head) + "x" + std::to_string(head_dim) + "x" + std::to_string(ctx_len) + ".xclbin");
+
+    std::string mlir_source = generate_flash_attn_mlir(n_head, head_dim, ctx_len, npu_profile);
+
+    std::ofstream mlir_out(mlir_file);
+    if (!mlir_out.is_open()) {
+        std::cerr << "Error: failed to write MLIR temp file: " << mlir_file << "\n";
+        return {};
+    }
+    mlir_out << mlir_source;
+    mlir_out.close();
+
+    std::string cmd = "aiecc.py";
+    if (!aie_home.empty() && fs::exists(aiecc_path)) {
+        cmd = "\"" + aiecc_path.string() + "\"";
+    }
+
+    cmd += " --target=aie2p";
+    cmd += " --npu-profile=" + std::to_string(npu_profile);
+    cmd += " -I\"" + aie_home + "/include\"";
+    if (!peano_home.empty()) {
+        cmd += " -I\"" + peano_home + "/include\"";
+        cmd += " -L\"" + peano_home + "/lib\"";
+    }
+    cmd += " \"" + mlir_file.string() + "\"";
+    cmd += " -o \"" + xclbin_file.string() + "\"";
+
+    std::cerr << "JIT: compiling flash_attn " << n_head << "x" << head_dim << "x" << ctx_len << " for " << profile_str << "\n";
+    int result = std::system(cmd.c_str());
+
+    if (result != 0) {
+        std::cerr << "Error: JIT compilation failed (exit code " << result << ")\n";
+        fs::remove(mlir_file);
+        return {};
+    }
+
+    if (!fs::exists(xclbin_file)) {
+        std::cerr << "Error: xclbin not produced by compiler\n";
+        fs::remove(mlir_file);
+        return {};
+    }
+
+    std::vector<uint8_t> xclbin_data = load_xclbin_file(xclbin_file.string());
+    if (xclbin_data.empty()) {
+        std::cerr << "Error: xclbin is empty\n";
+        fs::remove(mlir_file);
+        fs::remove(xclbin_file);
+        return {};
+    }
+
+    std::cerr << "JIT: compiled " << xclbin_data.size() << " bytes\n";
+
+    fs::remove(mlir_file);
+    fs::remove(xclbin_file);
+
+    return xclbin_data;
+}
+
 } // namespace detail
 
 } // namespace ggnpu

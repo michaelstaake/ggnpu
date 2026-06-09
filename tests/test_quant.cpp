@@ -213,7 +213,6 @@ void test_q4_0_decode() {
     // Create a simple Q4_0 block
     ggnpu::Q4_0Block block;
     block.d = 1;
-    memset(block.signs, 0, 16);
     memset(block.qs, 0, 8);
 
     std::vector<uint8_t> gguf_data(sizeof(ggnpu::Q4_0Block));

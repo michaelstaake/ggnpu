@@ -87,16 +87,18 @@ void KVCache::update_slab(uint64_t layer, uint64_t start_pos, uint64_t end_pos,
             }
         }
     }
-    if (values_ptr) {
+   if (values_ptr) {
         float* v_out = value_buffer(layer, start_pos);
         if (v_out) {
             for (uint64_t i = 0; i < count; i++) {
                 std::memcpy(v_out + i * head_kv * dim,
-                           values_ptr + i * head_kv * dim,
-                           head_kv * dim * sizeof(float));
+                            values_ptr + i * head_kv * dim,
+                            head_kv * dim * sizeof(float));
             }
         }
     }
+
+    set_position(end_pos);
 }
 
 uint64_t KVCache::current_position() const { return current_pos_; }

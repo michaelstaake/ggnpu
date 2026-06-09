@@ -299,11 +299,23 @@ int main(int argc, char* argv[]) {
 #ifdef GGNPU_HAS_NPU_BACKEND
         backend = create_amd_xdna_backend(params.npu_device);
         if (!backend || !backend->is_available()) {
-            std::cerr << "Warning: NPU backend unavailable, using CPU reference\n";
+#ifdef GGNPU_TEST_CPU
+            std::cerr << "Warning: NPU backend unavailable, using CPU reference for testing\n";
             backend = create_cpu_ref_backend();
+#else
+            std::cerr << "Error: NPU backend unavailable. AMD NPU (amdxdna) driver must be loaded.\n";
+            std::cerr << "  lsmod | grep amdxdna\n";
+            std::cerr << "  ls -la /dev/accel/accel0\n";
+            return 1;
+#endif
         }
 #else
+#ifdef GGNPU_TEST_CPU
         backend = create_cpu_ref_backend();
+#else
+        std::cerr << "Error: NPU backend not compiled in. Build with -DGGNPU_NPU_BACKEND=ON\n";
+        return 1;
+#endif
 #endif
 
         std::cout << "Backend: " << backend->name() << "\n\n";
@@ -370,11 +382,23 @@ int main(int argc, char* argv[]) {
 #ifdef GGNPU_HAS_NPU_BACKEND
     backend = create_amd_xdna_backend(params.npu_device);
     if (!backend || !backend->is_available()) {
+#ifdef GGNPU_TEST_CPU
         std::cerr << "Warning: NPU backend unavailable, using CPU reference for testing\n";
         backend = create_cpu_ref_backend();
+#else
+        std::cerr << "Error: NPU backend unavailable. AMD NPU (amdxdna) driver must be loaded.\n";
+        std::cerr << "  lsmod | grep amdxdna\n";
+        std::cerr << "  ls -la /dev/accel/accel0\n";
+        return 1;
+#endif
     }
 #else
+#ifdef GGNPU_TEST_CPU
     backend = create_cpu_ref_backend();
+#else
+    std::cerr << "Error: NPU backend not compiled in. Build with -DGGNPU_NPU_BACKEND=ON\n";
+    return 1;
+#endif
 #endif
 
     std::cout << "Backend: " << backend->name() << "\n";
@@ -384,8 +408,6 @@ int main(int argc, char* argv[]) {
         const char* home = std::getenv("HOME");
         cache_dir = home ? std::string(home) + "/.cache/ggnpu" : "~/.cache/ggnpu";
     }
-
-    CompileCache cache(cache_dir, !params.no_cache);
 
     std::cout << "Loading model: " << params.model_path << "\n";
     Model model;
@@ -487,15 +509,12 @@ int main(int argc, char* argv[]) {
     };
 
     auto rms_norm = [&](float* out, const float* inp, int size, float eps) {
-        float variance = 0.0f;
-        for (int i = 0; i < size; i++) {
-            variance += inp[i] * inp[i];
-        }
-        variance = variance / size + eps;
-        float inv_std = 1.0f / std::sqrt(variance);
-        for (int i = 0; i < size; i++) {
-            out[i] = inp[i] * inv_std;
-        }
+        RmsNormParams rms_params;
+        rms_params.input = inp;
+        rms_params.output = out;
+        rms_params.size = size;
+        rms_params.eps = eps;
+        backend->rms_norm(rms_params);
     };
 
     // Main generation loop
@@ -626,29 +645,20 @@ int main(int argc, char* argv[]) {
 
             // Softmax + weighted V
             std::vector<float> attn_out(static_cast<size_t>(n_tokens) * head_dim, 0.0f);
-            for (int i = 0; i < n_tokens; i++) {
-                // Softmax
-                float max_val = -INFINITY;
-                for (int64_t j = 0; j < ctx_len; j++) {
-                    if (attn_scores[i * ctx_len + j] > max_val) {
-                        max_val = attn_scores[i * ctx_len + j];
-                    }
-                }
-                float sum = 0.0f;
-                std::vector<float> weights(ctx_len);
-                for (int64_t j = 0; j < ctx_len; j++) {
-                    weights[j] = std::exp(attn_scores[i * ctx_len + j] - max_val);
-                    sum += weights[j];
-                }
-                for (int64_t j = 0; j < ctx_len; j++) {
-                    weights[j] /= sum;
-                }
+            std::vector<float> weights(static_cast<size_t>(n_tokens * ctx_len));
 
-                // Weighted sum of V
+            SoftmaxParams softmax_params;
+            softmax_params.input = attn_scores.data();
+            softmax_params.output = weights.data();
+            softmax_params.rows = n_tokens;
+            softmax_params.cols = static_cast<int>(ctx_len);
+            backend->softmax(softmax_params);
+
+            for (int i = 0; i < n_tokens; i++) {
                 for (int d = 0; d < head_dim; d++) {
                     float v_sum = 0.0f;
                     for (int64_t j = 0; j < ctx_len; j++) {
-                        v_sum += weights[j] * model.kv_cache().value_buffer(layer, j)[d];
+                        v_sum += weights[i * ctx_len + j] * model.kv_cache().value_buffer(layer, j)[d];
                     }
                     attn_out[i * head_dim + d] = v_sum;
                 }
@@ -733,8 +743,14 @@ int main(int argc, char* argv[]) {
             backend->sync();
 
             // SwiGLU: gate * silu(up)
+            SiluParams silu_params;
+            silu_params.input = ffn_up.data();
+            silu_params.output = ffn_silu.data();
+            silu_params.size = ffn_size;
+            backend->silu(silu_params);
+
             for (int i = 0; i < ffn_size; i++) {
-                ffn_silu[i] = ffn_gate[i] * (ffn_up[i] / (1.0f + std::exp(-ffn_up[i])));
+                ffn_silu[i] *= ffn_gate[i];
             }
 
             // FFN down projection
