@@ -294,6 +294,58 @@ void test_sync() {
     tests_passed++;
 }
 
+void test_mul_mat_q_benchmark_validation() {
+    std::cout << "  test_mul_mat_q_benchmark_validation\n";
+
+    auto backend = ggnpu::create_cpu_ref_backend();
+
+    // This test validates the exact correctness criterion used by
+    // the bench-matmul smoke test: when A and B are all ones,
+    // C[i][j] = sum_k(A[i][k] * B[k][j]) = K for every element.
+    // The benchmark checks that every output element equals K.
+
+    std::vector<std::tuple<int, int, int>> shapes = {
+        {256, 256, 256},
+        {512, 512, 512},
+        {1024, 1024, 1024},
+    };
+
+    for (auto [M, N, K] : shapes) {
+        std::vector<float> A(static_cast<size_t>(M * K), 1.0f);
+        std::vector<float> B(static_cast<size_t>(K * N), 1.0f);
+        std::vector<float> C(static_cast<size_t>(M * N), 0.0f);
+
+        ggnpu::MulMatParams params;
+        params.A = A.data();
+        params.B = B.data();
+        params.C = C.data();
+        params.M = M;
+        params.N = N;
+        params.K = K;
+        params.lda = K;
+        params.ldb = N;
+        params.ldc = N;
+        params.n_batches = 1;
+        params.B_type = ggnpu::GgmlType::F32;
+
+        ggnpu::Status st = backend->mul_mat_q(params);
+        ASSERT_EQ(st, ggnpu::Status::OK, "mul_mat_q benchmark shape returns OK");
+
+        // Validate every output element equals K (the benchmark's correctness check)
+        for (int i = 0; i < M * N; i++) {
+            float expected = static_cast<float>(K);
+            if (std::fabs(C[i] - expected) > 1e-3f) {
+                std::cerr << "  FAIL: benchmark validation for " << M << "x" << K
+                          << " x " << K << "x" << N << ": C[" << i
+                          << "] expected " << expected << ", got " << C[i] << "\n";
+                tests_failed++;
+                break;
+            }
+        }
+        tests_passed++;
+    }
+}
+
 void run_tests() {
     std::cout << "=== Architecture / Backend Tests ===\n\n";
 
@@ -307,6 +359,7 @@ void run_tests() {
     test_rms_norm_invalid_params();
     test_flash_attn_cpu_ref();
     test_rope_cpu_ref();
+    test_mul_mat_q_benchmark_validation();
     test_sync();
 
     std::cout << "\n--- Results ---\n";

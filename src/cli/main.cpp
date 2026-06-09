@@ -122,6 +122,43 @@ CliParams parse_args(int argc, char* argv[]) {
     return params;
 }
 
+const char* status_name(Status status) {
+    switch (status) {
+    case Status::OK:
+        return "OK";
+    case Status::ERROR:
+        return "ERROR";
+    case Status::NOT_FOUND:
+        return "NOT_FOUND";
+    case Status::INVALID_PARAM:
+        return "INVALID_PARAM";
+    case Status::NPU_UNAVAILABLE:
+        return "NPU_UNAVAILABLE";
+    case Status::OUT_OF_MEMORY:
+        return "OUT_OF_MEMORY";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+bool validate_matmul_output(const std::vector<float>& output, int expected_value,
+                           float tolerance, std::string* error_message) {
+    for (size_t i = 0; i < output.size(); i++) {
+        float actual = output[i];
+        float expected = static_cast<float>(expected_value);
+        if (std::fabs(actual - expected) > tolerance) {
+            if (error_message) {
+                std::ostringstream oss;
+                oss << "output[" << i << "] expected " << expected << ", got " << actual;
+                *error_message = oss.str();
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int sample_token(const std::vector<float>& logits, float temp, uint64_t& seed) {
     if (temp <= 0.0f) {
         int best = 0;
@@ -186,181 +223,6 @@ inline const float* get_float_ptr(const TensorView* tv) {
 
 inline float* get_float_ptr_mut(std::vector<float>& buf) {
     return buf.data();
-}
-
-// Build and execute a compute graph for one transformer layer
-Status execute_layer_graph(ComputeGraph& graph, std::shared_ptr<Backend> backend,
-                           const Model& model, WeightCache& weight_cache,
-                           const std::vector<float>& inp_norm,
-                           std::vector<float>& q_proj, std::vector<float>& k_proj,
-                           std::vector<float>& v_proj, std::vector<float>& attn_output,
-                           std::vector<float>& ffn_gate, std::vector<float>& ffn_up,
-                           std::vector<float>& ffn_down, std::vector<float>& ffn_silu,
-                           int layer, int n_tokens, int hidden_size, int ffn_size,
-                           int num_kv_heads, int head_dim, int /*num_heads*/,
-                           float /*rms_eps*/) {
-    graph.reset();
-    graph.set_backend(backend);
-
-    auto add_f32_matmul = [&](const std::string& name, const float* A, const int8_t* B,
-                               float* C, int M, int N, int K, GgmlType B_type) {
-        auto matmul_node = graph.add_node(OpType::MUL_MAT_Q, name);
-        matmul_node->cpu_buffer = const_cast<float*>(A);
-        matmul_node->M = M;
-        matmul_node->N = N;
-        matmul_node->K = K;
-        matmul_node->lda = K;
-        matmul_node->ldb = N;
-        matmul_node->ldc = N;
-        matmul_node->n_batches = 1;
-        matmul_node->B_type = B_type;
-
-        auto input_node = graph.add_node(OpType::VIEW, name + "_input");
-        input_node->cpu_buffer = const_cast<float*>(A);
-        input_node->size = M * K;
-
-        auto weight_node = graph.add_node(OpType::COPY, name + "_weight");
-        weight_node->cpu_buffer = const_cast<int8_t*>(B);
-        weight_node->size = K * N;
-
-        auto out_node = graph.add_node(OpType::COPY, name + "_out");
-        out_node->cpu_buffer = C;
-        out_node->size = M * N;
-
-        graph.connect(input_node, matmul_node);
-        graph.connect(weight_node, matmul_node);
-        graph.connect(matmul_node, out_node);
-
-        return out_node;
-    };
-
-    auto add_rmsnorm = [&](const std::string& name, const float* input, float* output,
-                            int size, float eps) {
-        auto rms_node = graph.add_node(OpType::RMS_NORM, name);
-        rms_node->cpu_buffer = output;
-        rms_node->size = size;
-        rms_node->eps = eps;
-
-        auto input_node = graph.add_node(OpType::VIEW, name + "_input");
-        input_node->cpu_buffer = const_cast<float*>(input);
-        input_node->size = size;
-
-        graph.connect(input_node, rms_node);
-        return rms_node;
-    };
-
-    auto add_silu = [&](const std::string& name, const float* input, float* output, int size) {
-        auto silu_node = graph.add_node(OpType::SILU, name);
-        silu_node->cpu_buffer = output;
-        silu_node->size = size;
-
-        auto input_node = graph.add_node(OpType::VIEW, name + "_input");
-        input_node->cpu_buffer = const_cast<float*>(input);
-        input_node->size = size;
-
-        graph.connect(input_node, silu_node);
-        return silu_node;
-    };
-
-    auto add_add_residual = [&](const std::string& name, const float* a, const float* b,
-                                 float* out, int size) {
-        auto add_node = graph.add_node(OpType::ADD, name);
-        add_node->cpu_buffer = out;
-        add_node->size = size;
-
-        auto a_node = graph.add_node(OpType::VIEW, name + "_a");
-        a_node->cpu_buffer = const_cast<float*>(a);
-        a_node->size = size;
-
-        auto b_node = graph.add_node(OpType::VIEW, name + "_b");
-        b_node->cpu_buffer = const_cast<float*>(b);
-        b_node->size = size;
-
-        graph.connect(a_node, add_node);
-        graph.connect(b_node, add_node);
-        return add_node;
-    };
-
-    // Attention path
-    const TensorView* attn_q = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", layer);
-    const TensorView* attn_k = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", layer);
-    const TensorView* attn_v = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", layer);
-
-    if (attn_q) {
-        const int8_t* decoded_q = weight_cache.get_or_decode(attn_q->name,
-            attn_q->data, attn_q->data_size(), attn_q->type);
-        if (decoded_q) {
-            add_f32_matmul("attn_q", inp_norm.data(), decoded_q, q_proj.data(),
-                          n_tokens, hidden_size, hidden_size, attn_q->type);
-        }
-    }
-
-    if (attn_k) {
-        const int8_t* decoded_k = weight_cache.get_or_decode(attn_k->name,
-            attn_k->data, attn_k->data_size(), attn_k->type);
-        if (decoded_k) {
-            add_f32_matmul("attn_k", inp_norm.data(), decoded_k, k_proj.data(),
-                          n_tokens, num_kv_heads * head_dim, hidden_size, attn_k->type);
-        }
-    }
-
-    if (attn_v) {
-        const int8_t* decoded_v = weight_cache.get_or_decode(attn_v->name,
-            attn_v->data, attn_v->data_size(), attn_v->type);
-        if (decoded_v) {
-            add_f32_matmul("attn_v", inp_norm.data(), decoded_v, v_proj.data(),
-                          n_tokens, num_kv_heads * head_dim, hidden_size, attn_v->type);
-        }
-    }
-
-    // Attention output projection
-    const TensorView* attn_output_w = find_tensor_pattern(model, "blk.{layer}.attn_output.weight", layer);
-    if (attn_output_w) {
-        const int8_t* decoded_attn_out = weight_cache.get_or_decode(attn_output_w->name,
-            attn_output_w->data, attn_output_w->data_size(), attn_output_w->type);
-        if (decoded_attn_out) {
-            add_f32_matmul("attn_out_proj", attn_output.data(), decoded_attn_out,
-                          attn_output.data(), n_tokens, hidden_size, hidden_size,
-                          attn_output_w->type);
-        }
-    }
-
-    // FFN path
-    const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer);
-    const TensorView* ffn_up_w = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", layer);
-    const TensorView* ffn_down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", layer);
-
-    if (ffn_gate_w) {
-        const int8_t* decoded_gate = weight_cache.get_or_decode(ffn_gate_w->name,
-            ffn_gate_w->data, ffn_gate_w->data_size(), ffn_gate_w->type);
-        if (decoded_gate) {
-            add_f32_matmul("ffn_gate", inp_norm.data(), decoded_gate, ffn_gate.data(),
-                          n_tokens, ffn_size, hidden_size, ffn_gate_w->type);
-        }
-    }
-
-    if (ffn_up_w) {
-        const int8_t* decoded_up = weight_cache.get_or_decode(ffn_up_w->name,
-            ffn_up_w->data, ffn_up_w->data_size(), ffn_up_w->type);
-        if (decoded_up) {
-            add_f32_matmul("ffn_up", inp_norm.data(), decoded_up, ffn_up.data(),
-                          n_tokens, ffn_size, hidden_size, ffn_up_w->type);
-        }
-    }
-
-    if (ffn_down_w) {
-        const int8_t* decoded_down = weight_cache.get_or_decode(ffn_down_w->name,
-            ffn_down_w->data, ffn_down_w->data_size(), ffn_down_w->type);
-        if (decoded_down) {
-            add_silu("ffn_silu", ffn_up.data(), ffn_silu.data(), ffn_size);
-            add_f32_matmul("ffn_down", ffn_silu.data(), decoded_down, ffn_down.data(),
-                          n_tokens, hidden_size, ffn_size, ffn_down_w->type);
-        }
-    }
-
-    Status st = graph.compile();
-    if (st != Status::OK) return st;
-    return graph.execute();
 }
 
 } // namespace
@@ -523,14 +385,31 @@ int main(int argc, char* argv[]) {
             p.n_batches = 1;
             p.B_type = GgmlType::F32;
 
-            backend->mul_mat_q(p);
+            Status warmup_status = backend->mul_mat_q(p);
             backend->sync();
+            if (warmup_status != Status::OK) {
+                std::cerr << "Matmul warmup failed for " << M << "x" << K << " x "
+                          << K << "x" << N << ": " << status_name(warmup_status) << "\n";
+                return 1;
+            }
+
+            std::string validation_error;
+            if (!validate_matmul_output(C, K, 1e-3f, &validation_error)) {
+                std::cerr << "Matmul validation failed for " << M << "x" << K << " x "
+                          << K << "x" << N << ": " << validation_error << "\n";
+                return 1;
+            }
 
             auto start = std::chrono::high_resolution_clock::now();
             int iterations = 10;
             for (int i = 0; i < iterations; i++) {
-                backend->mul_mat_q(p);
+                Status st = backend->mul_mat_q(p);
                 backend->sync();
+                if (st != Status::OK) {
+                    std::cerr << "Matmul benchmark iteration failed for " << M << "x" << K
+                              << " x " << K << "x" << N << ": " << status_name(st) << "\n";
+                    return 1;
+                }
             }
             auto end = std::chrono::high_resolution_clock::now();
 
@@ -586,6 +465,10 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Loading model: " << params.model_path << "\n";
     Model model;
+    if (params.ctx_size > 0) {
+        model.set_context_length(params.ctx_size);
+        std::cout << "  Context size overridden to: " << params.ctx_size << "\n";
+    }
     if (!model.load(params.model_path)) {
         std::cerr << "Error: failed to load model\n";
         return 1;

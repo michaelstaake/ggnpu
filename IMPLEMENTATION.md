@@ -347,10 +347,10 @@ Work through these in order. Do not skip ahead.
 |-------|------|--------|
 | 0 Scaffold | CMake, scripts, docs | Mostly done (no CI; host setup incomplete on dev machine) |
 | 1 GGUF loader | Parse, mmap, dump | **Done** |
-| 2 NPU matmul smoke | `bench-matmul` on hardware | **Not done** — needs XRT, xclbins, matmul D→H fix |
+| 2 NPU matmul smoke | `bench-matmul` on hardware | **Not done** — needs XRT, xclbins (host setup) |
 | 3 Q4_K weight path | Decode + one E2E matmul | Decoders + disk cache done; NPU E2E not validated |
 | 4 Full decoder layer | All ops on NPU | **Not done** |
-| 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — known code bugs (see §7.1) |
+| 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — KV cache `-c` fix done, loop seed bug fixed |
 | 6 Production | Docker, 3B, L2 tiling | **Not done** |
 | 7 Intel stub | Interface research | **Not started** |
 
@@ -379,7 +379,8 @@ Work through these in order. Do not skip ahead.
 - [ ] XRT device init on Krackan
 - [ ] Build INT8 matmul xclbin (e.g. 1×3072 × 3072×3072)
 - [ ] Compile cache (`~/.cache/ggnpu/xclbin/` — currently empty)
-- [ ] Fix `mul_mat_q` device→host copy in `src/backends/amd_xdna/amd_xdna.cpp`
+- [x] Copy matmul output from device back to host in `src/backends/amd_xdna/amd_xdna.cpp`
+- [x] Make `ggnpu bench-matmul` fail fast on backend errors and incorrect output
 
 **Done when:** `ggnpu bench-matmul` runs on NPU with measurable throughput.
 
@@ -472,7 +473,6 @@ Do **not** rely on `GGNPU_TEST_CPU=ON` in production — it allows silent CPU fa
 | Bug | File | Impact |
 |-----|------|--------|
 | Generation loop never starts | `src/cli/main.cpp` | `input_tokens` is built from the prompt but `current_tokens` starts empty and is never seeded; loop exits at `if (n_tokens == 0) break` |
-| Matmul D→H copy missing | `src/backends/amd_xdna/amd_xdna.cpp` | `mul_mat_q()` runs kernel but never `copy_from` output buffer (unlike `rms_norm`, `softmax`, `silu`, `flash_attn`) |
 | KV cache ignores `-c` | `src/arch/llama/llama.cpp` | `init_kv_cache()` uses GGUF `context_length`; Llama 3.2 1B reports **131072** → ~8.6 GB KV RAM alone |
 | Embeddings assume F32 | `src/cli/main.cpp` | `get_float_ptr()` casts quantized `token_embd.weight` without dequant |
 | RoPE on CPU | `src/backends/amd_xdna/amd_xdna.cpp` | Explicit CPU fallback; OK for early MVP, not “all math on NPU” |
@@ -501,9 +501,8 @@ cd build && ctest
 1. Host: install XRT, `sudo usermod -aG render $USER`, set memlock unlimited, re-login
 2. Rebuild: `-DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF`
 3. Obtain xclbins via `scripts/build-kernels.sh` (needs mlir-aie + Peano) or prebuilt artifacts — **avoid compiling mlir-aie on 16 GB RAM** (see §7.2)
-4. Fix `mul_mat_q` `copy_from` in `amd_xdna.cpp`
-5. Run `ggnpu bench-matmul` before full inference
-6. Fix `current_tokens` seeding + KV `-c` sizing + embedding dequant for Phase 5
+4. Run `ggnpu bench-matmul` and require both successful backend status and correct host-visible output before trusting throughput numbers
+5. Fix `current_tokens` seeding + KV `-c` sizing + embedding dequant for Phase 5
 
 ### 7.2 Memory constraints (16 GB RAM dev machine)
 
