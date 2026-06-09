@@ -1,1 +1,28 @@
-models/
+# Build artifacts
+build/
+*.o
+*.a
+ggnpu
+test_gguf
+test_quant
+test_graph
+test_arch
+
+# Local test models (large GGUF files)
+models/*.gguf
+models/*.bin
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+.cache/
+Testing/

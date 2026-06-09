@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  ggnpu:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ggnpu:latest
+    devices:
+      - /dev/accel/accel0
+    group_add:
+      - render
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - /usr/lib/firmware/amdnpu:/usr/lib/firmware/amdnpu:ro
+      - ${HOME}/.cache/ggnpu:/root/.cache/ggnpu
+      - ./models:/models:ro
+    command: ["-m", "/models/model.gguf", "-p", "Hello", "-n", "64"]
