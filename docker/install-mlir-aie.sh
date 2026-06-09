@@ -21,7 +21,8 @@ apt-get install -y --no-install-recommends \
     python3-venv \
     curl \
     ca-certificates \
-    unzip
+    unzip \
+    libssl-dev
 
 if [ ! -d "$MLIR_AIE_SRC/.git" ]; then
     git clone --depth 1 https://github.com/Xilinx/mlir-aie.git "$MLIR_AIE_SRC"
