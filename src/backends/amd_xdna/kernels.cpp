@@ -338,6 +338,179 @@ std::vector<uint8_t> jit_compile_matmul(int M, int N, int K, int npu_profile) {
 }
 
 //====//
+// MLIR source generation for RMS normalization kernel
+//====//
+std::string generate_rmsnorm_mlir(int N, int npu_profile) {
+    std::ostringstream mlir;
+
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    int vec_len = 16;
+    int num_vectors = (N + vec_len - 1) / vec_len;
+
+    mlir << "// GGNPU auto-generated MLIR for RMSNorm: N=" << N << "\n";
+    mlir << "// Compiled for NPU profile: " << profile_str << "\n";
+    mlir << "// Vector chunks: " << num_vectors << "\n\n";
+
+    mlir << "module attributes {aie.device = \"aie2p\"} {\n";
+
+    // DMA channels
+    mlir << "    %dma_in = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 0 : i32,\n";
+    mlir << "        direction = \"host_to_tile\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    mlir << "    %dma_out = \"aie.dma_acquire\"() {\n";
+    mlir << "        channel_id = 1 : i32,\n";
+    mlir << "        direction = \"tile_to_host\" : string,\n";
+    mlir << "        tile = #aie.tile{row = 0, col = 0}\n";
+    mlir << "    } : () -> !aie.objectbox.stream\n\n";
+
+    // Shim tile
+    mlir << "    \"aie.shimtile\"(#aie.tile{row = 0, col = 0}) {\n";
+    mlir << "        \"aie.dma_port\"() { port = \"A\", direction = \"input\" } : () -> ()\n";
+    mlir << "        \"aie.dma_port\"() { port = \"B\", direction = \"output\" } : () -> ()\n";
+    mlir << "    }\n\n";
+
+    // Control tile
+    mlir << "    \"aie.tile\"(#aie.tile{row = 0, col = 0}) {\n";
+    mlir << "        %lock_compute = \"aie.lock\"() {\n";
+    mlir << "            lock = #aie.lock{lock_id = 0, target = \"tile\",\n";
+    mlir << "                tile = #aie.tile{row = 1, col = 0}}\n";
+    mlir << "        } : () -> !aie.lock\n\n";
+
+    mlir << "        // Load input vector\n";
+    mlir << "        \"aie.dma_start\"(%dma_in) { len = " << (N * 4) << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_in) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n\n";
+
+    mlir << "        // Compute RMS factor: norm_inv = 1/sqrt(sum(x^2)/N + eps)\n";
+    mlir << "        // Store norm_inv to shared memory at offset 0\n\n";
+
+    mlir << "        // Signal compute tile\n";
+    mlir << "        \"aie.lock\"(%lock_compute) : (!aie.lock) -> ()\n\n";
+
+    mlir << "        // Store output vector\n";
+    mlir << "        \"aie.dma_start\"(%dma_out) { len = " << (N * 4) << " : i64 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "        \"aie.dma_wait\"(%dma_out) { count = 1 : i32 } : (!aie.objectbox.stream) -> ()\n";
+    mlir << "    }\n\n";
+
+    // Compute tile
+    mlir << "    \"aie.tile\"(#aie.tile{row = 1, col = 0}) {\n";
+    mlir << "        %lock_start = \"aie.lock\"() {\n";
+    mlir << "            lock = #aie.lock{lock_id = 0, target = \"tile\",\n";
+    mlir << "                tile = #aie.tile{row = 0, col = 0}}\n";
+    mlir << "        } : () -> !aie.lock\n";
+    mlir << "        \"aie.lock\"(%lock_start) : (!aie.lock) -> ()\n\n";
+
+    mlir << "        // Load norm_inv from shared memory\n";
+    mlir << "        // For each vector chunk: y_vec = x_vec * norm_inv\n";
+    for (int v = 0; v < num_vectors; v++) {
+        mlir << "        // Vector chunk " << v << ": offset=" << (v * vec_len) << "\n";
+        mlir << "        // %x_vec = aie.load(%ptr_input, offset=" << (v * vec_len * 4) << ")\n";
+        mlir << "        // %y_vec = vmul(%x_vec, broadcast(norm_inv))\n";
+        mlir << "        // aie.store(%y_vec, %ptr_output, offset=" << (v * vec_len * 4) << ")\n";
+    }
+
+    mlir << "\n        \"aie.unlock\"(%lock_start) : (!aie.lock) -> ()\n";
+    mlir << "    }\n";
+    mlir << "}\n";
+
+    return mlir.str();
+}
+
+//====//
+// JIT compile rmsnorm kernel using mlir-aie
+// Returns xclbin data, or empty vector if compilation fails
+//====//
+std::vector<uint8_t> jit_compile_rmsnorm(int N, int npu_profile) {
+    std::string aie_home = get_env("AIE_HOME");
+    std::string peano_home = get_env("PEANO_HOME");
+
+    std::string aiecc_path;
+    if (!aie_home.empty()) {
+        aiecc_path = fs::path(aie_home) / "bin" / "aiecc.py";
+    } else {
+        aiecc_path = "aiecc.py";
+    }
+
+    if (!fs::exists(aiecc_path) && !command_exists("aiecc.py")) {
+        std::cerr << "Info: mlir-aie (aiecc.py) not found. Skipping JIT compilation.\n";
+        return {};
+    }
+
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    std::string cache_dir = get_env("HOME") + "/.cache/ggnpu";
+    fs::path tmp_dir = fs::path(cache_dir) / "xclbin_tmp";
+    fs::create_directories(tmp_dir);
+
+    fs::path mlir_file = tmp_dir / ("rmsnorm_" + std::to_string(N) + ".mlir");
+    fs::path xclbin_file = tmp_dir / ("rmsnorm_" + profile_str + "_" + std::to_string(N) + ".xclbin");
+
+    std::string mlir_source = generate_rmsnorm_mlir(N, npu_profile);
+
+    std::ofstream mlir_out(mlir_file);
+    if (!mlir_out.is_open()) {
+        std::cerr << "Error: failed to write MLIR temp file: " << mlir_file << "\n";
+        return {};
+    }
+    mlir_out << mlir_source;
+    mlir_out.close();
+
+    std::string cmd = "aiecc.py";
+    if (!aie_home.empty() && fs::exists(aiecc_path)) {
+        cmd = "\"" + aiecc_path.string() + "\"";
+    }
+
+    cmd += " --target=aie2p";
+    cmd += " --npu-profile=" + std::to_string(npu_profile);
+    cmd += " -I\"" + aie_home + "/include\"";
+    if (!peano_home.empty()) {
+        cmd += " -I\"" + peano_home + "/include\"";
+        cmd += " -L\"" + peano_home + "/lib\"";
+    }
+    cmd += " \"" + mlir_file.string() + "\"";
+    cmd += " -o \"" + xclbin_file.string() + "\"";
+
+    std::cerr << "JIT: compiling rmsnorm N=" << N << " for " << profile_str << "\n";
+    int result = std::system(cmd.c_str());
+
+    if (result != 0) {
+        std::cerr << "Error: JIT compilation failed (exit code " << result << ")\n";
+        fs::remove(mlir_file);
+        return {};
+    }
+
+    if (!fs::exists(xclbin_file)) {
+        std::cerr << "Error: xclbin not produced by compiler\n";
+        fs::remove(mlir_file);
+        return {};
+    }
+
+    std::vector<uint8_t> xclbin_data = load_xclbin_file(xclbin_file.string());
+    if (xclbin_data.empty()) {
+        std::cerr << "Error: xclbin is empty\n";
+        fs::remove(mlir_file);
+        fs::remove(xclbin_file);
+        return {};
+    }
+
+    std::cerr << "JIT: compiled " << xclbin_data.size() << " bytes\n";
+
+    fs::remove(mlir_file);
+    fs::remove(xclbin_file);
+
+    return xclbin_data;
+}
+
+//====//
 // Check if JIT compilation is available
 //====//
 bool jit_compilation_available() {

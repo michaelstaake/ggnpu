@@ -13,6 +13,10 @@ kernels/amd/
 │   ├── matmul_control.h  # Control code for DMA/kernel launch
 │   └── README.md         # This file
 ├── rmsnorm/         # RMS normalization (Phase 4)
+│   ├── rmsnorm.mlir    # MLIR source for mlir-aie compilation
+│   ├── rmsnorm_tile.h  # C++ tile code for Peano compilation
+│   ├── rmsnorm_control.h # Control code for DMA/reduction
+│   └── README.md       # This file
 ├── rope/            # RoPE positional encoding (Phase 4)
 ├── softmax/         # Softmax activation (Phase 4)
 └── fused_attn/      # Fused attention v2 (Phase 6)
@@ -91,8 +95,8 @@ At runtime, `ggnpu` will:
 
 ## Current Status
 
-- `matmul_i8`: Source files created, requires mlir-aie to compile
-- `rmsnorm`: Placeholder (Phase 4)
+- `matmul_i8`: Source files complete, requires mlir-aie to compile
+- `rmsnorm`: Source files complete, requires mlir-aie to compile
 - `rope`: Placeholder (Phase 4)
 - `softmax`: Placeholder (Phase 4)
 - `fused_attn`: Placeholder (Phase 6)

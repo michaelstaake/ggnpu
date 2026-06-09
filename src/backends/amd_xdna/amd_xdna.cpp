@@ -26,6 +26,7 @@ namespace detail {
     std::vector<uint8_t> load_xclbin_file(const std::string& path);
     std::string find_prebuilt_xclbin(const std::string& xclbin_name, const std::string& cache_dir);
     std::vector<uint8_t> jit_compile_matmul(int M, int N, int K, int profile);
+    std::vector<uint8_t> jit_compile_rmsnorm(int N, int profile);
     std::string make_cache_key(const std::string& op, int M, int N, int K, const std::string& profile);
 }
 
@@ -98,6 +99,13 @@ struct CachedKernel {
     GgmlType B_type;
 };
 
+// Cached kernel for RMS normalization
+struct CachedRmsNormKernel {
+    xrt::ip_handle ip_handle;
+    xrt::run run;
+    int N;
+};
+
 // AMD XDNA NPU backend
 class AmdXdnaBackend : public Backend {
 public:
@@ -141,6 +149,9 @@ public:
 
         // Load or compile matmul xclbin
         load_matmul_xclbin();
+
+        // Load or compile rmsnorm xclbin
+        load_rmsnorm_xclbin();
     }
 
     ~AmdXdnaBackend() override = default;
@@ -216,18 +227,59 @@ public:
     }
 
     Status rms_norm(const RmsNormParams& params) override {
-        // Stub: compute on host for now, NPU kernel to be added in Phase 4
-        float variance = 0.0f;
-        for (int i = 0; i < params.size; i++) {
-            variance += params.input[i] * params.input[i];
+        if (!params.input || !params.output || params.size <= 0) {
+            last_status_ = Status::INVALID_PARAM;
+            return last_status_;
         }
-        variance /= params.size;
-        variance += params.eps;
-        float inv_std = 1.0f / std::sqrt(variance);
 
-        for (int i = 0; i < params.size; i++) {
-            params.output[i] = params.input[i] * inv_std;
+        int N = params.size;
+        std::string cache_key = "rmsnorm_" + std::to_string(N) + "_" + profile_str_;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = rmsnorm_kernels_.find(N);
+        if (it == rmsnorm_kernels_.end()) {
+            if (!ensure_rmsnorm_kernel(N, cache_key)) {
+                // Fall back to CPU if NPU kernel unavailable
+                std::cerr << "Warning: rmsnorm NPU kernel unavailable, using CPU fallback\n";
+                float variance = 0.0f;
+                for (int i = 0; i < params.size; i++) {
+                    variance += params.input[i] * params.input[i];
+                }
+                variance /= params.size;
+                variance += params.eps;
+                float inv_std = 1.0f / std::sqrt(variance);
+                for (int i = 0; i < params.size; i++) {
+                    params.output[i] = params.input[i] * inv_std;
+                }
+                return Status::OK;
+            }
+            it = rmsnorm_kernels_.find(N);
         }
+
+        auto& kernel = it->second;
+
+        size_t size_bytes = N * sizeof(float);
+        if (!buf_rmsnorm_in_ || buf_rmsnorm_in_->size() < size_bytes) {
+            buf_rmsnorm_in_ = buf_mgr_->alloc(size_bytes, true);
+        }
+        if (!buf_rmsnorm_out_ || buf_rmsnorm_out_->size() < size_bytes) {
+            buf_rmsnorm_out_ = buf_mgr_->alloc(size_bytes, true);
+        }
+
+        buf_mgr_->copy_to(*buf_rmsnorm_in_, params.input, size_bytes);
+
+        try {
+            kernel.run(buf_rmsnorm_in_->handle(), buf_rmsnorm_out_->handle(),
+                       static_cast<uint32_t>(N));
+        } catch (const std::exception& e) {
+            std::cerr << "Error: rmsnorm kernel execution failed: " << e.what() << "\n";
+            last_status_ = Status::ERROR;
+            return last_status_;
+        }
+
+        buf_mgr_->copy_from(*buf_rmsnorm_out_, params.output, size_bytes);
+
         return Status::OK;
     }
 
@@ -418,6 +470,92 @@ private:
         }
     }
 
+    // Load or compile the rmsnorm xclbin for the target NPU profile
+    bool load_rmsnorm_xclbin() {
+        std::string xclbin_name = "rmsnorm_" + profile_str_ + ".xclbin";
+        std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
+
+        if (xclbin_path.empty() && cache_->has_xclbin(xclbin_name)) {
+            xclbin_path = cache_->get_xclbin_path(xclbin_name);
+        }
+
+        if (xclbin_path.empty()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_rmsnorm(4096, npu_profile_);
+            if (!xclbin_data.empty()) {
+                std::string cache_key = detail::make_cache_key("rmsnorm", 4096, 0, 0, profile_str_);
+                cache_->store_xclbin(cache_key, xclbin_data);
+                xclbin_path = cache_->get_xclbin_path(cache_key);
+            }
+        }
+
+        if (xclbin_path.empty()) {
+            std::cerr << "Warning: no rmsnorm xclbin found for profile " << profile_str_ << "\n";
+            return false;
+        }
+
+        try {
+            xclbin_data_rmsnorm_ = detail::load_xclbin_file(xclbin_path);
+            if (xclbin_data_rmsnorm_.empty()) {
+                std::cerr << "Error: failed to read xclbin: " << xclbin_path << "\n";
+                return false;
+            }
+
+            xclbin_uuid_rmsnorm_ = device_->load_xclbin(xclbin_data_rmsnorm_);
+            std::cout << "Loaded rmsnorm xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_rmsnorm_ << "\n";
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to load rmsnorm xclbin: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    // Ensure a rmsnorm kernel exists for the given dimension
+    bool ensure_rmsnorm_kernel(int N, const std::string& cache_key) {
+        if (cache_->has_xclbin(cache_key)) {
+            std::string cached_path = cache_->get_xclbin_path(cache_key);
+            return load_rmsnorm_kernel_for_shape(cached_path, N, cache_key);
+        }
+
+        if (rmsnorm_kernels_.empty() && !xclbin_uuid_rmsnorm_.is_none()) {
+            return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
+        }
+
+        std::cerr << "Error: no xclbin available for rmsnorm N=" << N << "\n";
+        return false;
+    }
+
+    bool load_rmsnorm_kernel_for_shape(const std::string& path, int N, const std::string& cache_key) {
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) return false;
+
+            xrt::device tmp_device(*device_);
+            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
+
+            xrt::ip_handle ip(tmp_device, tmp_uuid);
+            xrt::run run(ip, "rmsnorm");
+
+            rmsnorm_kernels_[N] = {ip, run, N};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load rmsnorm kernel from cache: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool create_rmsnorm_kernel_from_loaded_xclbin(int N, const std::string& cache_key) {
+        try {
+            xrt::ip_handle ip(*device_, xclbin_uuid_rmsnorm_);
+            xrt::run run(ip, "rmsnorm");
+
+            rmsnorm_kernels_[N] = {ip, run, N};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to create rmsnorm kernel: " << e.what() << "\n";
+            return false;
+        }
+    }
+
     std::shared_ptr<xrt::device> device_;
     std::shared_ptr<BufferMgr> buf_mgr_;
     std::unique_ptr<CompileCache> cache_;
@@ -425,11 +563,18 @@ private:
     std::vector<uint8_t> xclbin_data_;
     xrt::uuid xclbin_uuid_;
 
+    std::vector<uint8_t> xclbin_data_rmsnorm_;
+    xrt::uuid xclbin_uuid_rmsnorm_;
+
     std::shared_ptr<XrtBuffer> buf_a_;
     std::shared_ptr<XrtBuffer> buf_b_;
     std::shared_ptr<XrtBuffer> buf_c_;
 
+    std::shared_ptr<XrtBuffer> buf_rmsnorm_in_;
+    std::shared_ptr<XrtBuffer> buf_rmsnorm_out_;
+
     std::unordered_map<std::string, CachedKernel> matmul_kernels_;
+    std::unordered_map<int, CachedRmsNormKernel> rmsnorm_kernels_;
 
     int npu_profile_ = 6;
     std::string profile_str_ = "npu6";

@@ -491,7 +491,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < size; i++) {
             variance += inp[i] * inp[i];
         }
-        variance = variance / size + eps * eps;
+        variance = variance / size + eps;
         float inv_std = 1.0f / std::sqrt(variance);
         for (int i = 0; i < size; i++) {
             out[i] = inp[i] * inv_std;
