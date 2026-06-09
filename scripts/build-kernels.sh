@@ -27,17 +27,29 @@ XCLBIN_DIR="$CACHE_DIR/xclbin"
 # NPU profiles: 4=Strix Point, 5=Strix Point rev, 6=Krackan
 ALL_PROFILES=("4" "5" "6")
 
-# Default: build all profiles unless specified
-if [ $# -ge 1 ] && [[ "$1" =~ ^[0-9]+$ ]]; then
-    PROFILES=("$1")
-elif [ $# -ge 1 ]; then
-    # Kernel name filter (e.g., "matmul")
-    KERNEL_FILTER="$1"
-    PROFILES=("${ALL_PROFILES[@]}")
-else
-    PROFILES=("${ALL_PROFILES[@]}")
-    KERNEL_FILTER=""
-fi
+# Parse args: profile (6, npu6) and/or kernel name (matmul)
+KERNEL_FILTER=""
+PROFILES=("${ALL_PROFILES[@]}")
+
+parse_profile_arg() {
+    local arg="$1"
+    case "$arg" in
+        npu4|4) echo "4" ;;
+        npu5|5) echo "5" ;;
+        npu6|6) echo "6" ;;
+        *) echo "" ;;
+    esac
+}
+
+while [ $# -gt 0 ]; do
+    profile="$(parse_profile_arg "$1")"
+    if [ -n "$profile" ]; then
+        PROFILES=("$profile")
+    else
+        KERNEL_FILTER="$1"
+    fi
+    shift
+done
 
 mkdir -p "$XCLBIN_DIR"
 
@@ -51,19 +63,41 @@ fi
 echo ""
 
 #====//
-# Check for aiecc.py
+# Check for aiecc / aiecc.py
 #====//
 AIECC_FOUND=false
 AIECC_PATH=""
 
+if [ -z "${AIE_HOME:-}" ] && [ -f /etc/ggnpu-aie-home ]; then
+    AIE_HOME="$(cat /etc/ggnpu-aie-home)"
+fi
+
 if [ -n "${AIE_HOME:-}" ]; then
-    if [ -f "$AIE_HOME/bin/aiecc.py" ]; then
+    if [[ "$AIE_HOME" == *"/path/to/"* ]] || [ ! -d "$AIE_HOME" ]; then
+        echo "ERROR: AIE_HOME is not a real mlir-aie install: $AIE_HOME"
+        echo ""
+        echo "  /path/to/mlir-aie is a documentation placeholder — set AIE_HOME to your"
+        echo "  actual mlir-aie build directory (the one that contains bin/aiecc.py)."
+        echo ""
+        echo "  Example after building mlir-aie:"
+        echo "    export AIE_HOME=\$HOME/mlir-aie/build"
+        echo "    ./scripts/build-kernels.sh npu6 matmul"
+        exit 1
+    fi
+    if [ -x "$AIE_HOME/bin/aiecc" ]; then
+        AIECC_FOUND=true
+        AIECC_PATH="$AIE_HOME/bin/aiecc"
+    elif [ -f "$AIE_HOME/bin/aiecc.py" ]; then
         AIECC_FOUND=true
         AIECC_PATH="$AIE_HOME/bin/aiecc.py"
     else
-        echo "ERROR: AIE_HOME=$AIE_HOME but aiecc.py not found"
+        echo "ERROR: AIE_HOME=$AIE_HOME but bin/aiecc or bin/aiecc.py not found"
+        echo "  mlir-aie is not installed. See docs/docker.md or docs/host-setup-guide.md"
         exit 1
     fi
+elif command -v aiecc >/dev/null 2>&1; then
+    AIECC_FOUND=true
+    AIECC_PATH="$(command -v aiecc)"
 elif command -v aiecc.py >/dev/null 2>&1; then
     AIECC_FOUND=true
     AIECC_PATH="$(command -v aiecc.py)"
@@ -78,8 +112,16 @@ else
     echo "      -DMLIR_AIE_BUILD_TOOLS=ON"
     echo "  ninja"
     echo ""
-    echo "Or set AIE_HOME to an existing mlir-aie build."
-    echo "Alternatively, use prebuilt xclbins in $XCLBIN_DIR"
+    echo "Or set AIE_HOME to your mlir-aie *build* directory (contains bin/aiecc.py):"
+    echo "  export AIE_HOME=\$HOME/mlir-aie/build"
+    echo "  ./scripts/build-kernels.sh npu6 matmul"
+    echo ""
+    echo "Build guide: https://github.com/Xilinx/mlir-aie/blob/main/docs/Building.md"
+    echo "Ryzen AI notes: https://github.com/Xilinx/mlir-aie/blob/main/docs/Building.md"
+    echo ""
+    echo "On 16GB RAM machines, prefer copying prebuilt xclbins into:"
+    echo "  $XCLBIN_DIR"
+    echo "  (needs at least matmul_npu6.xclbin for bench-matmul)"
     exit 1
 fi
 
@@ -197,6 +239,15 @@ echo "  Total: $TOTAL"
 echo "  Success: $SUCCESS"
 echo "  Failed: $FAILED"
 echo ""
+
+if [ "$TOTAL" -eq 0 ]; then
+    echo "ERROR: No kernels were built."
+    if [ -n "${KERNEL_FILTER:-}" ]; then
+        echo "  Unknown kernel filter: $KERNEL_FILTER"
+        echo "  Valid kernels: matmul rmsnorm rope softmax silu flash_attn"
+    fi
+    exit 1
+fi
 
 if [ "$FAILED" -gt 0 ]; then
     echo "Some kernels failed to compile. Check the output above for errors."

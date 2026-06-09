@@ -1,21 +1,55 @@
-version: '3.8'
+# GGNPU Docker Compose
+#
+# Host prerequisites (not installed in container):
+#   - Native Docker (not Docker Desktop VM)
+#   - amdxdna driver loaded, /dev/accel/accel0 present
+#   - User in render group (or compose group_add below)
+#   - /usr/lib/firmware/amdnpu on host
+#
+# Quick start:
+#   docker compose -f docker/docker-compose.yml build
+#   docker compose -f docker/docker-compose.yml --profile build run --rm builder
+#   docker compose -f docker/docker-compose.yml run --rm ggnpu bench-matmul
+#   docker compose -f docker/docker-compose.yml run --rm ggnpu \
+#     -m /models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048 -n 32
 
 services:
+  # One-shot: compile mlir-aie + xclbins + ggnpu (heavy; run once or when kernels change)
+  builder:
+    profiles: ["build"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.builder
+      args:
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-26.04}
+    image: ggnpu-builder:latest
+    volumes:
+      - ggnpu-cache:/root/.cache/ggnpu
+    # Populates ggnpu-cache volume with xclbins under xclbin/
+
+  # Inference / bench-matmul on host NPU
   ggnpu:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-26.04}
     image: ggnpu:latest
     devices:
-      - /dev/accel/accel0
+      - /dev/accel/accel0:/dev/accel/accel0
+    # GID of host 'render' group (getent group render | cut -d: -f3)
     group_add:
-      - render
+      - "${RENDER_GID:-990}"
     ulimits:
       memlock:
         soft: -1
         hard: -1
     volumes:
       - /usr/lib/firmware/amdnpu:/usr/lib/firmware/amdnpu:ro
-      - ${HOME}/.cache/ggnpu:/root/.cache/ggnpu
-      - ./models:/models:ro
-    command: ["-m", "/models/model.gguf", "-p", "Hello", "-n", "64"]
+      - ggnpu-cache:/root/.cache/ggnpu
+      - ../models:/models:ro
+    environment:
+      GGNPU_CACHE_DIR: /root/.cache/ggnpu
+
+volumes:
+  ggnpu-cache:

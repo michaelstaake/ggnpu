@@ -1,0 +1,11 @@
+build/
+build-*/
+.git/
+.cache/
+third_party/xrt-dev/
+third_party/uuid-dev/
+models/*.gguf
+models/*.bin
+*.o
+*.a
+Testing/

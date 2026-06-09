@@ -42,7 +42,7 @@ sudo usermod -aG render $USER
 ```bash
 docker run --rm \
   --device=/dev/accel/accel0 \
-  --group-add render \
+  --group-add "$(getent group render | cut -d: -f3)" \
   --ulimit memlock=-1:-1 \
   -v /usr/lib/firmware/amdnpu:/usr/lib/firmware/amdnpu:ro \
   -v $HOME/.cache/ggnpu:/root/.cache/ggnpu \
