@@ -5,11 +5,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# CMake module path for FindPeano, FindXRT
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
+
 # Options
 option(GGNPU_BUILD_TESTS "Build unit tests" ON)
 option(GGNPU_NPU_BACKEND "Enable AMD NPU backend (requires XRT)" OFF)
 option(GGNPU_TEST_CPU "Enable CPU reference backend for testing" ON)
 option(GGNPU_BUILD_DOCS "Build documentation" OFF)
+option(GGNPU_BUILD_KERNELS "Build NPU kernels at build time (requires mlir-aie)" OFF)
 
 # Compiler flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
@@ -151,3 +155,103 @@ endif()
 
 # Install
 install(TARGETS ggnpu DESTINATION bin)
+
+#====//
+# NPU Kernel Building (optional, requires mlir-aie + Peano)
+#====//
+if(GGNPU_BUILD_KERNELS)
+    find_package(Peano QUIET)
+
+    # Check for aiecc.py
+    set(AIECC_FOUND OFF)
+    set(AIE_HOME "" CACHE PATH "mlir-aie build directory")
+
+    if(AIE_HOME)
+        if(EXISTS "${AIE_HOME}/bin/aiecc.py")
+            set(AIECC_FOUND ON)
+            message(STATUS "mlir-aie found: ${AIE_HOME}/bin/aiecc.py")
+        else()
+            message(WARNING "AIE_HOME set to ${AIE_HOME} but aiecc.py not found")
+        endif()
+    elseif(NOT Peano_FOUND)
+        find_program(AIECC_BIN aiecc.py)
+        if(AIECC_BIN)
+            set(AIECC_FOUND ON)
+            message(STATUS "mlir-aie (aiecc.py) found: ${AIECC_BIN}")
+        endif()
+    endif()
+
+    if(AIECC_FOUND AND Peano_FOUND)
+        message(STATUS "NPU kernel building enabled")
+
+        # Define kernel shapes to compile (typical Llama 3B shapes)
+        set(GGNPU_KERNEL_SHAPES
+            "256x256x256"
+            "512x512x512"
+            "1024x1024x1024"
+            "2048x2048x2048"
+            "3072x3072x3072"
+            "4096x4096x4096"
+            "8192x8192x8192"
+        )
+
+        # Create kernel output directory
+        set(KERNEL_OUTPUT_DIR "${CMAKE_BINARY_DIR}/xclbin")
+        file(MAKE_DIRECTORY "${KERNEL_OUTPUT_DIR}")
+
+        # Generate aie2p target for each shape
+        foreach(SHAPE ${GGNPU_KERNEL_SHAPES})
+            string(REPLACE "x" "_" SHAPE_NAME "${SHAPE}")
+            set(MLIR_SRC "${CMAKE_SOURCE_DIR}/kernels/amd/matmul_i8/matmul.mlir")
+            set(XCLBIN_OUT "${KERNEL_OUTPUT_DIR}/matmul_aie2p_${SHAPE_NAME}.xclbin")
+
+            add_custom_command(
+                OUTPUT "${XCLBIN_OUT}"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${KERNEL_OUTPUT_DIR}"
+                COMMAND ${AIECC_BIN}
+                    --target=aie2p
+                    --npu-profile=4
+                    -I"${Peano_INCLUDE_DIRS}"
+                    -L"${Peano_LIBRARIES}"
+                    "${MLIR_SRC}"
+                    -o "${XCLBIN_OUT}"
+                DEPENDS "${MLIR_SRC}"
+                COMMENT "Building NPU kernel: matmul ${SHAPE}"
+                VERBATIM
+            )
+
+            list(APPEND GGNPU_KERNEL_TARGETS "${XCLBIN_OUT}")
+        endforeach()
+
+        add_custom_target(build_npu_kernels ALL
+            DEPENDS ${GGNPU_KERNEL_TARGETS}
+        )
+
+        # Install kernels to prefix
+        install(DIRECTORY "${KERNEL_OUTPUT_DIR}/"
+            DESTINATION share/ggnpu/xclbin
+            FILES_MATCHING PATTERN "*.xclbin"
+        )
+
+    elseif(AIECC_FOUND)
+        message(WARNING "aiecc.py found but Peano not found. Kernel building may fail.")
+    else()
+        message(STATUS "NPU kernel building disabled (aiecc.py not found)")
+        message(STATUS "  Install mlir-aie and set AIE_HOME, or enable prebuilt xclbins")
+    endif()
+endif()
+
+# Print build summary
+message(STATUS "")
+message(STATUS "=== GGNPU Build Configuration ===")
+message(STATUS "  NPU backend:        ${GGNPU_NPU_BACKEND}")
+message(STATUS "  CPU ref backend:    ${GGNPU_TEST_CPU}")
+message(STATUS "  Tests:              ${GGNPU_BUILD_TESTS}")
+message(STATUS "  Kernel building:    ${GGNPU_BUILD_KERNELS}")
+if(AIECC_FOUND)
+    message(STATUS "  JIT compilation:    available")
+else()
+    message(STATUS "  JIT compilation:    not available (requires mlir-aie)")
+endif()
+message(STATUS "=================================")
+message(STATUS "")
