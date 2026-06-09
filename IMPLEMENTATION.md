@@ -4,9 +4,9 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state (2025-06-09):** **Not ready to run a model on the NPU.** Phase 1 is complete (GGUF load/dump). Phases 0 and 3 are partial. Phases 2, 4–6 are not started on hardware. Hardware and driver foundations exist on the dev laptop (Krackan NPU, `amdxdna`, `/dev/accel/accel0`), but XRT is not installed, the default build disables the NPU backend, no `.xclbin` kernels are cached, and several code bugs block inference even on CPU ref. See **§7.1 Readiness snapshot** and `git log`.
+**Current state (2025-06-09):** **Not ready to run a model on the NPU.** Phase 1 is complete (GGUF load/dump). Phases 0 and 3 are partial. Phases 2, 4–6 are not started on hardware. The dev laptop has Krackan NPU hardware (`amdxdna`, `/dev/accel/accel0`, `render` group, memlock unlimited). XRT **runtime** is installed (`libxrt2`, `libxrt-npu2`) but **`libxrt-dev` is required to compile the NPU backend**. No `.xclbin` kernels are cached yet. Inference loop bugs (KV sizing, attention dims, prefill buffers) were fixed in this pass; RoPE and logits projection still run on CPU. See **§7.1 Readiness snapshot**.
 
-**Verdict:** Solid Phase 1 foundation; Phase 2+ work required before any model runs on the NPU.
+**Verdict:** Solid Phase 1 foundation; host is ~80% ready; Phase 2 (`bench-matmul` + xclbins) is the next gate before any model runs on the NPU.
 
 ---
 
@@ -350,7 +350,7 @@ Work through these in order. Do not skip ahead.
 | 2 NPU matmul smoke | `bench-matmul` on hardware | **Not done** — needs XRT, xclbins (host setup) |
 | 3 Q4_K weight path | Decode + one E2E matmul | Decoders + disk cache done; NPU E2E not validated |
 | 4 Full decoder layer | All ops on NPU | **Not done** |
-| 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — KV cache `-c` fix done, loop seed bug fixed |
+| 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — KV `-c`/cap fix done, attention dims fixed, not validated E2E |
 | 6 Production | Docker, 3B, L2 tiling | **Not done** |
 | 7 Intel stub | Interface research | **Not started** |
 
@@ -361,7 +361,7 @@ Work through these in order. Do not skip ahead.
 - [x] `scripts/setup-host.sh` — XRT PPA, memlock limits, `render` group
 - [x] `scripts/verify-npu.sh` — `lspci`, `lsmod amdxdna`, `/dev/accel/accel0`, `xrt-smi examine` (run with `bash scripts/verify-npu.sh`; chmod +x optional)
 - [x] `docs/architecture.md`, `docs/amd-krackan.md`
-- [ ] Binary links against XRT on dev machine (blocked: XRT not installed)
+- [ ] Binary links against XRT on dev machine (blocked: install `libxrt-dev`, rebuild with `-DGGNPU_NPU_BACKEND=ON`)
 
 **Done when:** binary links against XRT; `verify-npu.sh` passes on target host.
 
@@ -402,11 +402,11 @@ Work through these in order. Do not skip ahead.
 
 ### Phase 5 — Inference MVP
 
-- [ ] Prefill + decode loops (prefill not wired; decode loop has seed bug — see §7.1)
-- [x] Tokenizer + greedy sampling (implemented; blocked by loop bug)
-- [ ] Target: Llama 3.2 1B Q4_K_M, ctx 2048
-- [ ] Fix KV cache to respect `-c` (currently allocates full GGUF `context_length`)
-- [ ] Dequant `token_embd.weight` for Q4_K models (currently casts via `get_float_ptr()`)
+- [x] Prefill + decode loops (per-token buffers; not validated E2E)
+- [x] Tokenizer + greedy sampling
+- [ ] Target: Llama 3.2 1B Q4_K_M, ctx 2048 — needs NPU xclbins + E2E test
+- [x] Fix KV cache to respect `-c` / cap default ctx to 2048
+- [x] Dequant `token_embd.weight` for Q4_K models
 
 **Done when:**
 
@@ -441,9 +441,12 @@ Assessment of whether the project can run a model on the NPU **today**.
 |-------|--------|-------|
 | NPU hardware | Present | PCI `1022:17f0` (Strix/Krackan) |
 | Kernel driver | Loaded | `amdxdna` module |
-| Device node | Exists | `/dev/accel/accel0` (group `render`) |
+| Device node | Present | `/dev/accel/accel0` (group `render`) |
 | Firmware | Present | `/usr/lib/firmware/amdnpu` |
 | Host OS | Matches target | Linux 7.0 |
+| `render` group | Present | User in `render` |
+| Memlock | Unlimited | `ulimit -l` OK |
+| XRT runtime | Installed | `libxrt2`, `libxrt-npu2` |
 | ggnpu binary | Builds | Default: `GGNPU_NPU_BACKEND=OFF`, `GGNPU_TEST_CPU=ON` |
 | GGUF loading | Works | `--dump-tensors` on Llama 3.2 1B succeeds |
 | Test models | On disk | See §17 |
@@ -452,12 +455,11 @@ Assessment of whether the project can run a model on the NPU **today**.
 
 | Check | Dev machine | Required |
 |-------|-------------|----------|
-| XRT (`libxrt2`, `libxrt-npu2`) | **Not installed** | Every NPU op |
-| `render` group | **Missing** | Open `/dev/accel/accel0` |
-| `ulimit -l` (memlock) | **8192** (8 MB) | Must be `unlimited` for pinned DMA |
-| mlir-aie (`aiecc.py`) | **Not installed** | Compile `.xclbin` kernels |
-| NPU backend in build | **OFF** | `-DGGNPU_NPU_BACKEND=ON` |
+| XRT dev headers (`libxrt-dev`) | **Not installed** | Compile NPU backend |
+| mlir-aie (`aiecc.py`) | **Not installed** | Compile `.xclbin` kernels (or use prebuilt) |
+| NPU backend in build | **OFF** | `-DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF` |
 | `.xclbin` cache | **Empty** | `~/.cache/ggnpu/xclbin/` |
+| IOMMU | **Unverified** | `amd_iommu=on` in kernel cmdline |
 
 Host setup commands: §9 and `docs/amd-krackan.md`. Production build:
 
@@ -468,15 +470,27 @@ make -j2
 
 Do **not** rely on `GGNPU_TEST_CPU=ON` in production — it allows silent CPU fallback, which violates §2 production rule.
 
-#### Known code bugs (fix before Phase 5)
+#### Known code gaps (remaining before Phase 5)
 
-| Bug | File | Impact |
+| Gap | File | Impact |
 |-----|------|--------|
-| Generation loop never starts | `src/cli/main.cpp` | `input_tokens` is built from the prompt but `current_tokens` starts empty and is never seeded; loop exits at `if (n_tokens == 0) break` |
-| KV cache ignores `-c` | `src/arch/llama/llama.cpp` | `init_kv_cache()` uses GGUF `context_length`; Llama 3.2 1B reports **131072** → ~8.6 GB KV RAM alone |
-| Embeddings assume F32 | `src/cli/main.cpp` | `get_float_ptr()` casts quantized `token_embd.weight` without dequant |
-| RoPE on CPU | `src/backends/amd_xdna/amd_xdna.cpp` | Explicit CPU fallback; OK for early MVP, not “all math on NPU” |
+| RoPE on CPU | `src/backends/amd_xdna/amd_xdna.cpp`, `main.cpp` | Explicit CPU fallback; OK for early MVP, not “all math on NPU” |
+| Logits projection on CPU | `src/cli/main.cpp` | Dot product not routed through `mul_mat_q` |
+| Residual adds on CPU | `src/cli/main.cpp` | Cheap; acceptable for MVP |
+| MLIR kernels skeletal | `kernels/amd/*` | Must compile with mlir-aie; not validated on hardware |
 | `execute_layer_graph()` unused | `src/cli/main.cpp` | Dead code; main calls backend directly |
+
+#### Recently fixed (2025-06-09)
+
+| Fix | File |
+|-----|------|
+| `current_tokens` seeded from prompt | `main.cpp` |
+| KV cache respects `-c`; default ctx capped to 2048 | `llama.cpp`, `main.cpp` |
+| Q4_K `token_embd` dequant | `main.cpp` |
+| Per-token prefill buffers (no embedding sum) | `main.cpp` |
+| Attention output matmul dims + per-head flash_attn | `main.cpp` |
+| Q4_K scales passed to `mul_mat_q` | `main.cpp` |
+| CMake finds Ubuntu XRT via `FindXRT.cmake` | `CMakeLists.txt` |
 
 **KV RAM formula:** `2 × n_layers × n_ctx × n_head_kv × head_dim × 4` bytes.
 
@@ -492,17 +506,17 @@ cd build && ctest
 #### What does not work today
 
 ```bash
-./build/ggnpu bench-matmul                    # needs XRT + NPU build + xclbins
-./build/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048   # loop bug + KV OOM risk
+./build/ggnpu bench-matmul                    # needs libxrt-dev + NPU build + xclbins
+./build/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048   # CPU ref only until xclbins exist
 ```
 
 #### Minimum path to first NPU activity
 
-1. Host: install XRT, `sudo usermod -aG render $USER`, set memlock unlimited, re-login
-2. Rebuild: `-DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF`
+1. Host: `sudo apt install libxrt-dev` (runtime already installed); `bash scripts/verify-npu.sh`
+2. Rebuild: `cmake .. -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF && make -j2`
 3. Obtain xclbins via `scripts/build-kernels.sh` (needs mlir-aie + Peano) or prebuilt artifacts — **avoid compiling mlir-aie on 16 GB RAM** (see §7.2)
 4. Run `ggnpu bench-matmul` and require both successful backend status and correct host-visible output before trusting throughput numbers
-5. Fix `current_tokens` seeding + KV `-c` sizing + embedding dequant for Phase 5
+5. Run inference with production flags (no CPU fallback) once matmul xclbin validates
 
 ### 7.2 Memory constraints (16 GB RAM dev machine)
 

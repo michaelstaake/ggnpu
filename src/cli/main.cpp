@@ -465,10 +465,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Loading model: " << params.model_path << "\n";
     Model model;
-    if (params.ctx_size > 0) {
-        model.set_context_length(params.ctx_size);
-        std::cout << "  Context size overridden to: " << params.ctx_size << "\n";
-    }
     if (!model.load(params.model_path)) {
         std::cerr << "Error: failed to load model\n";
         return 1;
@@ -476,6 +472,16 @@ int main(int argc, char* argv[]) {
     model.set_backend(backend);
 
     const auto& hparams = model.hparams();
+
+    // Cap context to avoid multi-GB KV allocation on models with huge metadata ctx
+    if (params.ctx_size > 0) {
+        model.set_context_length(static_cast<uint64_t>(params.ctx_size));
+        std::cout << "  Context size overridden to: " << params.ctx_size << "\n";
+    } else if (hparams.context_length > 2048) {
+        model.set_context_length(2048);
+        std::cout << "  Context capped to 2048 (model reports "
+                  << hparams.context_length << "; use -c to override)\n";
+    }
     std::cout << "  Architecture: " << model.gguf().architecture() << "\n";
     std::cout << "  Context: " << hparams.context_length << "\n";
     std::cout << "  Layers: " << hparams.block_count << "\n";
@@ -504,10 +510,6 @@ int main(int argc, char* argv[]) {
     WeightCache weight_cache(compile_cache);
     std::cout << "Weight cache initialized\n";
 
-    if (params.ctx_size > 0) {
-        model.set_context_length(static_cast<uint64_t>(params.ctx_size));
-    }
-
     // Setup working buffers
     int hidden_size = static_cast<int>(hparams.embedding_length);
     int ffn_size = static_cast<int>(hparams.feed_forward_length);
@@ -515,7 +517,7 @@ int main(int argc, char* argv[]) {
     int num_heads = static_cast<int>(hparams.attention_head_count);
     int num_kv_heads = static_cast<int>(hparams.attention_head_count_kv);
     int head_dim = static_cast<int>(hparams.rope_dimension_count);
-    int ctx_size = params.ctx_size > 0 ? params.ctx_size : static_cast<int>(hparams.context_length);
+    int ctx_size = static_cast<int>(model.hparams().context_length);
     float rms_eps = 1e-5f;
     if (hparams.attention_layer_norm_rms_epsilon > 0) {
         rms_eps = static_cast<float>(hparams.attention_layer_norm_rms_epsilon);
@@ -523,19 +525,19 @@ int main(int argc, char* argv[]) {
     float rope_freq_scale = static_cast<float>(hparams.rope_freq_scale);
     float rope_freq_base = static_cast<float>(hparams.rope_freq_base);
 
-    // Working buffers for activations
-    std::vector<float> inp_embd(hidden_size);
-    std::vector<float> inp_norm(hidden_size);
-    std::vector<float> q_proj(hidden_size);
-    std::vector<float> k_proj(num_kv_heads * head_dim);
-    std::vector<float> v_proj(num_kv_heads * head_dim);
-    std::vector<float> k_rope(num_kv_heads * head_dim);
-    std::vector<float> q_rope(num_heads * head_dim);
-    std::vector<float> attn_output(hidden_size);
-    std::vector<float> ffn_gate(ffn_size);
-    std::vector<float> ffn_up(ffn_size);
-    std::vector<float> ffn_down(hidden_size);
-    std::vector<float> ffn_silu(ffn_size);
+    // Working buffers for activations (resized per iteration for prefill/decode)
+    std::vector<float> inp_embd;
+    std::vector<float> inp_norm;
+    std::vector<float> q_proj;
+    std::vector<float> k_proj;
+    std::vector<float> v_proj;
+    std::vector<float> k_rope;
+    std::vector<float> q_rope;
+    std::vector<float> attn_output;
+    std::vector<float> ffn_gate;
+    std::vector<float> ffn_up;
+    std::vector<float> ffn_down;
+    std::vector<float> ffn_silu;
     std::vector<float> logits(static_cast<size_t>(hparams.vocab_size));
 
     // RoPE frequency buffer
@@ -570,13 +572,43 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    auto rms_norm = [&](float* out, const float* inp, int size, float eps) {
-        RmsNormParams rms_params;
-        rms_params.input = inp;
-        rms_params.output = out;
-        rms_params.size = size;
-        rms_params.eps = eps;
-        backend->rms_norm(rms_params);
+    auto rms_norm = [&](float* out, const float* inp, int n_rows, int row_size, float eps) {
+        for (int row = 0; row < n_rows; row++) {
+            RmsNormParams rms_params;
+            rms_params.input = inp + row * row_size;
+            rms_params.output = out + row * row_size;
+            rms_params.size = row_size;
+            rms_params.eps = eps;
+            backend->rms_norm(rms_params);
+        }
+    };
+
+    auto mul_mat_weight = [&](const float* A, const TensorView* weight, float* C,
+                              int M, int N, int K, int lda, int ldb, int ldc) {
+        if (!weight) return;
+        const int8_t* decoded = weight_cache.get_or_decode(weight->name,
+            weight->data, weight->data_size(), weight->type);
+        if (!decoded) return;
+
+        MulMatParams mat_params;
+        mat_params.A = A;
+        mat_params.B = decoded;
+        mat_params.C = C;
+        mat_params.M = M;
+        mat_params.N = N;
+        mat_params.K = K;
+        mat_params.lda = lda;
+        mat_params.ldb = ldb;
+        mat_params.ldc = ldc;
+        mat_params.n_batches = 1;
+        mat_params.B_type = weight->type;
+        if (weight->type == GgmlType::Q4_K || weight->type == GgmlType::Q6_K) {
+            const auto& scales = weight_cache.get_scales(weight->name);
+            if (!scales.empty()) {
+                mat_params.scales = scales.data();
+            }
+        }
+        backend->mul_mat_q(mat_params);
     };
 
     // Dequantize token embeddings once before the generation loop
@@ -614,103 +646,74 @@ int main(int argc, char* argv[]) {
         int n_tokens = static_cast<int>(current_tokens.size());
         if (n_tokens == 0) break;
 
-        // Embedding lookup - get embeddings for each token
+        // Embedding lookup - one hidden vector per token
         if (!embd_data) {
             std::cerr << "Error: token_embd.weight not available\n";
             break;
         }
         int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
 
-        std::fill(inp_embd.begin(), inp_embd.end(), 0.0f);
+        inp_embd.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+        inp_norm.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+        q_proj.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+        k_proj.assign(static_cast<size_t>(n_tokens) * num_kv_heads * head_dim, 0.0f);
+        v_proj.assign(static_cast<size_t>(n_tokens) * num_kv_heads * head_dim, 0.0f);
+        k_rope.assign(static_cast<size_t>(n_tokens) * num_kv_heads * head_dim, 0.0f);
+        q_rope.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+        attn_output.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+        ffn_gate.assign(static_cast<size_t>(n_tokens) * ffn_size, 0.0f);
+        ffn_up.assign(static_cast<size_t>(n_tokens) * ffn_size, 0.0f);
+        ffn_down.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+        ffn_silu.assign(static_cast<size_t>(n_tokens) * ffn_size, 0.0f);
+
         for (int t = 0; t < n_tokens; t++) {
             int tok_id = current_tokens[t];
             for (int d = 0; d < hidden_size; d++) {
-                inp_embd[d] += embd_data[tok_id * embd_dim + d];
+                inp_embd[static_cast<size_t>(t) * hidden_size + d] =
+                    embd_data[tok_id * embd_dim + d];
             }
         }
 
         // Transformer layers
         for (int layer = 0; layer < num_layers; layer++) {
             // RMSNorm for attention
-            rms_norm(inp_norm.data(), inp_embd.data(), hidden_size, rms_eps);
+            rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps);
 
             // Attention projections
             const TensorView* attn_q = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", layer);
             const TensorView* attn_k = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", layer);
             const TensorView* attn_v = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", layer);
 
-            if (attn_q) {
-                const int8_t* decoded_q = weight_cache.get_or_decode(attn_q->name,
-                    attn_q->data, attn_q->data_size(), attn_q->type);
-                if (decoded_q) {
-                    MulMatParams q_params;
-                    q_params.A = inp_norm.data();
-                    q_params.B = decoded_q;
-                    q_params.C = q_proj.data();
-                    q_params.M = n_tokens;
-                    q_params.N = hidden_size;
-                    q_params.K = hidden_size;
-                    q_params.lda = hidden_size;
-                    q_params.ldb = hidden_size;
-                    q_params.ldc = hidden_size;
-                    q_params.n_batches = 1;
-                    q_params.B_type = attn_q->type;
-                    backend->mul_mat_q(q_params);
-                }
-            }
-
-            if (attn_k) {
-                const int8_t* decoded_k = weight_cache.get_or_decode(attn_k->name,
-                    attn_k->data, attn_k->data_size(), attn_k->type);
-                if (decoded_k) {
-                    MulMatParams k_params;
-                    k_params.A = inp_norm.data();
-                    k_params.B = decoded_k;
-                    k_params.C = k_proj.data();
-                    k_params.M = n_tokens;
-                    k_params.N = num_kv_heads * head_dim;
-                    k_params.K = hidden_size;
-                    k_params.lda = hidden_size;
-                    k_params.ldb = hidden_size;
-                    k_params.ldc = num_kv_heads * head_dim;
-                    k_params.n_batches = 1;
-                    k_params.B_type = attn_k->type;
-                    backend->mul_mat_q(k_params);
-                }
-            }
-
-            if (attn_v) {
-                const int8_t* decoded_v = weight_cache.get_or_decode(attn_v->name,
-                    attn_v->data, attn_v->data_size(), attn_v->type);
-                if (decoded_v) {
-                    MulMatParams v_params;
-                    v_params.A = inp_norm.data();
-                    v_params.B = decoded_v;
-                    v_params.C = v_proj.data();
-                    v_params.M = n_tokens;
-                    v_params.N = num_kv_heads * head_dim;
-                    v_params.K = hidden_size;
-                    v_params.lda = hidden_size;
-                    v_params.ldb = hidden_size;
-                    v_params.ldc = num_kv_heads * head_dim;
-                    v_params.n_batches = 1;
-                    v_params.B_type = attn_v->type;
-                    backend->mul_mat_q(v_params);
-                }
-            }
+            mul_mat_weight(inp_norm.data(), attn_q, q_proj.data(),
+                           n_tokens, hidden_size, hidden_size,
+                           hidden_size, hidden_size, hidden_size);
+            mul_mat_weight(inp_norm.data(), attn_k, k_proj.data(),
+                           n_tokens, num_kv_heads * head_dim, hidden_size,
+                           hidden_size, num_kv_heads * head_dim, num_kv_heads * head_dim);
+            mul_mat_weight(inp_norm.data(), attn_v, v_proj.data(),
+                           n_tokens, num_kv_heads * head_dim, hidden_size,
+                           hidden_size, num_kv_heads * head_dim, num_kv_heads * head_dim);
 
             backend->sync();
 
-            // Apply RoPE to Q and K
-            apply_rope(q_rope.data(), q_proj.data(), num_heads, pos,
-                      head_dim, rope_freqs);
-            apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos,
-                      head_dim, rope_freqs);
+            // Apply RoPE to Q and K (per token row)
+            for (int t = 0; t < n_tokens; t++) {
+                int64_t token_pos = pos + t;
+                apply_rope(q_rope.data() + t * hidden_size,
+                           q_proj.data() + t * hidden_size,
+                           num_heads, token_pos, head_dim, rope_freqs);
+                apply_rope(k_rope.data() + t * num_kv_heads * head_dim,
+                           k_proj.data() + t * num_kv_heads * head_dim,
+                           num_kv_heads, token_pos, head_dim, rope_freqs);
+            }
 
-            // Store KV in cache
-            model.kv_cache().update_slab(layer, pos, pos + n_tokens,
-                                         k_rope.data(), v_proj.data(),
-                                         num_kv_heads, head_dim);
+            // Store KV in cache (per token row)
+            for (int t = 0; t < n_tokens; t++) {
+                model.kv_cache().update_slab(layer, pos + t, pos + t + 1,
+                                             k_rope.data() + t * num_kv_heads * head_dim,
+                                             v_proj.data() + t * num_kv_heads * head_dim,
+                                             num_kv_heads, head_dim);
+            }
 
             // Attention: compute softmax(QK^T / sqrt(d)) @ V via NPU
             int64_t ctx_len = pos + n_tokens;
@@ -734,145 +737,92 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            std::vector<float> attn_out(static_cast<size_t>(n_tokens) * head_dim, 0.0f);
+            std::vector<float> attn_out(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
 
-            for (int64_t i = 0; i < n_tokens; i++) {
-                AttnParams fa_params;
-                fa_params.Q = q_rope.data() + static_cast<int>(i) * head_dim;
-                fa_params.K = k_expanded.data();
-                fa_params.V = v_expanded.data();
-                fa_params.output = attn_out.data() + static_cast<int>(i) * head_dim;
-                fa_params.batch_size = 1;
-                fa_params.n_head = static_cast<int>(hparams.attention_head_count);
-                fa_params.head_dim = head_dim;
-                fa_params.ctx_len = ctx_len;
-                fa_params.freq_factors = nullptr;
-
-                backend->flash_attn(fa_params);
+            for (int t = 0; t < n_tokens; t++) {
+                for (int h = 0; h < num_heads; h++) {
+                    AttnParams fa_params;
+                    fa_params.Q = q_rope.data() + t * hidden_size + h * head_dim;
+                    fa_params.K = k_expanded.data() + h * ctx_len * head_dim;
+                    fa_params.V = v_expanded.data() + h * ctx_len * head_dim;
+                    fa_params.output = attn_out.data() + t * hidden_size + h * head_dim;
+                    fa_params.batch_size = 1;
+                    fa_params.n_head = 1;
+                    fa_params.head_dim = head_dim;
+                    fa_params.ctx_len = ctx_len;
+                    fa_params.freq_factors = nullptr;
+                    backend->flash_attn(fa_params);
+                }
             }
 
             // Attention output projection
             const TensorView* attn_output_w = find_tensor_pattern(model, "blk.{layer}.attn_output.weight", layer);
             if (attn_output_w) {
                 std::fill(attn_output.begin(), attn_output.end(), 0.0f);
-                const int8_t* decoded_attn_out = weight_cache.get_or_decode(attn_output_w->name,
-                    attn_output_w->data, attn_output_w->data_size(), attn_output_w->type);
-                if (decoded_attn_out) {
-                    MulMatParams out_params;
-                    out_params.A = attn_out.data();
-                    out_params.B = decoded_attn_out;
-                    out_params.C = attn_output.data();
-                    out_params.M = n_tokens;
-                    out_params.N = hidden_size;
-                    out_params.K = hidden_size;
-                    out_params.lda = head_dim;
-                    out_params.ldb = hidden_size;
-                    out_params.ldc = hidden_size;
-                    out_params.n_batches = 1;
-                    out_params.B_type = attn_output_w->type;
-                    backend->mul_mat_q(out_params);
-                    backend->sync();
+                mul_mat_weight(attn_out.data(), attn_output_w, attn_output.data(),
+                               n_tokens, hidden_size, hidden_size,
+                               hidden_size, hidden_size, hidden_size);
+                backend->sync();
 
-                    // Add residual
+                for (int t = 0; t < n_tokens; t++) {
                     for (int i = 0; i < hidden_size; i++) {
-                        inp_embd[i] += attn_output[i];
+                        inp_embd[static_cast<size_t>(t) * hidden_size + i] +=
+                            attn_output[static_cast<size_t>(t) * hidden_size + i];
                     }
                 }
             }
 
             // FFN path
-            rms_norm(inp_norm.data(), inp_embd.data(), hidden_size, rms_eps);
+            rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps);
 
             const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer);
             const TensorView* ffn_up_w = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", layer);
             const TensorView* ffn_down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", layer);
 
-            if (ffn_gate_w) {
-                const int8_t* decoded_gate = weight_cache.get_or_decode(ffn_gate_w->name,
-                    ffn_gate_w->data, ffn_gate_w->data_size(), ffn_gate_w->type);
-                if (decoded_gate) {
-                    MulMatParams gate_params;
-                    gate_params.A = inp_norm.data();
-                    gate_params.B = decoded_gate;
-                    gate_params.C = ffn_gate.data();
-                    gate_params.M = n_tokens;
-                    gate_params.N = ffn_size;
-                    gate_params.K = hidden_size;
-                    gate_params.lda = hidden_size;
-                    gate_params.ldb = ffn_size;
-                    gate_params.ldc = ffn_size;
-                    gate_params.n_batches = 1;
-                    gate_params.B_type = ffn_gate_w->type;
-                    backend->mul_mat_q(gate_params);
-                }
-            }
-
-            if (ffn_up_w) {
-                const int8_t* decoded_up = weight_cache.get_or_decode(ffn_up_w->name,
-                    ffn_up_w->data, ffn_up_w->data_size(), ffn_up_w->type);
-                if (decoded_up) {
-                    MulMatParams up_params;
-                    up_params.A = inp_norm.data();
-                    up_params.B = decoded_up;
-                    up_params.C = ffn_up.data();
-                    up_params.M = n_tokens;
-                    up_params.N = ffn_size;
-                    up_params.K = hidden_size;
-                    up_params.lda = hidden_size;
-                    up_params.ldb = ffn_size;
-                    up_params.ldc = ffn_size;
-                    up_params.n_batches = 1;
-                    up_params.B_type = ffn_up_w->type;
-                    backend->mul_mat_q(up_params);
-                }
-            }
+            mul_mat_weight(inp_norm.data(), ffn_gate_w, ffn_gate.data(),
+                           n_tokens, ffn_size, hidden_size,
+                           hidden_size, ffn_size, ffn_size);
+            mul_mat_weight(inp_norm.data(), ffn_up_w, ffn_up.data(),
+                           n_tokens, ffn_size, hidden_size,
+                           hidden_size, ffn_size, ffn_size);
 
             backend->sync();
 
-            // SwiGLU: gate * silu(up)
-            SiluParams silu_params;
-            silu_params.input = ffn_up.data();
-            silu_params.output = ffn_silu.data();
-            silu_params.size = ffn_size;
-            backend->silu(silu_params);
+            // SwiGLU: gate * silu(up) per token row
+            for (int t = 0; t < n_tokens; t++) {
+                SiluParams silu_params;
+                silu_params.input = ffn_up.data() + t * ffn_size;
+                silu_params.output = ffn_silu.data() + t * ffn_size;
+                silu_params.size = ffn_size;
+                backend->silu(silu_params);
 
-            for (int i = 0; i < ffn_size; i++) {
-                ffn_silu[i] *= ffn_gate[i];
+                for (int i = 0; i < ffn_size; i++) {
+                    ffn_silu[static_cast<size_t>(t) * ffn_size + i] *=
+                        ffn_gate[static_cast<size_t>(t) * ffn_size + i];
+                }
             }
 
             // FFN down projection
             if (ffn_down_w) {
                 std::fill(ffn_down.begin(), ffn_down.end(), 0.0f);
-                const int8_t* decoded_down = weight_cache.get_or_decode(ffn_down_w->name,
-                    ffn_down_w->data, ffn_down_w->data_size(), ffn_down_w->type);
-                if (decoded_down) {
-                    MulMatParams down_params;
-                    down_params.A = ffn_silu.data();
-                    down_params.B = decoded_down;
-                    down_params.C = ffn_down.data();
-                    down_params.M = n_tokens;
-                    down_params.N = hidden_size;
-                    down_params.K = ffn_size;
-                    down_params.lda = ffn_size;
-                    down_params.ldb = hidden_size;
-                    down_params.ldc = hidden_size;
-                    down_params.n_batches = 1;
-                    down_params.B_type = ffn_down_w->type;
-                    backend->mul_mat_q(down_params);
-                    backend->sync();
+                mul_mat_weight(ffn_silu.data(), ffn_down_w, ffn_down.data(),
+                               n_tokens, hidden_size, ffn_size,
+                               ffn_size, hidden_size, hidden_size);
+                backend->sync();
 
-                    // Add residual
+                for (int t = 0; t < n_tokens; t++) {
                     for (int i = 0; i < hidden_size; i++) {
-                        inp_embd[i] += ffn_down[i];
+                        inp_embd[static_cast<size_t>(t) * hidden_size + i] +=
+                            ffn_down[static_cast<size_t>(t) * hidden_size + i];
                     }
                 }
             }
         }
 
         // Final normalization
-        rms_norm(inp_norm.data(), inp_embd.data(), hidden_size, rms_eps);
+        rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps);
 
-        // Logits projection: inp_norm @ tok_embd.T (or output.weight if present)
+        // Logits projection from the last token position
         std::fill(logits.begin(), logits.end(), 0.0f);
         const TensorView* tok_embd_out = find_tensor(model, "output.weight");
         const float* embd_ptr = embd_data;
@@ -880,14 +830,13 @@ int main(int argc, char* argv[]) {
 
         if (logits_ptr && embd_ptr) {
             int vocab_size = static_cast<int>(hparams.vocab_size);
-            for (int t = 0; t < n_tokens; t++) {
-                for (int v = 0; v < vocab_size; v++) {
-                    float sum = 0.0f;
-                    for (int d = 0; d < hidden_size; d++) {
-                        sum += inp_norm[t * hidden_size + d] * logits_ptr[v * hidden_size + d];
-                    }
-                    logits[v] += sum;
+            const float* last_hidden = inp_norm.data() + static_cast<size_t>(n_tokens - 1) * hidden_size;
+            for (int v = 0; v < vocab_size; v++) {
+                float sum = 0.0f;
+                for (int d = 0; d < hidden_size; d++) {
+                    sum += last_hidden[d] * logits_ptr[v * hidden_size + d];
                 }
+                logits[v] = sum;
             }
         }
 

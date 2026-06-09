@@ -152,6 +152,9 @@ TensorRole Model::get_tensor_role(const std::string& name) const {
 
 void Model::set_context_length(uint64_t ctx) {
     hparams_.context_length = ctx;
+    if (loaded_) {
+        init_kv_cache(0);
+    }
 }
 
 Model::Model() {}

@@ -1,13 +1,13 @@
 #include "backend.h"
 #include "tensor.h"
 #include "cache.h"
-#include <xrt.h>
 #include <xrt/xrt_bo.h>
 #include <xrt/xrt_device.h>
 #include <xrt/xrt_uuid.h>
-#include <xrt/xrt_xclbin.h>
 #include <xrt/xrt_kernel.h>
+#include <xrt/experimental/xrt_xclbin.h>
 #include <cstring>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
@@ -16,10 +16,39 @@
 #include <filesystem>
 #include <algorithm>
 #include <mutex>
+#include <functional>
+#include <unordered_map>
 
 namespace ggnpu {
 
 namespace fs = std::filesystem;
+
+namespace {
+
+constexpr xrt::memory_group kDefaultMemGroup = 0;
+
+struct PairHash {
+    size_t operator()(const std::pair<int, int>& p) const noexcept {
+        return std::hash<int>{}(p.first) ^ (std::hash<int>{}(p.second) << 1);
+    }
+};
+
+struct TupleHash {
+    size_t operator()(const std::tuple<int, int, int64_t>& t) const noexcept {
+        size_t h = std::hash<int>{}(std::get<0>(t));
+        h ^= std::hash<int>{}(std::get<1>(t)) << 1;
+        h ^= std::hash<int64_t>{}(std::get<2>(t)) << 2;
+        return h;
+    }
+};
+
+xrt::uuid load_xclbin_from_data(xrt::device& dev, const std::vector<uint8_t>& data) {
+    std::vector<char> copy(data.begin(), data.end());
+    xrt::xclbin xbin(copy);
+    return dev.load_xclbin(xbin);
+}
+
+} // namespace
 
 // Forward declarations from kernels.cpp
 namespace detail {
@@ -40,21 +69,21 @@ class XrtBuffer {
 public:
     XrtBuffer() = default;
     XrtBuffer(xrt::device& dev, size_t size, xrt::bo::flags flags)
-        : bo_(dev, size, flags) {}
+        : bo_(dev, size, flags, kDefaultMemGroup) {}
 
     void* map() {
         if (!is_valid()) return nullptr;
         return bo_.map<void*>();
     }
 
-    void sync(xrt::bo::direction dir) {
+    void sync(xclBOSyncDirection dir) {
         if (!is_valid()) return;
         bo_.sync(dir);
     }
 
     xrt::bo& handle() { return bo_; }
     const xrt::bo& handle() const { return bo_; }
-    bool is_valid() const { return bo_.is_valid(); }
+    bool is_valid() const { return static_cast<bool>(bo_); }
     size_t size() const { return bo_.size(); }
 
 private:
@@ -67,7 +96,7 @@ public:
     explicit BufferMgr(xrt::device& dev) : device_(dev) {}
 
     std::shared_ptr<XrtBuffer> alloc(size_t size, bool host_backed = false) {
-        xrt::bo::flags flags = host_backed ? xrt::bo::flags::host : xrt::bo::flags::default_flags;
+        xrt::bo::flags flags = host_backed ? xrt::bo::flags::host_only : xrt::bo::flags::normal;
         auto buf = std::make_shared<XrtBuffer>(device_, size, flags);
         buffers_.push_back(buf);
         return buf;
@@ -79,12 +108,12 @@ public:
         if (mapped) {
             std::memcpy(mapped, src, count);
         }
-        buf.sync(xrt::bo::direction::HTOD);
+        buf.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     }
 
     void copy_from(XrtBuffer& buf, void* dst, size_t count) {
         if (!buf.is_valid()) return;
-        buf.sync(xrt::bo::direction::DHTO);
+        buf.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
         void* mapped = buf.map();
         if (mapped) {
             std::memcpy(dst, mapped, count);
@@ -554,7 +583,7 @@ private:
                 return false;
             }
 
-            xclbin_uuid_ = device_->load_xclbin(xclbin_data_);
+            xclbin_uuid_ = load_xclbin_from_data(*device_, xclbin_data_);
             std::cout << "Loaded xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_ << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -572,7 +601,7 @@ private:
         }
 
         // Try to create kernel from the base loaded xclbin (works for any shape if kernel is dimension-agnostic)
-        if (!xclbin_uuid_.is_none()) {
+        if (xclbin_uuid_) {
             return create_matmul_kernel_from_loaded_xclbin(M, N, K, B_type, cache_key);
         }
 
@@ -595,10 +624,10 @@ private:
             if (data.empty()) return false;
 
             xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
+            xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
 
-            xrt::ip_handle ip(tmp_device, tmp_uuid);
-            xrt::run run(ip, "matmul");
+            xrt::kernel krnl(tmp_device, tmp_uuid, "matmul");
+            xrt::run run(krnl);
 
             matmul_kernels_[cache_key] = CachedMatmulKernel{run, M, N, K, B_type};
             return true;
@@ -610,8 +639,8 @@ private:
 
     bool create_matmul_kernel_from_loaded_xclbin(int M, int N, int K, GgmlType B_type, const std::string& cache_key) {
         try {
-            xrt::ip_handle ip(*device_, xclbin_uuid_);
-            xrt::run run(ip, "matmul");
+            xrt::kernel krnl(*device_, xclbin_uuid_, "matmul");
+            xrt::run run(krnl);
 
             matmul_kernels_[cache_key] = CachedMatmulKernel{run, M, N, K, B_type};
             return true;
@@ -653,7 +682,7 @@ private:
                 return false;
             }
 
-            xclbin_uuid_rmsnorm_ = device_->load_xclbin(xclbin_data_rmsnorm_);
+            xclbin_uuid_rmsnorm_ = load_xclbin_from_data(*device_, xclbin_data_rmsnorm_);
             std::cout << "Loaded rmsnorm xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -668,7 +697,7 @@ private:
             return load_rmsnorm_kernel_for_shape(cached_path, N, cache_key);
         }
 
-        if (!xclbin_uuid_rmsnorm_.is_none()) {
+        if (xclbin_uuid_rmsnorm_) {
             return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
         }
 
@@ -690,10 +719,10 @@ private:
             if (data.empty()) return false;
 
             xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
+            xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
 
-            xrt::ip_handle ip(tmp_device, tmp_uuid);
-            xrt::run run(ip, "rmsnorm");
+            xrt::kernel krnl(tmp_device, tmp_uuid, "rmsnorm");
+            xrt::run run(krnl);
 
             rmsnorm_kernels_[N] = CachedRmsNormKernel{run, N};
             return true;
@@ -705,8 +734,8 @@ private:
 
     bool create_rmsnorm_kernel_from_loaded_xclbin(int N, const std::string& cache_key) {
         try {
-            xrt::ip_handle ip(*device_, xclbin_uuid_rmsnorm_);
-            xrt::run run(ip, "rmsnorm");
+            xrt::kernel krnl(*device_, xclbin_uuid_rmsnorm_, "rmsnorm");
+            xrt::run run(krnl);
 
             rmsnorm_kernels_[N] = CachedRmsNormKernel{run, N};
             return true;
@@ -748,7 +777,7 @@ private:
                 return false;
             }
 
-            xclbin_uuid_softmax_ = device_->load_xclbin(xclbin_data_softmax_);
+            xclbin_uuid_softmax_ = load_xclbin_from_data(*device_, xclbin_data_softmax_);
             std::cout << "Loaded softmax xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -763,7 +792,7 @@ private:
             return load_softmax_kernel_for_shape(cached_path, rows, cols, cache_key);
         }
 
-        if (!xclbin_uuid_softmax_.is_none()) {
+        if (xclbin_uuid_softmax_) {
             return create_softmax_kernel_from_loaded_xclbin(rows, cols, cache_key);
         }
 
@@ -785,10 +814,10 @@ private:
             if (data.empty()) return false;
 
             xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
+            xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
 
-            xrt::ip_handle ip(tmp_device, tmp_uuid);
-            xrt::run run(ip, "softmax");
+            xrt::kernel krnl(tmp_device, tmp_uuid, "softmax");
+            xrt::run run(krnl);
 
             softmax_kernels_[std::make_pair(rows, cols)] = CachedSoftmaxKernel{run, rows, cols};
             return true;
@@ -800,8 +829,8 @@ private:
 
     bool create_softmax_kernel_from_loaded_xclbin(int rows, int cols, const std::string& cache_key) {
         try {
-            xrt::ip_handle ip(*device_, xclbin_uuid_softmax_);
-            xrt::run run(ip, "softmax");
+            xrt::kernel krnl(*device_, xclbin_uuid_softmax_, "softmax");
+            xrt::run run(krnl);
 
             softmax_kernels_[std::make_pair(rows, cols)] = CachedSoftmaxKernel{run, rows, cols};
             return true;
@@ -843,7 +872,7 @@ private:
                 return false;
             }
 
-            xclbin_uuid_silu_ = device_->load_xclbin(xclbin_data_silu_);
+            xclbin_uuid_silu_ = load_xclbin_from_data(*device_, xclbin_data_silu_);
             std::cout << "Loaded silu xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -858,7 +887,7 @@ private:
             return load_silu_kernel_for_shape(cached_path, size, cache_key);
         }
 
-        if (!xclbin_uuid_silu_.is_none()) {
+        if (xclbin_uuid_silu_) {
             return create_silu_kernel_from_loaded_xclbin(size, cache_key);
         }
 
@@ -880,10 +909,10 @@ private:
             if (data.empty()) return false;
 
             xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
+            xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
 
-            xrt::ip_handle ip(tmp_device, tmp_uuid);
-            xrt::run run(ip, "silu");
+            xrt::kernel krnl(tmp_device, tmp_uuid, "silu");
+            xrt::run run(krnl);
 
             silu_kernels_[size] = CachedSiluKernel{run, size};
             return true;
@@ -895,8 +924,8 @@ private:
 
     bool create_silu_kernel_from_loaded_xclbin(int size, const std::string& cache_key) {
         try {
-            xrt::ip_handle ip(*device_, xclbin_uuid_silu_);
-            xrt::run run(ip, "silu");
+            xrt::kernel krnl(*device_, xclbin_uuid_silu_, "silu");
+            xrt::run run(krnl);
 
             silu_kernels_[size] = CachedSiluKernel{run, size};
             return true;
@@ -938,7 +967,7 @@ private:
                 return false;
             }
 
-            xclbin_uuid_fa_ = device_->load_xclbin(xclbin_data_fa_);
+            xclbin_uuid_fa_ = load_xclbin_from_data(*device_, xclbin_data_fa_);
             std::cout << "Loaded flash_attn xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -953,7 +982,7 @@ private:
             return load_flash_attn_kernel_for_shape(cached_path, n_head, head_dim, ctx_len, cache_key);
         }
 
-        if (!xclbin_uuid_fa_.is_none()) {
+        if (xclbin_uuid_fa_) {
             return create_flash_attn_kernel_from_loaded_xclbin(n_head, head_dim, ctx_len, cache_key);
         }
 
@@ -975,10 +1004,10 @@ private:
             if (data.empty()) return false;
 
             xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = tmp_device.load_xclbin(data);
+            xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
 
-            xrt::ip_handle ip(tmp_device, tmp_uuid);
-            xrt::run run(ip, "flash_attn");
+            xrt::kernel krnl(tmp_device, tmp_uuid, "flash_attn");
+            xrt::run run(krnl);
 
             flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = CachedFlashAttnKernel{run, n_head, head_dim, ctx_len};
             return true;
@@ -990,8 +1019,8 @@ private:
 
     bool create_flash_attn_kernel_from_loaded_xclbin(int n_head, int head_dim, int64_t ctx_len, const std::string& cache_key) {
         try {
-            xrt::ip_handle ip(*device_, xclbin_uuid_fa_);
-            xrt::run run(ip, "flash_attn");
+            xrt::kernel krnl(*device_, xclbin_uuid_fa_, "flash_attn");
+            xrt::run run(krnl);
 
             flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = CachedFlashAttnKernel{run, n_head, head_dim, ctx_len};
             return true;
@@ -1040,9 +1069,9 @@ private:
 
     std::unordered_map<std::string, CachedMatmulKernel> matmul_kernels_;
     std::unordered_map<int, CachedRmsNormKernel> rmsnorm_kernels_;
-    std::unordered_map<std::pair<int, int>, CachedSoftmaxKernel, std::hash<std::pair<int, int>>> softmax_kernels_;
+    std::unordered_map<std::pair<int, int>, CachedSoftmaxKernel, PairHash> softmax_kernels_;
     std::unordered_map<int, CachedSiluKernel> silu_kernels_;
-    std::unordered_map<std::tuple<int, int, int64_t>, CachedFlashAttnKernel, std::hash<std::tuple<int, int, int64_t>>> flash_attn_kernels_;
+    std::unordered_map<std::tuple<int, int, int64_t>, CachedFlashAttnKernel, TupleHash> flash_attn_kernels_;
 
     int npu_profile_ = 6;
     std::string profile_str_ = "npu6";

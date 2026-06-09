@@ -27,3 +27,7 @@ Thumbs.db
 # Cache
 .cache/
 Testing/
+
+# Local dev package extracts (when system packages need sudo)
+third_party/xrt-dev/
+third_party/uuid-dev/

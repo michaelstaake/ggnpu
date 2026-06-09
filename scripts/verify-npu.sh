@@ -31,7 +31,7 @@ check "PCI ID 1022:17f0" "lspci -d 1022:17f0 | grep -q ."
 echo ""
 echo "Kernel:"
 check "amdxdna module" "lsmod | grep -q amdxdna"
-check "IOMMU enabled" "dmesg | grep -q 'amd_iommu=on'"
+check "IOMMU enabled" "grep -q amd_iommu=on /proc/cmdline 2>/dev/null || dmesg 2>/dev/null | grep -q 'amd_iommu=on'"
 check "accel0 device" "test -e /dev/accel/accel0"
 
 # Groups
@@ -52,8 +52,20 @@ check "NPU firmware" "test -d /usr/lib/firmware/amdnpu"
 # XRT
 echo ""
 echo "XRT:"
-check "XRT library" "ls /opt/xilinx/xrt/lib/libxrt_coreutil.so 2>/dev/null || ls /usr/lib/x86_64-linux-gnu/libxrt_coreutil.so 2>/dev/null"
-check "XRT include" "ls /opt/xilinx/include/xrt.h 2>/dev/null || ls /usr/include/xrt.h 2>/dev/null"
+check "XRT runtime (libxrt_coreutil)" "ldconfig -p 2>/dev/null | grep -q libxrt_coreutil"
+check "XRT NPU plugin (libxrt_driver_xdna)" "ldconfig -p 2>/dev/null | grep -q libxrt_driver_xdna"
+check "XRT headers (libxrt-dev)" "test -f /usr/include/xrt/xrt_bo.h -o -f /opt/xilinx/xrt/include/xrt/xrt_bo.h -o -f third_party/xrt-dev/usr/include/xrt/xrt_bo.h"
+
+# Kernel artifacts
+echo ""
+echo "Kernels:"
+if ls "$HOME/.cache/ggnpu/xclbin/"*.xclbin >/dev/null 2>&1; then
+    echo "  [PASS] xclbin cache present"
+    PASS=$((PASS + 1))
+else
+    echo "  [FAIL] xclbin cache empty (~/.cache/ggnpu/xclbin/)"
+    FAIL=$((FAIL + 1))
+fi
 
 echo ""
 echo "=== Results ==="
