@@ -248,6 +248,8 @@ public:
             return last_status_;
         }
 
+        buf_mgr_->copy_from(*buf_c_, params.C, size_c);
+
         return Status::OK;
     }
 

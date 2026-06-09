@@ -35,7 +35,7 @@ bool Model::load(const std::string& path) {
     if (!parse_hparams()) return false;
     if (!build_tensor_map()) return false;
     if (!prepare_tensors()) return false;
-    if (!init_kv_cache()) return false;
+    if (!init_kv_cache(0)) return false;
 
     loaded_ = true;
     return true;
@@ -124,8 +124,9 @@ void Model::set_backend(std::shared_ptr<Backend> backend) {
     backend_ = backend;
 }
 
-bool Model::init_kv_cache() {
+bool Model::init_kv_cache(int64_t ctx_override) {
     uint64_t ctx = hparams_.context_length;
+    if (ctx_override > 0) ctx = static_cast<uint64_t>(ctx_override);
     if (ctx == 0) ctx = 2048;
 
     uint64_t head_dim = hparams_.rope_dimension_count;
@@ -147,6 +148,10 @@ TensorRole Model::get_tensor_role(const std::string& name) const {
     auto it = tensor_roles_.find(name);
     if (it != tensor_roles_.end()) return it->second;
     return TensorRole::UNKNOWN;
+}
+
+void Model::set_context_length(uint64_t ctx) {
+    hparams_.context_length = ctx;
 }
 
 Model::Model() {}

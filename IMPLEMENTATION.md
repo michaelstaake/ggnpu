@@ -4,7 +4,9 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state:** Phases 0–3 partially implemented. GGUF parser, quantization decoders, CPU reference backend, compute graph, KV cache, tokenizer, CLI, and XRT NPU backend skeleton exist. Full inference loop works on CPU ref; NPU ops need kernel integration. See `git log` for commit history.
+**Current state (2025-06-09):** **Not ready to run a model on the NPU.** Phase 1 is complete (GGUF load/dump). Phases 0 and 3 are partial. Phases 2, 4–6 are not started on hardware. Hardware and driver foundations exist on the dev laptop (Krackan NPU, `amdxdna`, `/dev/accel/accel0`), but XRT is not installed, the default build disables the NPU backend, no `.xclbin` kernels are cached, and several code bugs block inference even on CPU ref. See **§7.1 Readiness snapshot** and `git log`.
+
+**Verdict:** Solid Phase 1 foundation; Phase 2+ work required before any model runs on the NPU.
 
 ---
 
@@ -150,7 +152,7 @@ NPU kernels (.xclbin):
 
 **Why XRT not raw ioctls:** Raw `DRM_IOCTL_AMDXDNA_*` requires reimplementing BO lifecycle, PASID/IOMMU SVA, ERT mailbox, firmware coupling. XRT is the official shim (like libdrm for GPU).
 
-**Docker:** Ship prebuilt `.xclbin` in the image. mlir-aie/Peano stay in a **builder** image, not the runtime image.
+**Docker:** Ship prebuilt `.xclbin` in the image. mlir-aie/Peano stay in a **builder** image, not the runtime image. (`docs/docker.md` references `Dockerfile.builder`; not in repo yet — Phase 6.)
 
 ---
 
@@ -203,7 +205,7 @@ Map tensor names → roles (`attn_q`, `ffn_gate`, etc.). Handle GQA. Respect `ll
 | Phase | `ggml_type` values |
 |-------|-------------------|
 | P0 | `F32`, `F16`, `Q8_0`, `Q4_0` |
-| P1 | `Q4_K`, `Q6_K` (required for `Q4_K_M` — mixed per-tensor types) |
+| P1 | `Q4_K`, `Q6_K` (required for `Q4_K_M` — mixed per-tensor types) — **decoders implemented** |
 | P2 | `IQ4_NL`, others |
 
 **NPU weight path:** GGUF weights stay mmap'd. On first use per tensor:
@@ -222,6 +224,7 @@ Ops: `MUL_MAT_Q`, `RMS_NORM`, `ROPE`, `SOFTMAX`, `ADD`, `MUL`, `SILU`, `FLASH_AT
 - **Prefill graph:** `n_tokens > 1`
 - **Decode graph:** `n_tokens == 1`, KV index = current position
 - **KV cache:** `[n_layer][n_ctx][n_head_kv][head_dim]`, pre-allocated
+- **Known gap:** `init_kv_cache()` currently uses GGUF `context_length`, not CLI `-c`. Must cap at `-c` (MVP: 2048) to avoid multi-GB allocation on models with 128k metadata ctx — see §7.1.
 
 ### Layer 5 — Backend interface (`include/ggnpu/backend.h`)
 
@@ -253,7 +256,9 @@ The NPU backend consists of two code paths that must never mix:
 1. `xrt::device` on `/dev/accel/accel0`
 2. Detect `npu6` (Krackan) → `aie2p` kernel profile
 3. HW context; unlimited memlock; `xrt::bo` for weights/activations
-4. Load `.xclbin` from `~/.cache/ggnpu/xclbin/` or JIT-compile
+4. Load `.xclbin` from `~/.cache/ggnpu/xclbin/` or JIT-compile (cache empty on dev machine as of 2025-06-09)
+
+**Known gap:** `mul_mat_q()` must `copy_from` output buffer after kernel run (other ops already do). Without this, NPU matmul results are never read back to host.
 
 **Kernel compile cache key:** `(op, M, N, K, dtype, npu_profile)`
 
@@ -336,58 +341,76 @@ ggnpu/
 
 Work through these in order. Do not skip ahead.
 
+### Phase status summary
+
+| Phase | Goal | Status |
+|-------|------|--------|
+| 0 Scaffold | CMake, scripts, docs | Mostly done (no CI; host setup incomplete on dev machine) |
+| 1 GGUF loader | Parse, mmap, dump | **Done** |
+| 2 NPU matmul smoke | `bench-matmul` on hardware | **Not done** — needs XRT, xclbins, matmul D→H fix |
+| 3 Q4_K weight path | Decode + one E2E matmul | Decoders + disk cache done; NPU E2E not validated |
+| 4 Full decoder layer | All ops on NPU | **Not done** |
+| 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — known code bugs (see §7.1) |
+| 6 Production | Docker, 3B, L2 tiling | **Not done** |
+| 7 Intel stub | Interface research | **Not started** |
+
 ### Phase 0 — Scaffold
 
-- [ ] CMake project, C++20, CI (compile on x86; NPU tests `MANUAL`)
-- [ ] `scripts/setup-host.sh` — XRT PPA, memlock limits, `render` group
-- [ ] `scripts/verify-npu.sh` — `lspci`, `lsmod amdxdna`, `/dev/accel/accel0`, `xrt-smi examine`
-- [ ] `docs/architecture.md`, `docs/amd-krackan.md`
+- [x] CMake project, C++20
+- [ ] CI (compile on x86; NPU tests `MANUAL`)
+- [x] `scripts/setup-host.sh` — XRT PPA, memlock limits, `render` group
+- [x] `scripts/verify-npu.sh` — `lspci`, `lsmod amdxdna`, `/dev/accel/accel0`, `xrt-smi examine` (run with `bash scripts/verify-npu.sh`; chmod +x optional)
+- [x] `docs/architecture.md`, `docs/amd-krackan.md`
+- [ ] Binary links against XRT on dev machine (blocked: XRT not installed)
 
-**Done when:** binary links against XRT; `verify-npu.sh` documents host prerequisites.
+**Done when:** binary links against XRT; `verify-npu.sh` passes on target host.
 
 ### Phase 1 — GGUF loader
 
-- [ ] Parser, mmap, metadata API
-- [ ] Quant layouts: F16, Q8_0, Q4_0
-- [ ] Llama hparams + tensor name map
-- [ ] Unit tests on real GGUF files
+- [x] Parser, mmap, metadata API
+- [x] Quant layouts: F16, Q8_0, Q4_0
+- [x] Llama hparams + tensor name map
+- [x] Unit tests on real GGUF files
 
-**Done when:** `ggnpu -m model.gguf --dump-tensors` prints correct inventory.
+**Done when:** `ggnpu -m model.gguf --dump-tensors` prints correct inventory. **Gate passed** on `models/llama-3.2-1b-q4_k_m.gguf`.
 
 ### Phase 2 — NPU matmul smoke
 
 - [ ] XRT device init on Krackan
 - [ ] Build INT8 matmul xclbin (e.g. 1×3072 × 3072×3072)
-- [ ] Compile cache
+- [ ] Compile cache (`~/.cache/ggnpu/xclbin/` — currently empty)
+- [ ] Fix `mul_mat_q` device→host copy in `src/backends/amd_xdna/amd_xdna.cpp`
 
 **Done when:** `ggnpu bench-matmul` runs on NPU with measurable throughput.
 
 ### Phase 3 — Q4_K weight path
 
-- [ ] Q4_K + Q6_K block decoders
-- [ ] Transparent INT8 NPU weight cache
-- [ ] One `ffn_gate` matmul end-to-end from GGUF
+- [x] Q4_K + Q6_K block decoders
+- [x] Transparent INT8 NPU weight cache (disk under `~/.cache/ggnpu/weights/`)
+- [ ] One `ffn_gate` matmul end-to-end from GGUF on NPU
 
 **Done when:** output within tolerance vs CPU reference dequant matmul.
 
 ### Phase 4 — Full decoder layer
 
 - [ ] All matmuls in one layer on NPU
-- [ ] RMSNorm, RoPE, attention (decomposed), SiLU on NPU
+- [ ] RMSNorm, RoPE, attention (decomposed), SiLU on NPU (RoPE currently CPU fallback in NPU backend)
 - [ ] KV cache write
 
 **Done when:** one-layer forward matches CPU reference.
 
 ### Phase 5 — Inference MVP
 
-- [ ] Prefill + decode loops
-- [ ] Tokenizer + greedy sampling
+- [ ] Prefill + decode loops (prefill not wired; decode loop has seed bug — see §7.1)
+- [x] Tokenizer + greedy sampling (implemented; blocked by loop bug)
 - [ ] Target: Llama 3.2 1B Q4_K_M, ctx 2048
+- [ ] Fix KV cache to respect `-c` (currently allocates full GGUF `context_length`)
+- [ ] Dequant `token_embd.weight` for Q4_K models (currently casts via `get_float_ptr()`)
 
 **Done when:**
 
 ```bash
-ggnpu -m llama-3.2-1b-Q4_K_M.gguf -p "The capital of France is"
+ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048
 ```
 
 produces coherent text with all math on NPU.
@@ -395,7 +418,8 @@ produces coherent text with all math on NPU.
 ### Phase 6 — Production
 
 - [ ] Llama 3.2 3B; L2-aware tiling
-- [ ] Docker image + compose
+- [ ] Docker image + compose (runtime `Dockerfile` exists; `Dockerfile.builder` referenced in docs but missing)
+- [ ] Ship prebuilt xclbins in image (none in repo yet)
 - [ ] Clear errors: missing firmware, IOMMU off, memlock
 - [ ] `docs/usage.md`, README quick start, `ggnpu --help` in sync
 
@@ -405,6 +429,102 @@ produces coherent text with all math on NPU.
 
 - [ ] `IntelNpuBackend` interface stub in `docs/intel-roadmap.md`
 - [ ] Panther Lake / Linux 7.0 NPU path research
+
+### 7.1 Readiness snapshot (dev laptop, 2025-06-09)
+
+Assessment of whether the project can run a model on the NPU **today**.
+
+#### Ready (hardware + Phase 1)
+
+| Layer | Status | Notes |
+|-------|--------|-------|
+| NPU hardware | Present | PCI `1022:17f0` (Strix/Krackan) |
+| Kernel driver | Loaded | `amdxdna` module |
+| Device node | Exists | `/dev/accel/accel0` (group `render`) |
+| Firmware | Present | `/usr/lib/firmware/amdnpu` |
+| Host OS | Matches target | Linux 7.0 |
+| ggnpu binary | Builds | Default: `GGNPU_NPU_BACKEND=OFF`, `GGNPU_TEST_CPU=ON` |
+| GGUF loading | Works | `--dump-tensors` on Llama 3.2 1B succeeds |
+| Test models | On disk | See §17 |
+
+#### Blocked (host + build + kernels)
+
+| Check | Dev machine | Required |
+|-------|-------------|----------|
+| XRT (`libxrt2`, `libxrt-npu2`) | **Not installed** | Every NPU op |
+| `render` group | **Missing** | Open `/dev/accel/accel0` |
+| `ulimit -l` (memlock) | **8192** (8 MB) | Must be `unlimited` for pinned DMA |
+| mlir-aie (`aiecc.py`) | **Not installed** | Compile `.xclbin` kernels |
+| NPU backend in build | **OFF** | `-DGGNPU_NPU_BACKEND=ON` |
+| `.xclbin` cache | **Empty** | `~/.cache/ggnpu/xclbin/` |
+
+Host setup commands: §9 and `docs/amd-krackan.md`. Production build:
+
+```bash
+cmake .. -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF
+make -j2
+```
+
+Do **not** rely on `GGNPU_TEST_CPU=ON` in production — it allows silent CPU fallback, which violates §2 production rule.
+
+#### Known code bugs (fix before Phase 5)
+
+| Bug | File | Impact |
+|-----|------|--------|
+| Generation loop never starts | `src/cli/main.cpp` | `input_tokens` is built from the prompt but `current_tokens` starts empty and is never seeded; loop exits at `if (n_tokens == 0) break` |
+| Matmul D→H copy missing | `src/backends/amd_xdna/amd_xdna.cpp` | `mul_mat_q()` runs kernel but never `copy_from` output buffer (unlike `rms_norm`, `softmax`, `silu`, `flash_attn`) |
+| KV cache ignores `-c` | `src/arch/llama/llama.cpp` | `init_kv_cache()` uses GGUF `context_length`; Llama 3.2 1B reports **131072** → ~8.6 GB KV RAM alone |
+| Embeddings assume F32 | `src/cli/main.cpp` | `get_float_ptr()` casts quantized `token_embd.weight` without dequant |
+| RoPE on CPU | `src/backends/amd_xdna/amd_xdna.cpp` | Explicit CPU fallback; OK for early MVP, not “all math on NPU” |
+| `execute_layer_graph()` unused | `src/cli/main.cpp` | Dead code; main calls backend directly |
+
+**KV RAM formula:** `2 × n_layers × n_ctx × n_head_kv × head_dim × 4` bytes.
+
+For Llama 3.2 1B at metadata ctx 131072: `2 × 16 × 131072 × 8 × 64 × 4 ≈ 8.6 GB`. At MVP ctx 2048: **~128 MB**.
+
+#### What works today (no NPU)
+
+```bash
+./build/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf --dump-tensors
+cd build && ctest
+```
+
+#### What does not work today
+
+```bash
+./build/ggnpu bench-matmul                    # needs XRT + NPU build + xclbins
+./build/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048   # loop bug + KV OOM risk
+```
+
+#### Minimum path to first NPU activity
+
+1. Host: install XRT, `sudo usermod -aG render $USER`, set memlock unlimited, re-login
+2. Rebuild: `-DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF`
+3. Obtain xclbins via `scripts/build-kernels.sh` (needs mlir-aie + Peano) or prebuilt artifacts — **avoid compiling mlir-aie on 16 GB RAM** (see §7.2)
+4. Fix `mul_mat_q` `copy_from` in `amd_xdna.cpp`
+5. Run `ggnpu bench-matmul` before full inference
+6. Fix `current_tokens` seeding + KV `-c` sizing + embedding dequant for Phase 5
+
+### 7.2 Memory constraints (16 GB RAM dev machine)
+
+Dev laptop has ~14 GiB RAM + 4 GiB swap. Cursor IDE can consume several GB; combined with an oversized KV cache this is the highest OOM risk.
+
+| Activity | RAM impact | Recommendation |
+|----------|------------|----------------|
+| Build ggnpu (no kernels) | Low (~2–4 GB with `-j`) | Fine; use `make -j2` if tight |
+| Build mlir-aie / xclbins | **Very high** (16–32 GB typical) | **Avoid on laptop**; use prebuilt xclbins or build on another machine |
+| Load Llama 1B Q4_K_M (mmap) | ~770 MB virtual | Fine |
+| KV at **131k ctx** (current code) | **~8.6 GB** | **Will OOM** with IDE open |
+| KV at **2048 ctx** (after fix) | **~128 MB** | Comfortable |
+| Weight decode disk cache | ~1–2 GB first run | Disk, not RAM |
+| NPU pinned buffers | Tens–hundreds of MB | Requires memlock unlimited |
+
+**RAM hygiene before inference:**
+
+- Run `ggnpu` from a plain terminal outside the IDE when memory is tight
+- Do not run `GGNPU_BUILD_KERNELS=ON` or mlir-aie builds on 16 GB RAM
+- Start with `models/llama-3.2-1b-q4_k_m.gguf` only; avoid 3B+ until KV is fixed
+- Set `ulimit -l unlimited` in the shell session
 
 ---
 
@@ -458,11 +578,13 @@ ggnpu -m model.gguf --dump-tensors
 
 ## 9. Host setup
 
+**Dev laptop status (2025-06-09):** NPU hardware, `amdxdna`, `/dev/accel/accel0`, and firmware are present. **Still needed:** XRT packages, `render` group, memlock unlimited. See §7.1.
+
 ```bash
 # Verify hardware
 lspci -vd 1022:17f0
 lsmod | grep amdxdna
-ls -la /dev/accel/
+ls -la /dev/accel/accel0
 
 # Install XRT (Ubuntu)
 sudo add-apt-repository ppa:amd-team/xrt
@@ -472,13 +594,14 @@ sudo apt install libxrt2 libxrt-npu2 amdxdna-dkms
 echo '* soft memlock unlimited' | sudo tee /etc/security/limits.d/99-amdxdna.conf
 echo '* hard memlock unlimited' | sudo tee -a /etc/security/limits.d/99-amdxdna.conf
 
-# User group
+# User group (required to open accel0)
 sudo usermod -aG render $USER
+# Log out and back in after group change
 
-# Verify
-source /opt/xilinx/xrt/setup.sh
+# Verify (re-login first)
+source /opt/xilinx/xrt/setup.sh   # if installed under /opt/xilinx/xrt
 xrt-smi examine
-./scripts/verify-npu.sh
+bash scripts/verify-npu.sh
 ```
 
 **BIOS:** Enable NPU/IPU (Advanced → CPU Configuration → IPU).  
@@ -536,11 +659,15 @@ Do not promise CUDA-class speed in v1.
 
 | Risk | Mitigation |
 |------|------------|
-| Q4_K mixed tensor types | Implement Q4_K + Q6_K in Phase 3 |
+| Q4_K mixed tensor types | Q4_K + Q6_K decoders done; embedding dequant still needed in CLI |
 | First-run JIT latency | Prebuilt xclbins + persistent cache |
 | XRT/driver/firmware skew | Pin versions; `verify-npu.sh` checks |
 | 4 MB L2 limit | Tile matmuls; stream from DDR |
 | mlir-aie complexity | Start from upstream matmul example + [IRON tutorial PDF](https://www.amd.com/content/dam/amd/en/documents/products/processors/ryzen/ai/iron-for-ryzen-ai-tutorial-ipdps-2025.pdf) |
+| mlir-aie / xclbin build OOM | Do not build on 16 GB RAM; ship prebuilt xclbins or use remote builder |
+| KV cache over-allocation | `init_kv_cache()` uses full GGUF `context_length`; must respect `-c` before inference on 16 GB hosts |
+| GGUF models with 128k+ ctx metadata | Cap KV at CLI `-c` or sensible MVP default (2048) regardless of metadata |
+| IDE memory pressure (Cursor) | Run heavy builds and inference outside IDE; use `make -j2` |
 
 ---
 
@@ -585,14 +712,22 @@ On **Ubuntu 26.04** + **Ryzen AI 7 350**, natively or in Docker:
 
 ### AIE kernel rules (enforce on all code generation)
 
-When generating NPU kernel code (`kernels/amd/`), **always** apply the four guardrails from Section 2b:
+When generating NPU kernel code (`kernels/amd/`), **always** apply the four guardrails from Section 2:
 
 - **Memory-first:** Block-based DMA, no un-chunked reads, overlap compute with streaming.
 - **Vector intrinsics only:** No scalar `+`/`*` in kernels. Use AIE vector ops. Types: INT8, BF16, FP8.
 - **No branches:** Zero `if/else`/`switch`/`while` in hot loops. Predication or lookup tables only.
 - **Two layers:** Control code (IRON API, DMA setup) never contains tensor math. Kernel code (Peano ELF) never handles DMA or launch.
 
-**Start here:** Phase 0 — scaffold CMake, `scripts/verify-npu.sh`, and `docs/amd-krackan.md`.
+**Start here (2025-06-09):** Phase 1 gate is passed. Next work, in order:
+
+1. **Host setup (Phase 0 finish):** Install XRT, add user to `render`, set memlock unlimited — see §9. Run `bash scripts/verify-npu.sh` until all checks pass.
+2. **Code fixes for Phase 2/5:** `mul_mat_q` `copy_from` in `amd_xdna.cpp`; seed `current_tokens` from `input_tokens` in `main.cpp`; make `init_kv_cache()` respect `-c`.
+3. **Phase 2 smoke:** Rebuild with `-DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF`; obtain xclbins (not on 16 GB RAM if possible); run `bench-matmul`.
+4. **Phase 3 E2E:** One `ffn_gate` matmul from GGUF on NPU vs CPU ref.
+5. **Phases 4–5:** Full layer + inference MVP on `models/llama-3.2-1b-q4_k_m.gguf` at `-c 2048`.
+
+See §7.1 for full blocker list and §7.2 for RAM constraints.
 
 ---
 
@@ -607,9 +742,22 @@ Put GGUF files in `models/` for development and E2E tests. This directory is **n
 models/
 ```
 
-Example test paths used in docs and scripts:
+### Models on dev machine (2025-06-09)
+
+| File | Approx. size | Notes |
+|------|--------------|-------|
+| `models/llama-3.2-1b-q4_k_m.gguf` | ~770 MB | **MVP target**; ctx metadata 131072 — use `-c 2048` after KV fix |
+| `models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf` | ~1.1 GB | P1 arch; use after Llama 1B works |
+| `models/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf` | ~2.6 GB | Larger; avoid on 16 GB RAM until KV fixed |
+
+Llama 3.2 1B metadata (verified via `--dump-tensors`): 16 layers, 2048 hidden, 32 attn / 8 KV heads, 64 rope dim, `Q4_K_M` (file_type 15).
+
+Example commands:
 
 ```bash
-ggnpu -m models/llama-3.2-1b-Q4_K_M.gguf -p "Hello" -n 32
-ggnpu -m models/llama-3.2-1b-Q4_K_M.gguf --dump-tensors
+# Inspect (works today)
+ggnpu -m models/llama-3.2-1b-q4_k_m.gguf --dump-tensors
+
+# MVP target (after Phase 5 fixes)
+ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048 -n 64
 ```

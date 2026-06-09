@@ -621,6 +621,10 @@ int main(int argc, char* argv[]) {
     WeightCache weight_cache(compile_cache);
     std::cout << "Weight cache initialized\n";
 
+    if (params.ctx_size > 0) {
+        model.set_context_length(static_cast<uint64_t>(params.ctx_size));
+    }
+
     // Setup working buffers
     int hidden_size = static_cast<int>(hparams.embedding_length);
     int ffn_size = static_cast<int>(hparams.feed_forward_length);
@@ -664,7 +668,7 @@ int main(int argc, char* argv[]) {
 
     int64_t pos = 0;
     int generated = 0;
-    std::vector<int> current_tokens;
+    std::vector<int> current_tokens = input_tokens;
 
     auto apply_rope = [&](float* out, const float* inp, int n_heads, int64_t offset,
                           int n_dims, const std::vector<float>& freqs) {
@@ -692,6 +696,33 @@ int main(int argc, char* argv[]) {
         backend->rms_norm(rms_params);
     };
 
+    // Dequantize token embeddings once before the generation loop
+    const TensorView* tok_embd = find_tensor(model, "token_embd.weight");
+    std::vector<float> tok_embd_f32;
+    const float* embd_data = nullptr;
+    if (tok_embd) {
+        if (tok_embd->type == GgmlType::F32) {
+            embd_data = get_float_ptr(tok_embd);
+        } else {
+            const int8_t* decoded = weight_cache.get_or_decode(tok_embd->name,
+                tok_embd->data, tok_embd->data_size(), tok_embd->type);
+            if (decoded) {
+                int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
+                int64_t vocab_size = static_cast<int64_t>(hparams.vocab_size);
+                tok_embd_f32.resize(static_cast<size_t>(vocab_size * embd_dim));
+                for (int64_t i = 0; i < vocab_size; i++) {
+                    for (int64_t d = 0; d < embd_dim; d++) {
+                        tok_embd_f32[static_cast<size_t>(i * embd_dim + d)] =
+                            static_cast<float>(decoded[i * embd_dim + d]);
+                    }
+                }
+                embd_data = tok_embd_f32.data();
+                std::cout << "  Dequantized token_embd.weight ("
+                    << ggml_type_name(tok_embd->type) << " -> F32)\n";
+            }
+        }
+    }
+
     // Main generation loop
     std::cout << "Generating: ";
 
@@ -701,13 +732,10 @@ int main(int argc, char* argv[]) {
         if (n_tokens == 0) break;
 
         // Embedding lookup - get embeddings for each token
-        const TensorView* tok_embd = find_tensor(model, "token_embd.weight");
-        if (!tok_embd) {
-            std::cerr << "Error: token_embd.weight not found\n";
+        if (!embd_data) {
+            std::cerr << "Error: token_embd.weight not available\n";
             break;
         }
-
-        const float* embd_data = get_float_ptr(tok_embd);
         int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
 
         std::fill(inp_embd.begin(), inp_embd.end(), 0.0f);
@@ -964,8 +992,7 @@ int main(int argc, char* argv[]) {
         // Logits projection: inp_norm @ tok_embd.T (or output.weight if present)
         std::fill(logits.begin(), logits.end(), 0.0f);
         const TensorView* tok_embd_out = find_tensor(model, "output.weight");
-        const TensorView* tok_embd_in = find_tensor(model, "token_embd.weight");
-        const float* embd_ptr = tok_embd_in ? get_float_ptr(tok_embd_in) : nullptr;
+        const float* embd_ptr = embd_data;
         const float* logits_ptr = tok_embd_out ? get_float_ptr(tok_embd_out) : embd_ptr;
 
         if (logits_ptr && embd_ptr) {
