@@ -22,7 +22,7 @@ RUN chmod +x /tmp/install-xrt-runtime.sh && /tmp/install-xrt-runtime.sh
 COPY docker/install-mlir-aie.sh /tmp/install-mlir-aie.sh
 RUN chmod +x /tmp/install-mlir-aie.sh && /tmp/install-mlir-aie.sh
 
-ENV AIE_HOME=/opt/mlir-aie/build/install
+ENV AIE_HOME=/opt/mlir-aie/install
 ENV PATH="${AIE_HOME}/bin:/opt/ironenv/bin:${PATH}"
 
 # Build tools for ggnpu

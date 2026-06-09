@@ -16,6 +16,7 @@ apt-get install -y --no-install-recommends \
     cmake \
     ninja-build \
     python3 \
+    python3-dev \
     python3-pip \
     python3-venv \
     curl \
@@ -36,12 +37,12 @@ python3 -m pip install -r "$MLIR_AIE_SRC/python/requirements.txt"
 cd "$MLIR_AIE_SRC"
 bash ./utils/build-mlir-aie-from-wheels.sh
 
-# shellcheck disable=SC1091
-source utils/env_setup.sh install
-
-# env_setup sets mlir-aie install; discover prefix containing bin/aiecc
+# Upstream wheel build installs to mlir-aie/install (sibling of build/), not build/install.
+# Do not source utils/env_setup.sh here: it requires xrt-smi/NPU hardware and fails under set -u
+# when PYTHONPATH is unset.
 AIE_HOME=""
 for candidate in \
+    "$MLIR_AIE_SRC/install" \
     "$MLIR_AIE_SRC/build/install" \
     "$MLIR_AIE_SRC/my_install/mlir_aie" \
     "$MLIR_AIE_INSTALL"; do
