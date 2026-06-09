@@ -7,6 +7,8 @@
 #include <random>
 #include <algorithm>
 #include <filesystem>
+#include <numeric>
+#include <sstream>
 
 #include "gguf.h"
 #include "tensor.h"
@@ -14,6 +16,8 @@
 #include "backend.h"
 #include "graph.h"
 #include "cache.h"
+#include "kv_cache.h"
+#include "tokenizer.h"
 
 namespace ggnpu {
 
@@ -117,54 +121,8 @@ CliParams parse_args(int argc, char* argv[]) {
     return params;
 }
 
-// Simple tokenizer (byte-pair encoding stub)
-// Full implementation would parse tokenizer.ggml.model or tokenizer.json
-
-struct SimpleTokenizer {
-    std::vector<int> encode(const std::string& text) {
-        // Simplified: character-level tokenization
-        // Production would use actual tokenizer from GGUF
-        std::vector<int> tokens;
-        std::string current;
-
-        for (char c : text) {
-            if (c == ' ') {
-                if (!current.empty()) {
-                    // Simple hash-based token ID
-                    tokens.push_back(hash_string(current));
-                    current.clear();
-                }
-            } else {
-                current += c;
-            }
-        }
-        if (!current.empty()) {
-            tokens.push_back(hash_string(current));
-        }
-
-        return tokens;
-    }
-
-    std::string decode(int token_id) {
-        // Simplified: reverse of encode
-        // Production would use actual tokenizer
-        return "token_" + std::to_string(token_id);
-    }
-
-private:
-    int hash_string(const std::string& s) {
-        int hash = 5381;
-        for (char c : s) {
-            hash = ((hash << 5) + hash) + c;
-        }
-        return std::abs(hash) % 50000;
-    }
-};
-
-// Simple sampler
 int sample_token(const std::vector<float>& logits, float temp, uint64_t& seed) {
     if (temp <= 0.0f) {
-        // Greedy sampling
         int best = 0;
         float best_val = -INFINITY;
         for (int i = 0; i < static_cast<int>(logits.size()); i++) {
@@ -176,17 +134,16 @@ int sample_token(const std::vector<float>& logits, float temp, uint64_t& seed) {
         return best;
     }
 
-    // Temperature sampling
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
 
-    // Apply temperature
     float max_logit = -INFINITY;
     for (float v : logits) {
         if (v > max_logit) max_logit = v;
     }
 
     std::vector<float> probs;
+    probs.reserve(logits.size());
     float sum_exp = 0.0f;
     for (float v : logits) {
         float exp_val = std::exp((v - max_logit) / temp);
@@ -199,8 +156,35 @@ int sample_token(const std::vector<float>& logits, float temp, uint64_t& seed) {
     }
 
     std::discrete_distribution<int> dist2(probs.begin(), probs.end());
-    seed = rng(); // advance seed
+    seed = rng();
     return dist2(rng);
+}
+
+// Helper: find tensor by name in model
+const TensorView* find_tensor(const Model& model, const std::string& name) {
+    auto it = model.tensor_map().find(name);
+    if (it == model.tensor_map().end()) return nullptr;
+    return &model.tensors()[it->second];
+}
+
+// Helper: find tensor by pattern (e.g., "blk.{layer}.ffn_gate.weight")
+const TensorView* find_tensor_pattern(const Model& model, const std::string& pattern, int layer) {
+    std::string expanded = pattern;
+    size_t pos = expanded.find("{layer}");
+    if (pos != std::string::npos) {
+        expanded.replace(pos, 7, std::to_string(layer));
+    }
+    return find_tensor(model, expanded);
+}
+
+// Helper: get raw pointer from TensorView
+inline const float* get_float_ptr(const TensorView* tv) {
+    if (!tv || !tv->data) return nullptr;
+    return reinterpret_cast<const float*>(tv->data);
+}
+
+inline float* get_float_ptr_mut(std::vector<float>& buf) {
+    return buf.data();
 }
 
 } // namespace
@@ -212,7 +196,6 @@ int main(int argc, char* argv[]) {
 
     CliParams params = parse_args(argc, argv);
 
-    // Version
     if (params.show_version) {
         std::cout << "ggnpu version " << VERSION << "\n";
 #ifdef GGNPU_HAS_NPU_BACKEND
@@ -226,13 +209,11 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Help
     if (argc == 1) {
         print_help();
         return 0;
     }
 
-    // Dump tensors
     if (params.dump_tensors) {
         if (params.model_path.empty()) {
             std::cerr << "Error: --model is required for --dump-tensors\n";
@@ -309,12 +290,10 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Bench matmul
     if (params.bench_matmul) {
         std::cout << "GGNPU Matmul Benchmark\n";
         std::cout << "======================\n\n";
 
-        // Select backend
         std::shared_ptr<Backend> backend;
 #ifdef GGNPU_HAS_NPU_BACKEND
         backend = create_amd_xdna_backend(params.npu_device);
@@ -328,7 +307,6 @@ int main(int argc, char* argv[]) {
 
         std::cout << "Backend: " << backend->name() << "\n\n";
 
-        // Test various matrix sizes
         std::vector<std::tuple<int, int, int>> sizes = {
             {256, 256, 256},
             {512, 512, 512},
@@ -340,7 +318,6 @@ int main(int argc, char* argv[]) {
         };
 
         for (auto [M, N, K] : sizes) {
-            // Allocate buffers
             std::vector<float> A(M * K, 1.0f);
             std::vector<float> B(K * N, 1.0f);
             std::vector<float> C(M * N, 0.0f);
@@ -356,12 +333,11 @@ int main(int argc, char* argv[]) {
             p.ldb = N;
             p.ldc = N;
             p.n_batches = 1;
+            p.B_type = GgmlType::F32;
 
-            // Warmup
             backend->mul_mat_q(p);
             backend->sync();
 
-            // Benchmark
             auto start = std::chrono::high_resolution_clock::now();
             int iterations = 10;
             for (int i = 0; i < iterations; i++) {
@@ -381,7 +357,6 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Text generation
     if (params.model_path.empty()) {
         std::cerr << "Error: --model is required\n\n";
         print_help();
@@ -390,7 +365,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "GGNPU - GGUF NPU Inference Engine v" << VERSION << "\n\n";
 
-    // Select backend
     std::shared_ptr<Backend> backend;
 #ifdef GGNPU_HAS_NPU_BACKEND
     backend = create_amd_xdna_backend(params.npu_device);
@@ -404,7 +378,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Backend: " << backend->name() << "\n";
 
-    // Setup cache
     std::string cache_dir = params.cache_dir;
     if (cache_dir.empty()) {
         const char* home = std::getenv("HOME");
@@ -413,7 +386,6 @@ int main(int argc, char* argv[]) {
 
     CompileCache cache(cache_dir, !params.no_cache);
 
-    // Load model
     std::cout << "Loading model: " << params.model_path << "\n";
     Model model;
     if (!model.load(params.model_path)) {
@@ -436,44 +408,378 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Tokenize
-    SimpleTokenizer tokenizer;
-    std::vector<int> input_tokens = tokenizer.encode(params.prompt);
+    // Load tokenizer
+    Tokenizer tokenizer;
+    tokenizer.load_from_gguf(model.gguf().kv_pairs());
+    std::cout << "Tokenizer: " << tokenizer.vocab_size() << " tokens\n";
+
+    // Tokenize prompt
+    std::vector<int> input_tokens = tokenizer.encode(params.prompt, true, false);
     std::cout << "Input tokens: " << input_tokens.size() << "\n";
     std::cout << "Prompt: " << params.prompt << "\n\n";
 
-    // Generate
-    std::cout << "Generating: ";
+    // Setup working buffers
+    int hidden_size = static_cast<int>(hparams.embedding_length);
+    int ffn_size = static_cast<int>(hparams.feed_forward_length);
+    int num_layers = static_cast<int>(hparams.block_count);
+    int num_heads = static_cast<int>(hparams.attention_head_count);
+    int num_kv_heads = static_cast<int>(hparams.attention_head_count_kv);
+    int head_dim = static_cast<int>(hparams.rope_dimension_count);
+    int ctx_size = params.ctx_size > 0 ? params.ctx_size : static_cast<int>(hparams.context_length);
+    float rms_eps = 1e-5f;
+    if (hparams.attention_layer_norm_rms_epsilon > 0) {
+        rms_eps = std::sqrt(static_cast<float>(hparams.attention_layer_norm_rms_epsilon));
+    }
+    float rope_freq_scale = static_cast<float>(hparams.rope_freq_scale);
+    float rope_freq_base = static_cast<float>(hparams.rope_freq_base);
+
+    // Working buffers for activations
+    std::vector<float> inp_embd(hidden_size);
+    std::vector<float> inp_norm(hidden_size);
+    std::vector<float> q_proj(hidden_size);
+    std::vector<float> k_proj(num_kv_heads * head_dim);
+    std::vector<float> v_proj(num_kv_heads * head_dim);
+    std::vector<float> k_rope(num_kv_heads * head_dim);
+    std::vector<float> q_rope(num_heads * head_dim);
+    std::vector<float> attn_output(hidden_size);
+    std::vector<float> ffn_gate(ffn_size);
+    std::vector<float> ffn_up(ffn_size);
+    std::vector<float> ffn_down(hidden_size);
+    std::vector<float> ffn_silu(ffn_size);
+    std::vector<float> logits(static_cast<size_t>(hparams.vocab_size));
+
+    // RoPE frequency buffer
+    std::vector<float> rope_freqs(head_dim / 2);
+    for (int i = 0; i < head_dim / 2; i++) {
+        rope_freqs[i] = 1.0f / std::pow(rope_freq_base, static_cast<float>(i * 2) / head_dim) / rope_freq_scale;
+    }
 
     uint64_t rng_seed = params.seed;
     if (rng_seed == 0) {
         rng_seed = std::chrono::steady_clock::now().time_since_epoch().count();
     }
 
+    int64_t pos = 0;
     int generated = 0;
-    for (int i = 0; i < params.max_tokens; i++) {
-        // Simplified generation loop
-        // In production, this would run the full compute graph
+    std::vector<int> current_tokens;
 
-        // Sample next token
-        std::vector<float> logits(100);
-        for (auto& l : logits) {
-            l = static_cast<float>(std::rand()) / RAND_MAX;
+    auto apply_rope = [&](float* out, const float* inp, int n_heads, int64_t offset,
+                          int n_dims, const std::vector<float>& freqs) {
+        for (int h = 0; h < n_heads; h++) {
+            for (int i = 0; i < n_dims / 2; i++) {
+                float freq = freqs[i];
+                float val = static_cast<float>(offset) * freq;
+                float cos_val = std::cos(val);
+                float sin_val = std::sin(val);
+
+                float v0 = inp[h * n_dims + i];
+                float v1 = inp[h * n_dims + i + n_dims / 2];
+                out[h * n_dims + i] = v0 * cos_val - v1 * sin_val;
+                out[h * n_dims + i + n_dims / 2] = v0 * sin_val + v1 * cos_val;
+            }
+        }
+    };
+
+    auto rms_norm = [&](float* out, const float* inp, int size, float eps) {
+        float variance = 0.0f;
+        for (int i = 0; i < size; i++) {
+            variance += inp[i] * inp[i];
+        }
+        variance = variance / size + eps * eps;
+        float inv_std = 1.0f / std::sqrt(variance);
+        for (int i = 0; i < size; i++) {
+            out[i] = inp[i] * inv_std;
+        }
+    };
+
+    // Main generation loop
+    std::cout << "Generating: ";
+
+    bool first_token = true;
+    while (generated < params.max_tokens) {
+        int n_tokens = static_cast<int>(current_tokens.size());
+        if (n_tokens == 0) break;
+
+        // Embedding lookup - get embeddings for each token
+        const TensorView* tok_embd = find_tensor(model, "token_embd.weight");
+        if (!tok_embd) {
+            std::cerr << "Error: token_embd.weight not found\n";
+            break;
         }
 
+        const float* embd_data = get_float_ptr(tok_embd);
+        int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
+
+        std::fill(inp_embd.begin(), inp_embd.end(), 0.0f);
+        for (int t = 0; t < n_tokens; t++) {
+            int tok_id = current_tokens[t];
+            for (int d = 0; d < hidden_size; d++) {
+                inp_embd[d] += embd_data[tok_id * embd_dim + d];
+            }
+        }
+
+        // Transformer layers
+        for (int layer = 0; layer < num_layers; layer++) {
+            // RMSNorm for attention
+            rms_norm(inp_norm.data(), inp_embd.data(), hidden_size, rms_eps);
+
+            // Attention projections
+            const TensorView* attn_q = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", layer);
+            const TensorView* attn_k = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", layer);
+            const TensorView* attn_v = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", layer);
+
+            if (attn_q) {
+                MulMatParams q_params;
+                q_params.A = inp_norm.data();
+                q_params.B = get_float_ptr(attn_q);
+                q_params.C = q_proj.data();
+                q_params.M = n_tokens;
+                q_params.N = hidden_size;
+                q_params.K = hidden_size;
+                q_params.lda = hidden_size;
+                q_params.ldb = hidden_size;
+                q_params.ldc = hidden_size;
+                q_params.n_batches = 1;
+                q_params.B_type = attn_q->type;
+                backend->mul_mat_q(q_params);
+            }
+
+            if (attn_k) {
+                MulMatParams k_params;
+                k_params.A = inp_norm.data();
+                k_params.B = get_float_ptr(attn_k);
+                k_params.C = k_proj.data();
+                k_params.M = n_tokens;
+                k_params.N = num_kv_heads * head_dim;
+                k_params.K = hidden_size;
+                k_params.lda = hidden_size;
+                k_params.ldb = hidden_size;
+                k_params.ldc = num_kv_heads * head_dim;
+                k_params.n_batches = 1;
+                k_params.B_type = attn_k->type;
+                backend->mul_mat_q(k_params);
+            }
+
+            if (attn_v) {
+                MulMatParams v_params;
+                v_params.A = inp_norm.data();
+                v_params.B = get_float_ptr(attn_v);
+                v_params.C = v_proj.data();
+                v_params.M = n_tokens;
+                v_params.N = num_kv_heads * head_dim;
+                v_params.K = hidden_size;
+                v_params.lda = hidden_size;
+                v_params.ldb = hidden_size;
+                v_params.ldc = num_kv_heads * head_dim;
+                v_params.n_batches = 1;
+                v_params.B_type = attn_v->type;
+                backend->mul_mat_q(v_params);
+            }
+
+            backend->sync();
+
+            // Apply RoPE to Q and K
+            apply_rope(q_rope.data(), q_proj.data(), num_heads, pos,
+                      head_dim, rope_freqs);
+            apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos,
+                      head_dim, rope_freqs);
+
+            // Store KV in cache
+            model.kv_cache().update_slab(layer, pos, pos + n_tokens,
+                                         k_rope.data(), v_proj.data(),
+                                         num_kv_heads, head_dim);
+
+            // Attention: compute QK^T / sqrt(d) then apply to V
+            float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+            int64_t ctx_len = pos + n_tokens;
+
+            // For each query position
+            std::vector<float> attn_scores(static_cast<size_t>(n_tokens * ctx_len), 0.0f);
+            for (int i = 0; i < n_tokens; i++) {
+                for (int64_t j = 0; j < ctx_len; j++) {
+                    float sum = 0.0f;
+                    for (int d = 0; d < head_dim; d++) {
+                        sum += q_rope[i * head_dim + d] *
+                               model.kv_cache().key_buffer(layer, j)[d];
+                    }
+                    attn_scores[i * ctx_len + j] = sum * scale;
+                }
+            }
+
+            // Softmax + weighted V
+            std::vector<float> attn_out(static_cast<size_t>(n_tokens) * head_dim, 0.0f);
+            for (int i = 0; i < n_tokens; i++) {
+                // Softmax
+                float max_val = -INFINITY;
+                for (int64_t j = 0; j < ctx_len; j++) {
+                    if (attn_scores[i * ctx_len + j] > max_val) {
+                        max_val = attn_scores[i * ctx_len + j];
+                    }
+                }
+                float sum = 0.0f;
+                std::vector<float> weights(ctx_len);
+                for (int64_t j = 0; j < ctx_len; j++) {
+                    weights[j] = std::exp(attn_scores[i * ctx_len + j] - max_val);
+                    sum += weights[j];
+                }
+                for (int64_t j = 0; j < ctx_len; j++) {
+                    weights[j] /= sum;
+                }
+
+                // Weighted sum of V
+                for (int d = 0; d < head_dim; d++) {
+                    float v_sum = 0.0f;
+                    for (int64_t j = 0; j < ctx_len; j++) {
+                        v_sum += weights[j] * model.kv_cache().value_buffer(layer, j)[d];
+                    }
+                    attn_out[i * head_dim + d] = v_sum;
+                }
+            }
+
+            // Attention output projection
+            const TensorView* attn_output_w = find_tensor_pattern(model, "blk.{layer}.attn_output.weight", layer);
+            if (attn_output_w) {
+                std::fill(attn_output.begin(), attn_output.end(), 0.0f);
+                MulMatParams out_params;
+                out_params.A = attn_out.data();
+                out_params.B = get_float_ptr(attn_output_w);
+                out_params.C = attn_output.data();
+                out_params.M = n_tokens;
+                out_params.N = hidden_size;
+                out_params.K = hidden_size;
+                out_params.lda = head_dim;
+                out_params.ldb = hidden_size;
+                out_params.ldc = hidden_size;
+                out_params.n_batches = 1;
+                out_params.B_type = attn_output_w->type;
+                backend->mul_mat_q(out_params);
+                backend->sync();
+
+                // Add residual
+                for (int i = 0; i < hidden_size; i++) {
+                    inp_embd[i] += attn_output[i];
+                }
+            }
+
+            // FFN path
+            rms_norm(inp_norm.data(), inp_embd.data(), hidden_size, rms_eps);
+
+            const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer);
+            const TensorView* ffn_up_w = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", layer);
+            const TensorView* ffn_down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", layer);
+
+            if (ffn_gate_w) {
+                MulMatParams gate_params;
+                gate_params.A = inp_norm.data();
+                gate_params.B = get_float_ptr(ffn_gate_w);
+                gate_params.C = ffn_gate.data();
+                gate_params.M = n_tokens;
+                gate_params.N = ffn_size;
+                gate_params.K = hidden_size;
+                gate_params.lda = hidden_size;
+                gate_params.ldb = ffn_size;
+                gate_params.ldc = ffn_size;
+                gate_params.n_batches = 1;
+                gate_params.B_type = ffn_gate_w->type;
+                backend->mul_mat_q(gate_params);
+            }
+
+            if (ffn_up_w) {
+                MulMatParams up_params;
+                up_params.A = inp_norm.data();
+                up_params.B = get_float_ptr(ffn_up_w);
+                up_params.C = ffn_up.data();
+                up_params.M = n_tokens;
+                up_params.N = ffn_size;
+                up_params.K = hidden_size;
+                up_params.lda = hidden_size;
+                up_params.ldb = ffn_size;
+                up_params.ldc = ffn_size;
+                up_params.n_batches = 1;
+                up_params.B_type = ffn_up_w->type;
+                backend->mul_mat_q(up_params);
+            }
+
+            backend->sync();
+
+            // SwiGLU: gate * silu(up)
+            for (int i = 0; i < ffn_size; i++) {
+                ffn_silu[i] = ffn_gate[i] * (ffn_up[i] / (1.0f + std::exp(-ffn_up[i])));
+            }
+
+            // FFN down projection
+            if (ffn_down_w) {
+                std::fill(ffn_down.begin(), ffn_down.end(), 0.0f);
+                MulMatParams down_params;
+                down_params.A = ffn_silu.data();
+                down_params.B = get_float_ptr(ffn_down_w);
+                down_params.C = ffn_down.data();
+                down_params.M = n_tokens;
+                down_params.N = hidden_size;
+                down_params.K = ffn_size;
+                down_params.lda = ffn_size;
+                down_params.ldb = hidden_size;
+                down_params.ldc = hidden_size;
+                down_params.n_batches = 1;
+                down_params.B_type = ffn_down_w->type;
+                backend->mul_mat_q(down_params);
+                backend->sync();
+
+                // Add residual
+                for (int i = 0; i < hidden_size; i++) {
+                    inp_embd[i] += ffn_down[i];
+                }
+            }
+        }
+
+        // Final normalization
+        rms_norm(inp_norm.data(), inp_embd.data(), hidden_size, rms_eps);
+
+        // Logits projection: inp_norm @ tok_embd.T (or output.weight if present)
+        std::fill(logits.begin(), logits.end(), 0.0f);
+        const TensorView* tok_embd_out = find_tensor(model, "output.weight");
+        const TensorView* tok_embd_in = find_tensor(model, "token_embd.weight");
+        const float* embd_ptr = tok_embd_in ? get_float_ptr(tok_embd_in) : nullptr;
+        const float* logits_ptr = tok_embd_out ? get_float_ptr(tok_embd_out) : embd_ptr;
+
+        if (logits_ptr && embd_ptr) {
+            int vocab_size = static_cast<int>(hparams.vocab_size);
+            for (int t = 0; t < n_tokens; t++) {
+                for (int v = 0; v < vocab_size; v++) {
+                    float sum = 0.0f;
+                    for (int d = 0; d < hidden_size; d++) {
+                        sum += inp_norm[t * hidden_size + d] * logits_ptr[v * hidden_size + d];
+                    }
+                    logits[v] += sum;
+                }
+            }
+        }
+
+        backend->sync();
+
+        // Sample next token from last position
         int next_token = sample_token(logits, params.temp, rng_seed);
         std::string decoded = tokenizer.decode(next_token);
 
-        std::cout << decoded << " ";
+        if (first_token) {
+            std::cout << decoded;
+            first_token = false;
+        } else {
+            std::cout << decoded;
+        }
+        std::cout.flush();
+
+        current_tokens.clear();
+        current_tokens.push_back(next_token);
+        pos += n_tokens;
         generated++;
 
-        // Stop on special tokens (simplified)
-        if (next_token == 0 || next_token == 1) break;
+        if (next_token == tokenizer.eos_token_id() || next_token == 0) break;
+        if (pos >= ctx_size) break;
     }
 
     std::cout << "\n\nGenerated " << generated << " tokens.\n";
 
-    // Cleanup
     model.unload();
     return 0;
 }

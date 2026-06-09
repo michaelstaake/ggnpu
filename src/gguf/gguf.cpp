@@ -273,7 +273,6 @@ bool GgufLoader::parse_tensors() {    tensors_.clear();
         std::string name(name_len, '\0');
         if (::read(fd_, &name[0], name_len) != static_cast<ssize_t>(name_len)) return false;
         info.name = name;
-        info.name_offset = static_cast<size_t>(lseek(fd_, 0, SEEK_CUR)) - name_len - 8;
 
         // Read number of dimensions
         uint8_t ndim_buf[4];
@@ -295,7 +294,7 @@ bool GgufLoader::parse_tensors() {    tensors_.clear();
         uint32_t type_val = read_u32_le(type_buf);
         info.type = static_cast<GgmlType>(type_val);
 
-        // Read data offset (8 bytes) - this is the offset from the start of tensor data
+        // Read data offset (8 bytes)
         uint8_t data_off_buf[8];
         if (::read(fd_, data_off_buf, 8) != 8) return false;
         info.data_offset = read_u64_le(data_off_buf);
@@ -304,8 +303,6 @@ bool GgufLoader::parse_tensors() {    tensors_.clear();
         size_t elem_count = 1;
         for (auto d : info.dims) elem_count *= d;
         info.data_size = (elem_count / ggml_blck_size(info.type)) * ggml_type_size(info.type);
-
-        if (i < 3 || i >= header_.tensor_count - 3) {        }
 
         tensors_.push_back(std::move(info));
     }

@@ -288,7 +288,7 @@ ggnpu/
 
 Work through these in order. Do not skip ahead.
 
-### Phase 0 — Scaffold (1 week)
+### Phase 0 — Scaffold
 
 - [ ] CMake project, C++20, CI (compile on x86; NPU tests `MANUAL`)
 - [ ] `scripts/setup-host.sh` — XRT PPA, memlock limits, `render` group
@@ -297,7 +297,7 @@ Work through these in order. Do not skip ahead.
 
 **Done when:** binary links against XRT; `verify-npu.sh` documents host prerequisites.
 
-### Phase 1 — GGUF loader (2 weeks)
+### Phase 1 — GGUF loader
 
 - [ ] Parser, mmap, metadata API
 - [ ] Quant layouts: F16, Q8_0, Q4_0
@@ -306,7 +306,7 @@ Work through these in order. Do not skip ahead.
 
 **Done when:** `ggnpu -m model.gguf --dump-tensors` prints correct inventory.
 
-### Phase 2 — NPU matmul smoke (3 weeks)
+### Phase 2 — NPU matmul smoke
 
 - [ ] XRT device init on Krackan
 - [ ] Build INT8 matmul xclbin (e.g. 1×3072 × 3072×3072)
@@ -314,7 +314,7 @@ Work through these in order. Do not skip ahead.
 
 **Done when:** `ggnpu bench-matmul` runs on NPU with measurable throughput.
 
-### Phase 3 — Q4_K weight path (3 weeks)
+### Phase 3 — Q4_K weight path
 
 - [ ] Q4_K + Q6_K block decoders
 - [ ] Transparent INT8 NPU weight cache
@@ -322,7 +322,7 @@ Work through these in order. Do not skip ahead.
 
 **Done when:** output within tolerance vs CPU reference dequant matmul.
 
-### Phase 4 — Full decoder layer (4 weeks)
+### Phase 4 — Full decoder layer
 
 - [ ] All matmuls in one layer on NPU
 - [ ] RMSNorm, RoPE, attention (decomposed), SiLU on NPU
@@ -330,7 +330,7 @@ Work through these in order. Do not skip ahead.
 
 **Done when:** one-layer forward matches CPU reference.
 
-### Phase 5 — Inference MVP (4 weeks)
+### Phase 5 — Inference MVP
 
 - [ ] Prefill + decode loops
 - [ ] Tokenizer + greedy sampling
@@ -344,7 +344,7 @@ ggnpu -m llama-3.2-1b-Q4_K_M.gguf -p "The capital of France is"
 
 produces coherent text with all math on NPU.
 
-### Phase 6 — Production (3 weeks)
+### Phase 6 — Production
 
 - [ ] Llama 3.2 3B; L2-aware tiling
 - [ ] Docker image + compose

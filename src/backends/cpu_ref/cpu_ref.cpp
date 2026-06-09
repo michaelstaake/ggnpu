@@ -1,4 +1,7 @@
 #include "backend.h"
+#include "tensor.h"
+#include "quant/q4_0.h"
+#include "quant/q8_0.h"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -14,39 +17,76 @@ class CpuRefBackend : public Backend {
 public:
     CpuRefBackend() : last_status_(Status::OK) {}
 
+    static int8_t q4_0_to_int8(uint8_t nibble) {
+        return static_cast<int8_t>((nibble & 0x08) ? (nibble | 0xF0) : nibble);
+    }
+
     Status mul_mat_q(const MulMatParams& params) override {
-        // Simplified matmul: just copy for now
-        // Full implementation would decode quantized weights and compute
         if (!params.A || !params.B || !params.C) return Status::INVALID_PARAM;
 
         int M = params.M;
         int N = params.N;
         int K = params.K;
+        float* C = static_cast<float*>(params.C);
 
-        // For F32 x F32 -> F32
-        if (params.scales) {
-            // Quantized matmul with scales
-            const float* scales = static_cast<const float*>(params.scales);
-            const int8_t* A_int8 = static_cast<const int8_t*>(params.A);
-            const int8_t* B_int8 = static_cast<const int8_t*>(params.B);
-            float* C_float = static_cast<float*>(params.C);
+        memset(C, 0, M * N * sizeof(float));
 
+        switch (params.B_type) {
+        case GgmlType::Q8_0: {
+            const int8_t* B_q = static_cast<const int8_t*>(params.B);
+            const int8_t* A_q = static_cast<const int8_t*>(params.A);
             for (int m = 0; m < M; m++) {
                 for (int n = 0; n < N; n++) {
                     float sum = 0.0f;
                     for (int k = 0; k < K; k++) {
-                        sum += static_cast<float>(A_int8[m * K + k]) *
-                               static_cast<float>(B_int8[k * N + n]);
+                        sum += static_cast<float>(A_q[m * K + k]) *
+                               static_cast<float>(B_q[k * N + n]);
                     }
-                    C_float[m * N + n] = sum * scales[m];
+                    C[m * N + n] = sum;
                 }
             }
-        } else {
-            // Simple F32 matmul
+            break;
+        }
+
+        case GgmlType::Q4_0: {
+            const int8_t* A_f32 = static_cast<const int8_t*>(params.A);
+            const uint8_t* B_q = static_cast<const uint8_t*>(params.B);
+            size_t B_block_size = ggml_type_size(GgmlType::Q4_0);
+            size_t num_blocks = K / ggml_blck_size(GgmlType::Q4_0);
+
+            for (int m = 0; m < M; m++) {
+                for (int n = 0; n < N; n++) {
+                    float sum = 0.0f;
+                    for (size_t b = 0; b < num_blocks; b++) {
+                        Q4_0Block block;
+                        memcpy(&block, B_q + b * B_block_size, sizeof(Q4_0Block));
+                        int16_t d_raw = block.d;
+                        float d = static_cast<float>(static_cast<int16_t>(d_raw));
+
+                        for (int k_in_block = 0; k_in_block < 16; k_in_block++) {
+                            int k = static_cast<int>(b * 16 + k_in_block);
+                            if (k >= K) break;
+
+                            uint8_t nibble;
+                            if (k_in_block % 2 == 0) {
+                                nibble = block.qs[k_in_block / 2] & 0x0F;
+                            } else {
+                                nibble = (block.qs[k_in_block / 2] >> 4) & 0x0F;
+                            }
+                            int8_t bv = q4_0_to_int8(nibble);
+                            sum += static_cast<float>(A_f32[m * K + k]) * static_cast<float>(bv) * d;
+                        }
+                    }
+                    C[m * N + n] = sum;
+                }
+            }
+            break;
+        }
+
+        case GgmlType::F32:
+        default: {
             const float* A = static_cast<const float*>(params.A);
             const float* B = static_cast<const float*>(params.B);
-            float* C = static_cast<float*>(params.C);
-
             for (int m = 0; m < M; m++) {
                 for (int n = 0; n < N; n++) {
                     float sum = 0.0f;
@@ -56,6 +96,8 @@ public:
                     C[m * N + n] = sum;
                 }
             }
+            break;
+        }
         }
 
         return Status::OK;

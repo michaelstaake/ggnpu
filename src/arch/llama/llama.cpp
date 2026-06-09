@@ -6,6 +6,26 @@
 
 namespace ggnpu {
 
+namespace {
+
+TensorRole parse_tensor_role(const std::string& name) {
+    if (name.find("token_embd") != std::string::npos) return TensorRole::EMBEDDING;
+    if (name.find("attn_q") != std::string::npos) return TensorRole::ATTN_Q;
+    if (name.find("attn_k") != std::string::npos) return TensorRole::ATTN_K;
+    if (name.find("attn_v") != std::string::npos) return TensorRole::ATTN_V;
+    if (name.find("attn_output") != std::string::npos) return TensorRole::ATTN_OUTPUT;
+    if (name.find("attn_norm") != std::string::npos) return TensorRole::ATTN_NORM;
+    if (name.find("ffn_gate") != std::string::npos) return TensorRole::FFN_GATE;
+    if (name.find("ffn_up") != std::string::npos) return TensorRole::FFN_UP;
+    if (name.find("ffn_down") != std::string::npos) return TensorRole::FFN_DOWN;
+    if (name.find("ffn_norm") != std::string::npos) return TensorRole::FFN_NORM;
+    if (name.find("output_norm") != std::string::npos) return TensorRole::OUTPUT_NORM;
+    if (name.find("output") != std::string::npos) return TensorRole::OUTPUT;
+    return TensorRole::UNKNOWN;
+}
+
+} // namespace
+
 bool Model::load(const std::string& path) {
     gguf_ = std::make_unique<GgufLoader>();
     if (!gguf_->load(path)) {
@@ -15,6 +35,7 @@ bool Model::load(const std::string& path) {
     if (!parse_hparams()) return false;
     if (!build_tensor_map()) return false;
     if (!prepare_tensors()) return false;
+    if (!init_kv_cache()) return false;
 
     loaded_ = true;
     return true;
@@ -24,6 +45,8 @@ void Model::unload() {
     if (gguf_) gguf_->unload();
     tensors_.clear();
     tensor_map_.clear();
+    tensor_roles_.clear();
+    kv_cache_.reset();
     loaded_ = false;
 }
 
@@ -58,12 +81,13 @@ bool Model::parse_hparams() {
 
 bool Model::build_tensor_map() {
     tensor_map_.clear();
+    tensor_roles_.clear();
 
-    // Build tensor map from GGUF tensor list
     const auto& gguf_tensors = gguf_->tensors();
     for (int i = 0; i < static_cast<int>(gguf_tensors.size()); i++) {
         const auto& t = gguf_tensors[i];
         tensor_map_[t.name] = i;
+        tensor_roles_[t.name] = parse_tensor_role(t.name);
     }
 
     return !tensor_map_.empty();
@@ -98,6 +122,31 @@ bool Model::prepare_tensors() {
 
 void Model::set_backend(std::shared_ptr<Backend> backend) {
     backend_ = backend;
+}
+
+bool Model::init_kv_cache() {
+    uint64_t ctx = hparams_.context_length;
+    if (ctx == 0) ctx = 2048;
+
+    uint64_t head_dim = hparams_.rope_dimension_count;
+    if (head_dim == 0) {
+        head_dim = hparams_.embedding_length / hparams_.attention_head_count;
+    }
+
+    kv_cache_ = std::make_unique<KVCache>(
+        hparams_.block_count,
+        ctx,
+        hparams_.attention_head_count_kv,
+        head_dim
+    );
+
+    return static_cast<bool>(kv_cache_);
+}
+
+TensorRole Model::get_tensor_role(const std::string& name) const {
+    auto it = tensor_roles_.find(name);
+    if (it != tensor_roles_.end()) return it->second;
+    return TensorRole::UNKNOWN;
 }
 
 Model::Model() {}
