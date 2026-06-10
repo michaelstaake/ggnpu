@@ -14,7 +14,7 @@ This guide walks through the host setup required to build and run `ggnpu` direct
 ```bash
 # Core build tools
 sudo apt update
-sudo apt install build-essential cmake git clang lld ninja-build python3-pip python3-venv
+sudo apt install build-essential cmake git clang lld ninja-build python3-pip python3-venv libssl-dev
 
 # Add AMD XRT PPA (if available)
 sudo add-apt-repository ppa:amd-team/xrt
@@ -228,7 +228,7 @@ ls -la ~/.cache/ggnpu/xclbin/
 
 If you built on a different machine, copy them there.
 
-## Step 9: Run benchmark
+## Step 10: Run benchmark
 
 ```bash
 # Run matmul benchmark (Phase 2 smoke test)
