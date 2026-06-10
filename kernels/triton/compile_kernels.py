@@ -239,8 +239,12 @@ def compile_kernel(op, profile, params, output_dir):
         f.write(KERNEL_SOURCES[op])
         f.write("\n\n")
         
+        # Build the parameter values for the generated script
+        # We need to embed the actual values, not reference a 'params' dict
+        p = params
+
         # Add compilation code
-        f.write(f"""
+        f.write(f'''
 import triton
 from triton.backends.amd_triton_npu.driver import NPUDriver
 
@@ -252,11 +256,11 @@ kernel_func = {kernel_info['func']}
 
 # Build grid based on kernel type
 if "{op}" == "matmul":
-    M, N, K = {params['M']}, {params['N']}, {params['K']}
+    M, N, K = {p.get("M", 256)}, {p.get("N", 256)}, {p.get("K", 256)}
     BLOCK_SIZE_M = 256
     BLOCK_SIZE_N = 256
     BLOCK_SIZE_K = K
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']), triton.cdiv(N, META['BLOCK_SIZE_N']))
+    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]))
     kernel_func[grid](
         None, None, None,  # Dummy pointers for compilation
         M, N, K,
@@ -266,18 +270,18 @@ if "{op}" == "matmul":
         BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
 elif "{op}" == "rmsnorm":
-    N = {params['N']}
+    N = {p.get("N", 2048)}
     BLOCK_SIZE = 1024
-    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']),)
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
     kernel_func[grid](
         None, None,  # Dummy pointers
         N, 1e-5,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 elif "{op}" == "softmax":
-    rows, cols = {params['rows']}, {params['cols']}
+    rows, cols = {p.get("rows", 1)}, {p.get("cols", 1024)}
     BLOCK_SIZE = 1024
-    grid = lambda META: (triton.cdiv(rows, META['BLOCK_SIZE']),)
+    grid = lambda META: (triton.cdiv(rows, META["BLOCK_SIZE"]),)
     kernel_func[grid](
         None, None,  # Dummy pointers
         rows, cols,
@@ -285,18 +289,18 @@ elif "{op}" == "softmax":
         BLOCK_SIZE=BLOCK_SIZE,
     )
 elif "{op}" == "silu":
-    N = {params['N']}
+    N = {p.get("N", 8192)}
     BLOCK_SIZE = 1024
-    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']),)
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
     kernel_func[grid](
         None, None,  # Dummy pointers
         N,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 elif "{op}" == "rope":
-    N, dims = {params['N']}, {params['dims']}
+    N, dims = {p.get("N", 2048)}, {p.get("dims", 64)}
     BLOCK_SIZE = 1024
-    grid = lambda META: (triton.cdiv(N, META['BLOCK_SIZE']),)
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
     kernel_func[grid](
         None, None,  # Dummy pointers
         N, dims,
@@ -304,7 +308,7 @@ elif "{op}" == "rope":
         BLOCK_SIZE=BLOCK_SIZE,
     )
 elif "{op}" == "flash_attn":
-    n_head, head_dim, ctx_len = {params['n_head']}, {params['head_dim']}, {params['ctx_len']}
+    n_head, head_dim, ctx_len = {p.get("n_head", 8)}, {p.get("head_dim", 128)}, {p.get("ctx_len", 2048)}
     BLOCK_SIZE_Q = 64
     BLOCK_SIZE_K = 64
     grid = lambda META: (n_head,)
@@ -316,8 +320,8 @@ elif "{op}" == "flash_attn":
         BLOCK_SIZE_Q=BLOCK_SIZE_Q, BLOCK_SIZE_K=BLOCK_SIZE_K,
     )
 
-print(f"Compiled {{op}} kernel successfully")
-""")
+print(f"Compiled {op} kernel successfully")
+''')
     
     try:
         # Run compilation
