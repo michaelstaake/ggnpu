@@ -72,6 +72,13 @@ cmake --build build-npu -j2
 No NPU hardware is needed to build kernels — the compilation runs entirely on CPU.
 You can build on a separate machine (no NPU required) and copy the `.xclbin` files to the NPU machine.
 
+**System dependencies** (install on the build machine):
+
+```bash
+sudo apt update
+sudo apt install build-essential cmake git clang lld ninja-build python3-pip python3-venv libssl-dev
+```
+
 ```bash
 # 1. Clone mlir-aie
 git clone https://github.com/Xilinx/mlir-aie.git ~/mlir-aie
