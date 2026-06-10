@@ -24,7 +24,7 @@ BIOS: NPU/IPU enabled. Boot: `amd_iommu=on`.
 ```bash
 # 1. Core build tools
 sudo apt update
-sudo apt install build-essential cmake git clang lld ninja-build python3-pip
+sudo apt install build-essential cmake git clang lld ninja-build python3-pip python3-venv
 
 # 2. XRT runtime + NPU driver (from AMD PPA)
 sudo add-apt-repository ppa:amd-team/xrt

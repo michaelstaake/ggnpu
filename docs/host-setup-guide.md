@@ -14,7 +14,7 @@ This guide walks through the host setup required to build and run `ggnpu` direct
 ```bash
 # Core build tools
 sudo apt update
-sudo apt install build-essential cmake git
+sudo apt install build-essential cmake git clang lld ninja-build python3-pip python3-venv
 
 # Add AMD XRT PPA (if available)
 sudo add-apt-repository ppa:amd-team/xrt
