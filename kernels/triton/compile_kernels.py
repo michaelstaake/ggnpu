@@ -242,7 +242,8 @@ def _include_flags_for_env(env: dict[str, str], xrt_root: Path) -> list[str]:
     flags = [f"-I{xrt_root / 'include'}"]
     extra = env.get("CPLUS_INCLUDE_PATH", "")
     for entry in extra.split(":"):
-        if entry and entry != str(xrt_root / "include"):
+        # Skip /usr/include: passing it as -I breaks libstdc++ include_next.
+        if entry and entry not in (str(xrt_root / "include"), "/usr/include"):
             flags.append(f"-I{entry}")
     return flags
 
@@ -378,7 +379,10 @@ def setup_compile_env(repo_root: Path) -> dict[str, str]:
     if (uuid_inc / "uuid/uuid.h").is_file():
         include_paths.append(str(uuid_inc))
     elif Path("/usr/include/uuid/uuid.h").is_file():
-        include_paths.append("/usr/include")
+        # /usr/include is already a default system include dir; adding it to
+        # CPLUS_INCLUDE_PATH demotes it to a user dir and breaks libstdc++'s
+        # `#include_next <stdlib.h>` (fatal error: stdlib.h: No such file).
+        pass
     else:
         raise RuntimeError(
             "uuid/uuid.h not found. XRT headers require uuid-dev.\n"
