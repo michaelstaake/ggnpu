@@ -17,8 +17,13 @@ WORKDIR /workspace
 # Stage 1 deps: XRT headers/libs for linking ggnpu
 COPY docker/install-xrt-runtime.sh /tmp/install-xrt-runtime.sh
 RUN chmod +x /tmp/install-xrt-runtime.sh && /tmp/install-xrt-runtime.sh
-
+# Create swap file for 16 GB RAM machines (critical for mlir-aie build)
+# This ensures the build doesn't OOM when physical memory is exhausted
+RUN dd if=/dev/zero of=/swapfile bs=1M count=4096 2>/dev/null && \
+    chmod 600 /swapfile && \
+    mkswap /swapfile 2>/dev/null || true
 # Stage 2: mlir-aie (wheel-based build from upstream script)
+# Memory-limited: --jobs 2 --max-memory 8G for 16 GB RAM machines
 COPY docker/install-mlir-aie.sh /tmp/install-mlir-aie.sh
 RUN chmod +x /tmp/install-mlir-aie.sh && /tmp/install-mlir-aie.sh
 
@@ -37,11 +42,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . .
 
 # Build ggnpu with NPU backend
+# -j2: limit parallelism for 16 GB RAM machines (default is $(nproc))
 RUN cmake -S . -B build \
         -DGGNPU_NPU_BACKEND=ON \
         -DGGNPU_TEST_CPU=OFF \
         -DGGNPU_BUILD_TESTS=OFF \
-    && cmake --build build -j"$(nproc)"
+    && cmake --build build -j2
 
 # Build NPU kernels for Krackan (npu6). Matmul first; extend as MLIR matures.
 # Kernels are cached under /root/.cache/ggnpu/xclbin — mount a volume here.

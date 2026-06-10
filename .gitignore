@@ -1,3 +1,6 @@
+# Env files
+docker/.env
+
 # Build artifacts
 build/
 build-*/

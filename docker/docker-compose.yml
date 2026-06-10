@@ -15,6 +15,7 @@
 
 services:
   # One-shot: compile mlir-aie + xclbins + ggnpu (heavy; run once or when kernels change)
+  # Memory-limited for 16 GB RAM machines (--memory 12g --cpus 2)
   builder:
     profiles: ["build"]
     build:
@@ -23,6 +24,9 @@ services:
       args:
         UBUNTU_VERSION: ${UBUNTU_VERSION:-26.04}
     image: ggnpu-builder:latest
+    mem_limit: 12g
+    memswap_limit: 14g
+    cpus: 2
     volumes:
       - ggnpu-cache:/root/.cache/ggnpu
     # Populates ggnpu-cache volume with xclbins under xclbin/

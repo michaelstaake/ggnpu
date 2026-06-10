@@ -184,14 +184,11 @@ TOTAL=0
 SUCCESS=0
 FAILED=0
 
-# Define kernels to build: name, mlir_file, output_prefix
+# Memory-limited kernel builds for 16 GB RAM machines.
+# Build only matmul first (critical path for bench-matmul).
+# Additional kernels can be built later with: ./scripts/build-kernels.sh npu6 rmsnorm
 Kernels=(
     "matmul:matmul_i8/matmul.mlir:matmul"
-    "rmsnorm:rmsnorm/rmsnorm.mlir:rmsnorm"
-    "rope:rope/rope.mlir:rope"
-    "softmax:softmax/softmax.mlir:softmax"
-    "silu:silu/silu.mlir:silu"
-    "flash_attn:fused_attn/flash_attn.mlir:flash_attn"
 )
 
 for kernel_def in "${Kernels[@]}"; do
