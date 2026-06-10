@@ -79,6 +79,37 @@ def _valid_xrt_root(path: Path) -> bool:
     return (path / "include/xrt").is_dir() and (path / "lib").is_dir()
 
 
+def _linker_lib_names() -> tuple[str, ...]:
+    return ("libxrt_coreutil.so", "libuuid.so")
+
+
+def _can_link_lib(lib_dir: Path, base: str) -> bool:
+    if not lib_dir.is_dir():
+        return False
+    unversioned = lib_dir / f"{base}.so"
+    if unversioned.exists():
+        return True
+    return any(lib_dir.glob(f"{base}.so.*"))
+
+
+def _ensure_dev_symlinks(lib_dir: Path, dest_lib_dir: Path) -> None:
+    """Symlink runtime .so.N files and add unversioned .so names for -l flags."""
+    dest_lib_dir.mkdir(parents=True, exist_ok=True)
+    if not lib_dir.is_dir():
+        return
+
+    for lib in sorted(lib_dir.glob("libxrt*.so*")) + sorted(lib_dir.glob("libuuid.so*")):
+        link = dest_lib_dir / lib.name
+        if not link.exists():
+            link.symlink_to(lib.resolve())
+
+    for lib in sorted(dest_lib_dir.glob("*.so.*")):
+        base = lib.name.split(".so.", 1)[0] + ".so"
+        unversioned = dest_lib_dir / base
+        if not unversioned.exists():
+            unversioned.symlink_to(lib.name)
+
+
 def find_xilinx_xrt(repo_root: Path) -> Path | None:
     """Locate an XRT SDK tree (include/xrt + lib) for Triton-XDNA compile-only builds."""
     explicit = os.environ.get("XILINX_XRT", "")
@@ -114,21 +145,54 @@ def find_xilinx_xrt(repo_root: Path) -> Path | None:
             Path("/opt/xilinx/xrt/lib"),
         ]
         for lib_dir in lib_dirs:
-            if not lib_dir.is_dir():
-                continue
-            for lib in lib_dir.glob("libxrt*.so*"):
-                link = shim_lib / lib.name
-                if not link.exists():
-                    link.symlink_to(lib.resolve())
-            for lib in lib_dir.glob("libxrt*.a"):
-                link = shim_lib / lib.name
-                if not link.exists():
-                    link.symlink_to(lib.resolve())
+            _ensure_dev_symlinks(lib_dir, shim_lib)
 
         if _valid_xrt_root(shim):
             return shim.resolve()
 
     return None
+
+
+def linker_lib_search_dirs(xrt_root: Path, repo_root: Path) -> list[Path]:
+    dirs: list[Path] = [xrt_root / "lib"]
+    for sub in ("lib/x86_64-linux-gnu", "lib"):
+        p = xrt_root / sub
+        if p.is_dir():
+            dirs.append(p)
+    uuid_lib = repo_root / "third_party/uuid-dev/usr/lib/x86_64-linux-gnu"
+    if uuid_lib.is_dir():
+        dirs.append(uuid_lib)
+    system_lib = Path("/usr/lib/x86_64-linux-gnu")
+    if system_lib.is_dir():
+        dirs.append(system_lib)
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for d in dirs:
+        resolved = d.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(d)
+    return unique
+
+
+def check_linker_prereqs(xrt_root: Path, repo_root: Path) -> str | None:
+    """Return an error message when g++ cannot link the Triton compile-only launcher."""
+    lib_dirs = linker_lib_search_dirs(xrt_root, repo_root)
+    required = ("libxrt_coreutil", "libuuid")
+    missing = [base for base in required if not any(_can_link_lib(d, base) for d in lib_dirs)]
+    if not missing:
+        return None
+    return (
+        "Missing linker libraries for Triton compile-only launcher: "
+        + ", ".join(f"{name}.so" for name in missing)
+        + ".\n"
+        "  Install development packages (headers + linker names):\n"
+        "    sudo apt install libxrt-dev uuid-dev\n"
+        "  Or extract debs without sudo:\n"
+        "    bash scripts/fetch-xrt-dev.sh\n"
+        "    export XILINX_XRT=$PWD/third_party/xrt-dev/usr\n"
+        "  You also need libxrt2 runtime: sudo apt install libxrt2"
+    )
 
 
 def setup_compile_env(repo_root: Path) -> dict[str, str]:
@@ -145,6 +209,10 @@ def setup_compile_env(repo_root: Path) -> dict[str, str]:
         )
     env["XILINX_XRT"] = str(xrt_root)
 
+    linker_err = check_linker_prereqs(xrt_root, repo_root)
+    if linker_err:
+        raise RuntimeError(linker_err)
+
     include_paths = [str(xrt_root / "include")]
     uuid_inc = repo_root / "third_party/uuid-dev/usr/include"
     if uuid_inc.is_dir():
@@ -153,15 +221,7 @@ def setup_compile_env(repo_root: Path) -> dict[str, str]:
         include_paths.append("/usr/include")
     env["CPLUS_INCLUDE_PATH"] = ":".join(include_paths + ([env["CPLUS_INCLUDE_PATH"]] if env.get("CPLUS_INCLUDE_PATH") else []))
 
-    lib_paths = []
-    for sub in ("lib/x86_64-linux-gnu", "lib"):
-        p = xrt_root / sub
-        if p.is_dir():
-            lib_paths.append(str(p))
-    if (repo_root / "third_party/uuid-dev/usr/lib/x86_64-linux-gnu").is_dir():
-        lib_paths.append(str(repo_root / "third_party/uuid-dev/usr/lib/x86_64-linux-gnu"))
-    elif Path("/usr/lib/x86_64-linux-gnu").is_dir():
-        lib_paths.append("/usr/lib/x86_64-linux-gnu")
+    lib_paths = [str(d) for d in linker_lib_search_dirs(xrt_root, repo_root)]
     if lib_paths:
         env["LIBRARY_PATH"] = ":".join(lib_paths + ([env["LIBRARY_PATH"]] if env.get("LIBRARY_PATH") else []))
 
