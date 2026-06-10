@@ -2,6 +2,7 @@
 build/
 build-*/
 build/air_cache/
+build/xrt-sdk-shim/
 *.o
 *.a
 /ggnpu

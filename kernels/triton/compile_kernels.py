@@ -75,31 +75,95 @@ PROFILE_TO_TARGET = {
 }
 
 
+def _valid_xrt_root(path: Path) -> bool:
+    return (path / "include/xrt").is_dir() and (path / "lib").is_dir()
+
+
+def find_xilinx_xrt(repo_root: Path) -> Path | None:
+    """Locate an XRT SDK tree (include/xrt + lib) for Triton-XDNA compile-only builds."""
+    explicit = os.environ.get("XILINX_XRT", "")
+    if explicit:
+        root = Path(explicit)
+        if _valid_xrt_root(root):
+            return root.resolve()
+
+    for candidate in (
+        Path("/opt/xilinx/xrt"),
+        repo_root / "third_party/xrt-dev/usr",
+    ):
+        if _valid_xrt_root(candidate):
+            return candidate.resolve()
+
+    # Ubuntu libxrt-dev splits headers (/usr/include/xrt) and libs (/usr/lib/...).
+    # Triton expects a unified tree — build a shim under build/xrt-sdk-shim.
+    usr_inc = Path("/usr/include/xrt")
+    if usr_inc.is_dir():
+        shim = repo_root / "build" / "xrt-sdk-shim"
+        shim_inc = shim / "include" / "xrt"
+        shim_lib = shim / "lib"
+        shim.mkdir(parents=True, exist_ok=True)
+        (shim / "include").mkdir(parents=True, exist_ok=True)
+        shim_lib.mkdir(parents=True, exist_ok=True)
+
+        if not shim_inc.exists():
+            shim_inc.symlink_to(usr_inc.resolve(), target_is_directory=True)
+
+        lib_dirs = [
+            Path("/usr/lib/x86_64-linux-gnu"),
+            Path("/usr/lib"),
+            Path("/opt/xilinx/xrt/lib"),
+        ]
+        for lib_dir in lib_dirs:
+            if not lib_dir.is_dir():
+                continue
+            for lib in lib_dir.glob("libxrt*.so*"):
+                link = shim_lib / lib.name
+                if not link.exists():
+                    link.symlink_to(lib.resolve())
+            for lib in lib_dir.glob("libxrt*.a"):
+                link = shim_lib / lib.name
+                if not link.exists():
+                    link.symlink_to(lib.resolve())
+
+        if _valid_xrt_root(shim):
+            return shim.resolve()
+
+    return None
+
+
 def setup_compile_env(repo_root: Path) -> dict[str, str]:
     """Return environment variables needed for Triton-XDNA compile-only builds."""
     env = os.environ.copy()
 
-    xrt_candidates = [
-        Path("/opt/xilinx/xrt"),
-        repo_root / "third_party/xrt-dev/usr",
-    ]
-    for candidate in xrt_candidates:
-        if (candidate / "include/xrt").is_dir() and (candidate / "lib").is_dir():
-            env["XILINX_XRT"] = str(candidate)
-            break
+    xrt_root = find_xilinx_xrt(repo_root)
+    if xrt_root is None:
+        raise RuntimeError(
+            "XRT development files not found. Triton-XDNA needs include/xrt and libxrt.\n"
+            "  Install: sudo apt install libxrt-dev uuid-dev\n"
+            "  Or set:  export XILINX_XRT=/opt/xilinx/xrt\n"
+            "  Or extract headers to: third_party/xrt-dev/usr/"
+        )
+    env["XILINX_XRT"] = str(xrt_root)
 
+    include_paths = [str(xrt_root / "include")]
     uuid_inc = repo_root / "third_party/uuid-dev/usr/include"
     if uuid_inc.is_dir():
-        inc = env.get("CPLUS_INCLUDE_PATH", "")
-        env["CPLUS_INCLUDE_PATH"] = f"{uuid_inc}:{inc}" if inc else str(uuid_inc)
-        lib = repo_root / "third_party/uuid-dev/usr/lib/x86_64-linux-gnu"
-        if lib.is_dir():
-            env["LIBRARY_PATH"] = f"{lib}:{env.get('LIBRARY_PATH', '')}"
+        include_paths.append(str(uuid_inc))
+    elif Path("/usr/include/uuid").is_dir():
+        include_paths.append("/usr/include")
+    env["CPLUS_INCLUDE_PATH"] = ":".join(include_paths + ([env["CPLUS_INCLUDE_PATH"]] if env.get("CPLUS_INCLUDE_PATH") else []))
 
-    if "XILINX_XRT" in env:
-        xrt_lib = Path(env["XILINX_XRT"]) / "lib/x86_64-linux-gnu"
-        if xrt_lib.is_dir():
-            env["LIBRARY_PATH"] = f"{xrt_lib}:{env.get('LIBRARY_PATH', '')}"
+    lib_paths = []
+    for sub in ("lib/x86_64-linux-gnu", "lib"):
+        p = xrt_root / sub
+        if p.is_dir():
+            lib_paths.append(str(p))
+    if (repo_root / "third_party/uuid-dev/usr/lib/x86_64-linux-gnu").is_dir():
+        lib_paths.append(str(repo_root / "third_party/uuid-dev/usr/lib/x86_64-linux-gnu"))
+    elif Path("/usr/lib/x86_64-linux-gnu").is_dir():
+        lib_paths.append("/usr/lib/x86_64-linux-gnu")
+    if lib_paths:
+        env["LIBRARY_PATH"] = ":".join(lib_paths + ([env["LIBRARY_PATH"]] if env.get("LIBRARY_PATH") else []))
 
     venv = os.environ.get("VIRTUAL_ENV") or os.environ.get("GGNPU_TRITON_VENV")
     if not venv:
@@ -261,45 +325,49 @@ def build_kernel_script(op: str, params: dict) -> str:
         """)
 
     elif op == "flash_attn":
+        n_head = p.get("n_head", 8)
+        head_dim = p.get("head_dim", 128)
+        ctx_len = p.get("ctx_len", 2048)
         launch = textwrap.dedent(f"""
-            n_head, head_dim, ctx_len = {p.get("n_head", 8)}, {p.get("head_dim", 128)}, {p.get("ctx_len", 2048)}
+            n_head, head_dim, ctx_len = {n_head}, {head_dim}, {ctx_len}
             Q = torch.randn(n_head, head_dim, dtype=torch.float32)
             K = torch.randn(ctx_len, head_dim, dtype=torch.float32)
             V = torch.randn(ctx_len, head_dim, dtype=torch.float32)
             O = torch.empty(n_head, head_dim, dtype=torch.float32)
             grid = lambda META: (n_head,)
             compiled = flash_attn_kernel[grid](
-                Q, K, V, O, n_head, head_dim, ctx_len,
+                Q, K, V, O, head_dim, ctx_len,
                 head_dim, ctx_len * head_dim, ctx_len * head_dim, head_dim,
-                BLOCK_SIZE_Q=64, BLOCK_SIZE_K=64,
+                BLOCK_K=64,
             )
         """)
         kernel_src = textwrap.dedent("""
             @triton.jit
-            def flash_attn_kernel(Q, K, V, output, n_head: tl.constexpr, head_dim: tl.constexpr, ctx_len: tl.constexpr,
+            def flash_attn_kernel(Q, K, V, output, head_dim: tl.constexpr, ctx_len: tl.constexpr,
                 stride_qh: tl.constexpr, stride_kh: tl.constexpr, stride_vh: tl.constexpr, stride_oh: tl.constexpr,
-                BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+                BLOCK_K: tl.constexpr):
                 pid = tl.program_id(0)
-                q = tl.load(Q + pid * stride_qh + tl.arange(0, head_dim))
-                scores = tl.zeros([BLOCK_SIZE_K], dtype=tl.float32)
-                for k in range(0, ctx_len, BLOCK_SIZE_K):
-                    k_idx = k + tl.arange(0, BLOCK_SIZE_K)
-                    k_mask = k_idx < ctx_len
-                    k_row = tl.load(K + k_idx[:, None] * head_dim + tl.arange(0, head_dim)[None, :], mask=k_mask[:, None])
-                    dot = tl.sum(q[None, :] * k_row, axis=1)
-                    scores = tl.where(k_mask, dot, scores)
-                max_s = tl.max(scores, axis=0)
-                exp_s = tl.exp(scores - max_s)
-                sum_s = tl.sum(exp_s, axis=0)
-                weights = exp_s / sum_s
-                out = tl.zeros([head_dim], dtype=tl.float32)
-                for k in range(0, ctx_len, BLOCK_SIZE_K):
-                    k_idx = k + tl.arange(0, BLOCK_SIZE_K)
-                    k_mask = k_idx < ctx_len
-                    v_row = tl.load(V + k_idx[:, None] * head_dim + tl.arange(0, head_dim)[None, :], mask=k_mask[:, None])
-                    w = tl.load(weights + k_idx - k, mask=k_mask, other=0.0)
-                    out += tl.sum(v_row * w[:, None], axis=0)
-                tl.store(output + pid * stride_oh + tl.arange(0, head_dim), out)
+                q_offs = tl.arange(0, head_dim)
+                q = tl.load(Q + pid * stride_qh + q_offs)
+                m = tl.full([], -1e9, tl.float32)
+                l = tl.full([], 0.0, tl.float32)
+                acc = tl.zeros([head_dim], dtype=tl.float32)
+                for start in range(0, ctx_len, BLOCK_K):
+                    k_idx = start + tl.arange(0, BLOCK_K)
+                    mask = k_idx < ctx_len
+                    k_row = tl.load(K + k_idx[:, None] * head_dim + q_offs[None, :], mask=mask[:, None], other=0.0)
+                    scores = tl.sum(q[None, :] * k_row, axis=1)
+                    scores = tl.where(mask, scores, -1e9)
+                    block_max = tl.max(scores, axis=0)
+                    new_m = tl.maximum(m, block_max)
+                    alpha = tl.exp(m - new_m)
+                    beta = tl.exp(scores - new_m)
+                    v_row = tl.load(V + k_idx[:, None] * head_dim + q_offs[None, :], mask=mask[:, None], other=0.0)
+                    acc = acc * alpha + tl.sum(beta[:, None] * v_row, axis=0)
+                    l = l * alpha + tl.sum(beta, axis=0)
+                    m = new_m
+                out = acc / l
+                tl.store(output + pid * stride_oh + q_offs, out)
         """)
     else:
         raise ValueError(f"Unknown op: {op}")
@@ -396,7 +464,11 @@ def compile_kernel(op: str, profile: str, params: dict, output_dir: Path, repo_r
     build_dir.mkdir(parents=True, exist_ok=True)
     air_project = Path(tempfile.mkdtemp(prefix=f"ggnpu_{op}_{profile}_", dir=str(build_dir)))
 
-    env = setup_compile_env(repo_root)
+    try:
+        env = setup_compile_env(repo_root)
+    except RuntimeError as e:
+        print(f"  ERROR: {e}")
+        return False
     env["AMD_TRITON_NPU_TARGET"] = target
     env["AMD_TRITON_NPU_OUTPUT_FORMAT"] = "xclbin"
     env["AMD_TRITON_NPU_COMPILE_ONLY"] = "1"

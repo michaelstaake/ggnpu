@@ -173,6 +173,24 @@ The setup script installs `triton-xdna` plus transitive wheels (mlir-air, mlir-a
 
 Requires `libxrt-dev` (or `third_party/xrt-dev/`) and `uuid-dev` headers for the compile-only launcher build.
 
+Triton-XDNA expects a unified XRT SDK tree (`include/xrt` + `lib`) via `XILINX_XRT`. If you see *"XRT development files not found"* with a Windows path in the error:
+
+```bash
+# Option A — system packages (recommended on NPU host)
+sudo apt install libxrt-dev uuid-dev
+export XILINX_XRT=/opt/xilinx/xrt   # if present after apt install
+
+# Option B — let compile_kernels.py build a shim from /usr/include/xrt
+# (automatic when libxrt-dev is installed but /opt/xilinx/xrt is missing)
+
+# Option C — repo-bundled headers (no apt)
+export XILINX_XRT=$PWD/third_party/xrt-dev/usr
+export CPLUS_INCLUDE_PATH=$XILINX_XRT/include:$PWD/third_party/uuid-dev/usr/include
+export LIBRARY_PATH=$XILINX_XRT/lib/x86_64-linux-gnu
+```
+
+`build-kernels.sh` checks for XRT before compiling and prints which path it will use.
+
 ### Build ggnpu kernels
 
 ```bash
