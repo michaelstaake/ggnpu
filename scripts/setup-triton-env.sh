@@ -40,9 +40,15 @@ echo "Upgrading pip..."
 python -m pip install --upgrade pip wheel
 
 # Point at local XRT headers when system libxrt-dev is unavailable
-if [ -z "${XILINX_XRT:-}" ] && [ -d "${SCRIPT_DIR}/third_party/xrt-dev/usr/include/xrt" ]; then
-    export XILINX_XRT="${SCRIPT_DIR}/third_party/xrt-dev/usr"
-    echo "Using XRT headers from: $XILINX_XRT"
+if [ -z "${XILINX_XRT:-}" ]; then
+    if [ -d "${SCRIPT_DIR}/third_party/xrt-dev/usr/include/xrt" ]; then
+        export XILINX_XRT="${SCRIPT_DIR}/third_party/xrt-dev/usr"
+        echo "Using XRT headers from: $XILINX_XRT"
+    elif ! bash "${SCRIPT_DIR}/scripts/fetch-xrt-dev.sh" --check 2>/dev/null; then
+        echo "NOTE: XRT dev headers not found yet."
+        echo "  Kernel builds will run: bash scripts/fetch-xrt-dev.sh"
+        echo "  Or install: sudo apt install libxrt-dev uuid-dev"
+    fi
 fi
 
 PIP_ARGS=(install -r "$SCRIPT_DIR/requirements-triton.txt")

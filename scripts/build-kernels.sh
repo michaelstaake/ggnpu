@@ -113,24 +113,51 @@ fi
 echo "Triton-XDNA: $PYTHON3_BIN"
 
 # XRT dev headers required for Triton-XDNA compile-only launcher build
-if [ -n "${XILINX_XRT:-}" ] && [ -d "${XILINX_XRT}/include/xrt" ] && [ -d "${XILINX_XRT}/lib" ]; then
-    echo "XRT SDK: $XILINX_XRT"
-elif [ -d /opt/xilinx/xrt/include/xrt ] && [ -d /opt/xilinx/xrt/lib ]; then
-    export XILINX_XRT=/opt/xilinx/xrt
-    echo "XRT SDK: $XILINX_XRT"
-elif [ -d "$SCRIPT_DIR/third_party/xrt-dev/usr/include/xrt" ]; then
-    export XILINX_XRT="$SCRIPT_DIR/third_party/xrt-dev/usr"
-    echo "XRT SDK: $XILINX_XRT (third_party)"
-elif [ -d /usr/include/xrt ]; then
-    echo "XRT SDK: will use system headers via build/xrt-sdk-shim (compile_kernels.py)"
-else
+resolve_xrt_sdk() {
+    if [ -n "${XILINX_XRT:-}" ] && [ -d "${XILINX_XRT}/include/xrt" ] && [ -d "${XILINX_XRT}/lib" ]; then
+        echo "$XILINX_XRT"
+        return 0
+    fi
+    if [ -d /opt/xilinx/xrt/include/xrt ] && [ -d /opt/xilinx/xrt/lib ]; then
+        echo /opt/xilinx/xrt
+        return 0
+    fi
+    if [ -d "$SCRIPT_DIR/third_party/xrt-dev/usr/include/xrt" ] \
+        && [ -d "$SCRIPT_DIR/third_party/xrt-dev/usr/lib" ]; then
+        echo "$SCRIPT_DIR/third_party/xrt-dev/usr"
+        return 0
+    fi
+    if [ -d /usr/include/xrt ]; then
+        echo "shim"
+        return 0
+    fi
+    return 1
+}
+
+XRT_SDK="$(resolve_xrt_sdk || true)"
+if [ -z "$XRT_SDK" ]; then
+    echo "XRT dev headers not found — fetching libxrt-dev into third_party/ ..."
+    if bash "$SCRIPT_DIR/scripts/fetch-xrt-dev.sh"; then
+        XRT_SDK="$(resolve_xrt_sdk || true)"
+    fi
+fi
+
+if [ -z "$XRT_SDK" ]; then
     echo "ERROR: XRT development files not found"
     echo ""
     echo "  Triton-XDNA kernel builds need libxrt-dev headers + libraries."
-    echo "  Install: sudo apt install libxrt-dev uuid-dev"
-    echo "  Or set:  export XILINX_XRT=/opt/xilinx/xrt"
+    echo "  Option A: sudo apt install libxrt-dev uuid-dev"
+    echo "  Option B: bash scripts/fetch-xrt-dev.sh   # extract debs to third_party/"
+    echo "  Option C: export XILINX_XRT=/opt/xilinx/xrt"
     echo ""
     exit 1
+fi
+
+if [ "$XRT_SDK" = "shim" ]; then
+    echo "XRT SDK: system headers via build/xrt-sdk-shim (compile_kernels.py)"
+else
+    export XILINX_XRT="$XRT_SDK"
+    echo "XRT SDK: $XILINX_XRT"
 fi
 
 if [ ! -f "$COMPILE_SCRIPT" ]; then

@@ -171,7 +171,16 @@ source ~/triton-env/bin/activate   # or: source .venv-triton/bin/activate
 
 The setup script installs `triton-xdna` plus transitive wheels (mlir-air, mlir-aie, llvm-aie/Peano) via GitHub find-links. You can also install system-wide on Ubuntu 24.04+ with `pip install triton-xdna --break-system-packages` and the same find-links URLs from [README.md](../README.md).
 
-Requires `libxrt-dev` (or `third_party/xrt-dev/`) and `uuid-dev` headers for the compile-only launcher build.
+Requires `libxrt-dev` (or `third_party/xrt-dev/`) and `uuid-dev` headers for the compile-only launcher build. Runtime packages (`libxrt2`, `libxrt-npu2`) alone are not enough — you need the **-dev** headers.
+
+If you have runtime XRT but not `libxrt-dev`, extract headers without sudo:
+
+```bash
+bash scripts/fetch-xrt-dev.sh
+export XILINX_XRT=$PWD/third_party/xrt-dev/usr
+```
+
+`build-kernels.sh` runs `fetch-xrt-dev.sh` automatically when headers are missing.
 
 Triton-XDNA expects a unified XRT SDK tree (`include/xrt` + `lib`) via `XILINX_XRT`. If you see *"XRT development files not found"* with a Windows path in the error:
 
