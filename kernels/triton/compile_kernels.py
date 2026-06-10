@@ -746,7 +746,10 @@ def compile_kernel(op: str, profile: str, params: dict, output_dir: Path, repo_r
         if result.returncode != 0:
             print("  Triton compile returned non-zero; trying aircc fallback...")
             if result.stderr:
-                print(extract_compiler_error(result.stderr))
+                if os.environ.get("GGNPU_DEBUG"):
+                    print(result.stderr)
+                else:
+                    print(extract_compiler_error(result.stderr))
             run_aircc_fallback(air_project, env)
     except subprocess.TimeoutExpired:
         print("  ERROR: Compilation timed out")
