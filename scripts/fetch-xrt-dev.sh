@@ -14,14 +14,16 @@ UUID_ROOT="$SCRIPT_DIR/third_party/uuid-dev/usr"
 DL_DIR="$SCRIPT_DIR/build/xrt-deb-cache"
 
 have_headers() {
-    test -f "$XRT_ROOT/include/xrt/xrt_bo.h" && test -d "$XRT_ROOT/lib"
+    test -f "$XRT_ROOT/include/xrt/xrt_bo.h" && test -d "$XRT_ROOT/lib" \
+        && test -f "$UUID_ROOT/include/uuid/uuid.h"
 }
 
 if [ "${1:-}" = "--check" ]; then
     if have_headers; then
         exit 0
     fi
-    if test -f /usr/include/xrt/xrt_bo.h || test -f /opt/xilinx/xrt/include/xrt/xrt_bo.h; then
+    if { test -f /usr/include/xrt/xrt_bo.h || test -f /opt/xilinx/xrt/include/xrt/xrt_bo.h; } \
+        && test -f /usr/include/uuid/uuid.h; then
         exit 0
     fi
     exit 1
@@ -34,8 +36,8 @@ if have_headers; then
     exit 0
 fi
 
-if test -f /usr/include/xrt/xrt_bo.h; then
-    echo "System libxrt-dev already installed (/usr/include/xrt)"
+if test -f /usr/include/xrt/xrt_bo.h && test -f /usr/include/uuid/uuid.h; then
+    echo "System libxrt-dev + uuid-dev already installed"
     exit 0
 fi
 

@@ -79,6 +79,25 @@ def _valid_xrt_root(path: Path) -> bool:
     return (path / "include/xrt").is_dir() and (path / "lib").is_dir()
 
 
+def _is_drvfs(path: Path) -> bool:
+    """True when path lives on a Windows mount (WSL drvfs). Symlinks there are unreliable."""
+    try:
+        return path.resolve().as_posix().startswith("/mnt/")
+    except OSError:
+        return False
+
+
+def _is_wsl() -> bool:
+    return Path("/proc/version").is_file() and "microsoft" in Path("/proc/version").read_text().lower()
+
+
+def _shim_root(repo_root: Path) -> Path:
+    # WSL users often clone under /mnt/c — keep the shim on the Linux filesystem.
+    if _is_drvfs(repo_root) or _is_wsl():
+        return Path.home() / ".cache/ggnpu" / "xrt-sdk-shim"
+    return repo_root / "build" / "xrt-sdk-shim"
+
+
 def _linker_lib_names() -> tuple[str, ...]:
     return ("libxrt_coreutil.so", "libuuid.so")
 
@@ -92,21 +111,36 @@ def _can_link_lib(lib_dir: Path, base: str) -> bool:
     return any(lib_dir.glob(f"{base}.so.*"))
 
 
-def _ensure_dev_symlinks(lib_dir: Path, dest_lib_dir: Path) -> None:
-    """Symlink runtime .so.N files and add unversioned .so names for -l flags."""
+def _materialize_lib(src: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        return
+    shutil.copy2(src.resolve(), dest, follow_symlinks=True)
+
+
+def _ensure_dev_symlinks(lib_dir: Path, dest_lib_dir: Path, *, materialize: bool) -> None:
+    """Populate dest with XRT/uuid libs; copy on WSL drvfs instead of symlinking."""
     dest_lib_dir.mkdir(parents=True, exist_ok=True)
     if not lib_dir.is_dir():
         return
 
     for lib in sorted(lib_dir.glob("libxrt*.so*")) + sorted(lib_dir.glob("libuuid.so*")):
-        link = dest_lib_dir / lib.name
-        if not link.exists():
-            link.symlink_to(lib.resolve())
+        dest = dest_lib_dir / lib.name
+        if dest.exists():
+            continue
+        if materialize:
+            _materialize_lib(lib, dest)
+        else:
+            dest.symlink_to(lib.resolve())
 
     for lib in sorted(dest_lib_dir.glob("*.so.*")):
         base = lib.name.split(".so.", 1)[0] + ".so"
         unversioned = dest_lib_dir / base
-        if not unversioned.exists():
+        if unversioned.exists():
+            continue
+        if materialize:
+            _materialize_lib(lib, unversioned)
+        else:
             unversioned.symlink_to(lib.name)
 
 
@@ -129,15 +163,19 @@ def find_xilinx_xrt(repo_root: Path) -> Path | None:
     # Triton expects a unified tree — build a shim under build/xrt-sdk-shim.
     usr_inc = Path("/usr/include/xrt")
     if usr_inc.is_dir():
-        shim = repo_root / "build" / "xrt-sdk-shim"
+        shim = _shim_root(repo_root)
         shim_inc = shim / "include" / "xrt"
         shim_lib = shim / "lib"
+        materialize = _is_drvfs(shim) or _is_drvfs(repo_root) or _is_wsl()
         shim.mkdir(parents=True, exist_ok=True)
         (shim / "include").mkdir(parents=True, exist_ok=True)
         shim_lib.mkdir(parents=True, exist_ok=True)
 
         if not shim_inc.exists():
-            shim_inc.symlink_to(usr_inc.resolve(), target_is_directory=True)
+            if materialize:
+                shutil.copytree(usr_inc, shim_inc, dirs_exist_ok=True, symlinks=True)
+            else:
+                shim_inc.symlink_to(usr_inc.resolve(), target_is_directory=True)
 
         lib_dirs = [
             Path("/usr/lib/x86_64-linux-gnu"),
@@ -145,7 +183,7 @@ def find_xilinx_xrt(repo_root: Path) -> Path | None:
             Path("/opt/xilinx/xrt/lib"),
         ]
         for lib_dir in lib_dirs:
-            _ensure_dev_symlinks(lib_dir, shim_lib)
+            _ensure_dev_symlinks(lib_dir, shim_lib, materialize=materialize)
 
         if _valid_xrt_root(shim):
             return shim.resolve()
@@ -173,6 +211,124 @@ def linker_lib_search_dirs(xrt_root: Path, repo_root: Path) -> list[Path]:
             seen.add(resolved)
             unique.append(d)
     return unique
+
+
+def _python_include_dir() -> Path:
+    return Path(f"/usr/include/python{sys.version_info.major}.{sys.version_info.minor}")
+
+
+def _triton_npu_include_dir() -> Path | None:
+    for site in Path(sys.executable).parent.parent.glob(
+        "lib/python*/site-packages/triton/backends/amd_triton_npu/include"
+    ):
+        if site.is_dir():
+            return site
+    return None
+
+
+def check_python_dev_headers() -> str | None:
+    inc = _python_include_dir()
+    if inc.is_dir() and (inc / "Python.h").is_file():
+        return None
+    ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return (
+        f"Python development headers missing for {sys.executable} ({ver}).\n"
+        f"  Expected: {inc}/Python.h\n"
+        f"  Install:  sudo apt install python{ver}-dev"
+    )
+
+
+def _include_flags_for_env(env: dict[str, str], xrt_root: Path) -> list[str]:
+    flags = [f"-I{xrt_root / 'include'}"]
+    extra = env.get("CPLUS_INCLUDE_PATH", "")
+    for entry in extra.split(":"):
+        if entry and entry != str(xrt_root / "include"):
+            flags.append(f"-I{entry}")
+    return flags
+
+
+def run_launcher_link_smoke_test(env: dict[str, str], repo_root: Path) -> str | None:
+    """Run the same style of g++ link Triton uses for xrt_dispatch.exe."""
+    py_err = check_python_dev_headers()
+    if py_err:
+        return py_err
+
+    xrt_root = Path(env["XILINX_XRT"])
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    triton_inc = _triton_npu_include_dir()
+    lib_dirs = linker_lib_search_dirs(xrt_root, repo_root)
+    uuid_hdr = repo_root / "third_party/uuid-dev/usr/include/uuid/uuid.h"
+    if not uuid_hdr.is_file() and not Path("/usr/include/uuid/uuid.h").is_file():
+        return (
+            "uuid/uuid.h not found.\n"
+            "  Install: sudo apt install uuid-dev\n"
+            "  Or run:  bash scripts/fetch-xrt-dev.sh"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="ggnpu_xrt_link_") as tmp:
+        main_cxx = Path(tmp) / "main.cxx"
+        main_cxx.write_text(
+            '#include <xrt/xrt_bo.h>\n#include <Python.h>\nint main() { return 0; }\n',
+            encoding="utf-8",
+        )
+        out = Path(tmp) / "xrt_dispatch.exe"
+        cmd = [
+            "g++",
+            "-std=c++23",
+            str(main_cxx),
+            f"-I{_python_include_dir()}",
+        ]
+        if triton_inc:
+            cmd.append(f"-I{triton_inc}")
+        cmd.extend(_include_flags_for_env(env, xrt_root))
+        cmd.extend(
+            [
+                "-shared",
+                f"-lpython{py_ver}",
+                "-fPIC",
+                "-Wall",
+                "-luuid",
+                "-lxrt_coreutil",
+                "-lrt",
+                "-lstdc++",
+                "-o",
+                str(out),
+            ]
+        )
+        for lib_dir in lib_dirs:
+            cmd.extend(["-L", str(lib_dir)])
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return None
+        detail = "\n".join(line for line in (result.stdout + result.stderr).splitlines() if line.strip())
+        return detail or "g++ link smoke test failed (no compiler output)"
+
+
+def extract_compiler_error(stderr: str) -> str:
+    """Pull the most useful g++/ld lines out of a long Triton traceback."""
+    if not stderr:
+        return ""
+    lines = stderr.splitlines()
+    interesting = [
+        line
+        for line in lines
+        if any(
+            token in line
+            for token in (
+                "error:",
+                "fatal error:",
+                "cannot find",
+                "No such file",
+                "collect2:",
+                "ld returned",
+                "Command '[",
+            )
+        )
+    ]
+    if interesting:
+        return "\n".join(interesting[-20:])
+    return stderr[-4000:]
 
 
 def check_linker_prereqs(xrt_root: Path, repo_root: Path) -> str | None:
@@ -213,12 +369,22 @@ def setup_compile_env(repo_root: Path) -> dict[str, str]:
     if linker_err:
         raise RuntimeError(linker_err)
 
+    py_err = check_python_dev_headers()
+    if py_err:
+        raise RuntimeError(py_err)
+
     include_paths = [str(xrt_root / "include")]
     uuid_inc = repo_root / "third_party/uuid-dev/usr/include"
-    if uuid_inc.is_dir():
+    if (uuid_inc / "uuid/uuid.h").is_file():
         include_paths.append(str(uuid_inc))
-    elif Path("/usr/include/uuid").is_dir():
+    elif Path("/usr/include/uuid/uuid.h").is_file():
         include_paths.append("/usr/include")
+    else:
+        raise RuntimeError(
+            "uuid/uuid.h not found. XRT headers require uuid-dev.\n"
+            "  Install: sudo apt install uuid-dev\n"
+            "  Or run:  bash scripts/fetch-xrt-dev.sh"
+        )
     env["CPLUS_INCLUDE_PATH"] = ":".join(include_paths + ([env["CPLUS_INCLUDE_PATH"]] if env.get("CPLUS_INCLUDE_PATH") else []))
 
     lib_paths = [str(d) for d in linker_lib_search_dirs(xrt_root, repo_root)]
@@ -538,6 +704,19 @@ def compile_kernel(op: str, profile: str, params: dict, output_dir: Path, repo_r
     print(f"Compiling {op}: {KERNELS[op]['description']}")
     print(f"  profile={profile} target={target}")
     print(f"  transform={transform.name}")
+    if _is_wsl():
+        print("  note: WSL detected — using native Linux XRT shim under ~/.cache/ggnpu/")
+    print(f"  XILINX_XRT={env['XILINX_XRT']}")
+
+    link_err = run_launcher_link_smoke_test(env, repo_root)
+    if link_err:
+        print("  ERROR: Triton launcher link preflight failed (g++):")
+        for line in link_err.splitlines():
+            print(f"    {line}")
+        if _is_wsl() and _is_drvfs(repo_root):
+            print("  Hint: clone ggnpu under the Linux home dir (~/ggnpu), not /mnt/c/...")
+        print("  Run: bash scripts/verify-kernel-build.sh")
+        return False
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=f"_{op}_compile.py", delete=False) as f:
         f.write(build_kernel_script(op, params))
@@ -563,7 +742,7 @@ def compile_kernel(op: str, profile: str, params: dict, output_dir: Path, repo_r
         if result.returncode != 0:
             print("  Triton compile returned non-zero; trying aircc fallback...")
             if result.stderr:
-                print(result.stderr[-2000:])
+                print(extract_compiler_error(result.stderr))
             run_aircc_fallback(air_project, env)
     except subprocess.TimeoutExpired:
         print("  ERROR: Compilation timed out")

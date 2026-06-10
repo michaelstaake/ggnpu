@@ -127,7 +127,7 @@ resolve_xrt_sdk() {
         echo "$SCRIPT_DIR/third_party/xrt-dev/usr"
         return 0
     fi
-    if [ -d /usr/include/xrt ]; then
+    if [ -d /usr/include/xrt ] && [ -f /usr/include/uuid/uuid.h ]; then
         echo "shim"
         return 0
     fi
@@ -136,7 +136,7 @@ resolve_xrt_sdk() {
 
 XRT_SDK="$(resolve_xrt_sdk || true)"
 if [ -z "$XRT_SDK" ]; then
-    echo "XRT dev headers not found — fetching libxrt-dev into third_party/ ..."
+    echo "XRT/uuid dev headers not found — fetching libxrt-dev + uuid-dev into third_party/ ..."
     if bash "$SCRIPT_DIR/scripts/fetch-xrt-dev.sh"; then
         XRT_SDK="$(resolve_xrt_sdk || true)"
     fi
@@ -154,7 +154,11 @@ if [ -z "$XRT_SDK" ]; then
 fi
 
 if [ "$XRT_SDK" = "shim" ]; then
-    echo "XRT SDK: system headers via build/xrt-sdk-shim (compile_kernels.py)"
+    echo "XRT SDK: system headers via ~/.cache/ggnpu/xrt-sdk-shim (compile_kernels.py)"
+    if grep -qi microsoft /proc/version 2>/dev/null && [[ "$SCRIPT_DIR" == /mnt/* ]]; then
+        echo "WARNING: WSL repo on /mnt/c — move to ~/ggnpu (native Linux FS) if builds fail."
+        echo "  Run: bash scripts/verify-kernel-build.sh"
+    fi
 else
     export XILINX_XRT="$XRT_SDK"
     echo "XRT SDK: $XILINX_XRT"
