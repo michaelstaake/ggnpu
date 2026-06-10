@@ -57,6 +57,19 @@ for candidate in \
     fi
 done
 
+# Fallback: wheel build may place aiecc under python/compiler/ or tools/ instead of install/
+if [ -z "$AIE_HOME" ]; then
+    for candidate in \
+        "$MLIR_AIE_SRC/python/compiler" \
+        "$MLIR_AIE_SRC/tools" \
+        "$MLIR_AIE_SRC"; do
+        if [ -x "$candidate/aiecc" ] || [ -f "$candidate/aiecc.py" ]; then
+            AIE_HOME="$candidate"
+            break
+        fi
+    done
+fi
+
 if [ -z "$AIE_HOME" ]; then
     echo "ERROR: mlir-aie install directory not found after build" >&2
     find "$MLIR_AIE_SRC" -name 'aiecc' -o -name 'aiecc.py' 2>/dev/null | head -5 >&2 || true
@@ -66,9 +79,13 @@ fi
 echo "$AIE_HOME" > /etc/ggnpu-aie-home
 
 AIE_HOME="$(cat /etc/ggnpu-aie-home)"
-if [ ! -f "$AIE_HOME/bin/aiecc.py" ] && [ ! -x "$AIE_HOME/bin/aiecc" ]; then
-    echo "ERROR: aiecc not found under $AIE_HOME/bin" >&2
-    ls -la "$AIE_HOME/bin" 2>/dev/null || true
+# Accept aiecc anywhere under AIE_HOME (bin/, python/compiler/, tools/, or root)
+if [ ! -f "$AIE_HOME/bin/aiecc.py" ] && [ ! -x "$AIE_HOME/bin/aiecc" ] && \
+   [ ! -f "$AIE_HOME/aiecc.py" ] && [ ! -x "$AIE_HOME/aiecc" ] && \
+   [ ! -f "$AIE_HOME/python/compiler/aiecc.py" ] && [ ! -x "$AIE_HOME/python/compiler/aiecc" ] && \
+   [ ! -f "$AIE_HOME/tools/aiecc.py" ] && [ ! -x "$AIE_HOME/tools/aiecc" ]; then
+    echo "ERROR: aiecc not found under $AIE_HOME" >&2
+    find "$AIE_HOME" -name 'aiecc*' 2>/dev/null | head -5 >&2 || true
     exit 1
 fi
 
