@@ -661,7 +661,14 @@ def run_aircc_fallback(air_project: Path, env: dict[str, str]) -> None:
         "--stack-size", "2048",
         str(mlir),
     ]
-    subprocess.run(cmd, env=env, cwd=str(mlir.parent), capture_output=True, timeout=600)
+    if os.environ.get("GGNPU_DEBUG"):
+        cmd.insert(1, "-v")
+    result = subprocess.run(cmd, env=env, cwd=str(mlir.parent), capture_output=True, text=True, timeout=600)
+    if os.environ.get("GGNPU_DEBUG"):
+        print(f"  aircc fallback exit={result.returncode}")
+        out = (result.stdout or "") + (result.stderr or "")
+        for line in out.splitlines():
+            print(f"  | {line}")
 
 
 def find_artifacts(search_roots: list[Path]) -> tuple[Path | None, Path | None]:
