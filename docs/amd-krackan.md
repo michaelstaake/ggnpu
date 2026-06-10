@@ -37,15 +37,15 @@ echo '* hard memlock unlimited' | sudo tee -a /etc/security/limits.d/99-amdxdna.
 sudo usermod -aG render $USER
 ```
 
-## Docker
+## Native run
 
 ```bash
-docker run --rm \
-  --device=/dev/accel/accel0 \
-  --group-add "$(getent group render | cut -d: -f3)" \
-  --ulimit memlock=-1:-1 \
-  -v /usr/lib/firmware/amdnpu:/usr/lib/firmware/amdnpu:ro \
-  -v $HOME/.cache/ggnpu:/root/.cache/ggnpu \
-  -v /path/to/models:/models:ro \
-  ggnpu:latest -m /models/model.gguf -p "Hello"
+cmake -S . -B build-npu \
+  -DGGNPU_NPU_BACKEND=ON \
+  -DGGNPU_TEST_CPU=OFF \
+  -DGGNPU_BUILD_TESTS=ON
+cmake --build build-npu -j2
+
+./build-npu/ggnpu bench-matmul
+./build-npu/ggnpu -m models/model.gguf -p "Hello"
 ```

@@ -4,9 +4,9 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state (2025-06-09):** **Not ready to run a model on the NPU.** Phase 1 is complete (GGUF load/dump). Docker runtime image builds on Ubuntu 26.04 and opens the Krackan NPU from inside a container. **Production delivery is Docker-only** — users do not install XRT, mlir-aie, or `ggnpu` on the host. Phase 2 is blocked on xclbin kernels (builder image + `ggnpu-cache` volume). See **§7.1**.
+**Current state (2025-06-10):** **Not ready to run a model on the NPU.** Phase 1 is complete (GGUF load/dump). The project is now documented for **native host builds and runs**. Phase 2 remains blocked on validated `.xclbin` kernels for `bench-matmul` and end-to-end NPU execution. See **§7.1**.
 
-**Verdict:** Docker path is the supported product surface; Phase 2 (`bench-matmul` + xclbins via `docker/Dockerfile.builder`) is the next gate.
+**Verdict:** The supported path is now host-native: install host prerequisites, build `ggnpu` locally, and provide local `.xclbin` kernels under `~/.cache/ggnpu/xclbin/`.
 
 ---
 
@@ -18,31 +18,25 @@ Build a standalone C++20 inference binary named `ggnpu` that:
 2. Runs **all transformer tensor math** on the **AMD NPU** — matmul, attention, norms, activations, RoPE.
 3. Uses the **host CPU only** for control plane: CLI, GGUF parsing, mmap, tokenization, sampling, logging.
 4. Targets **Ubuntu 26.04 LTS** (Linux **7.0**) and **AMD Ryzen AI 7 350** (Krackan / XDNA2 / `npu6`).
-5. Ships and runs **only inside Docker** (`docker/Dockerfile`, `docker compose`). Host passes through `/dev/accel/accel0` and firmware; all toolchain and runtime deps live in the image.
-6. Ships simple user docs: `README`, `docs/docker.md`, `docs/usage.md`, and `ggnpu --help`.
+5. Builds and runs **directly on the host** with `/dev/accel/accel0`, firmware, XRT, and local `.xclbin` kernels.
+6. Ships simple user docs: `README`, `docs/host-setup-guide.md`, `docs/usage.md`, and `ggnpu --help`.
 
-### 1.1 Deployment model (Docker-only)
+### 1.1 Deployment model (native host)
 
 | Layer | Where it runs |
 |-------|----------------|
 | `amdxdna` driver, `/dev/accel/accel0` | **Host** (kernel) |
-| NPU firmware | **Host** path mounted read-only into container |
-| Docker Engine | **Host** (native Linux; not Docker Desktop VM) |
-| XRT, mlir-aie, Peano, `ggnpu` binary, `.xclbin` kernels | **Inside Docker images** |
-| Inference CLI | **`docker compose run ggnpu …`** |
+| NPU firmware | **Host** filesystem |
+| XRT runtime + headers | **Host** |
+| `ggnpu` binary | **Host build output** |
+| `.xclbin` kernels | **Host cache** (`~/.cache/ggnpu/xclbin`) |
+| Inference CLI | **`./build-npu/ggnpu ...`** |
 
-**Users must not** install `libxrt2`, `libxrt-dev`, mlir-aie, or build `ggnpu` on the host for production use.
+**Users must** install XRT and build `ggnpu` on the host.
 
-**Contributors** may still build natively for unit tests (`ctest`, CPU ref) and debugging; that path is unsupported for end users.
+**Kernel compilation** remains optional for users who already have prebuilt `.xclbin` artifacts, but native host deployment is the default path.
 
-**Images:**
-
-| Image | Dockerfile | Role |
-|-------|------------|------|
-| `ggnpu:latest` | `docker/Dockerfile` | Runtime: XRT + NPU-enabled `ggnpu` |
-| `ggnpu-builder:latest` | `docker/Dockerfile.builder` | One-shot: mlir-aie + xclbin compile → `ggnpu-cache` volume |
-
-See **§10** and `docs/docker.md`.
+See **§9** and `docs/host-setup-guide.md`.
 
 **Future (not v1):** Intel NPU backend behind the same interface.
 
@@ -175,7 +169,7 @@ NPU kernels (.xclbin):
 
 **Why XRT not raw ioctls:** Raw `DRM_IOCTL_AMDXDNA_*` requires reimplementing BO lifecycle, PASID/IOMMU SVA, ERT mailbox, firmware coupling. XRT is the official shim (like libdrm for GPU).
 
-**Docker:** Production delivery only. mlir-aie/Peano stay in `docker/Dockerfile.builder`; runtime image `docker/Dockerfile` ships `ggnpu` + XRT. xclbins live in the `ggnpu-cache` Docker volume (populated by the builder service). See `docs/docker.md`.
+**Native deployment:** Production delivery now assumes a host-native install. XRT runs on the host, `ggnpu` is built locally, and `.xclbin` kernels live in `~/.cache/ggnpu/xclbin/`. See `docs/host-setup-guide.md`.
 
 ---
 
@@ -325,7 +319,7 @@ ggnpu/
 │   ├── usage.md                   # CLI flags (≤80 lines)
 │   ├── architecture.md
 │   ├── amd-krackan.md
-│   ├── docker.md
+│   ├── host-setup-guide.md
 │   └── intel-roadmap.md
 ├── cmake/                         # FindXRT, FindPeano
 ├── third_party/                   # minimal only (xxhash, etc.)
@@ -349,9 +343,6 @@ ggnpu/
 │   ├── softmax/
 │   └── fused_attn/
 ├── tests/
-├── docker/
-│   ├── Dockerfile
-│   └── docker-compose.yml
 └── scripts/
     ├── setup-host.sh
     ├── build-kernels.sh
@@ -368,27 +359,24 @@ Work through these in order. Do not skip ahead.
 
 | Phase | Goal | Status |
 |-------|------|--------|
-| 0 Scaffold | CMake, scripts, docs | Mostly done (Docker runtime image builds; no CI) |
+| 0 Scaffold | CMake, scripts, docs | Mostly done (native host flow documented; no CI) |
 | 1 GGUF loader | Parse, mmap, dump | **Done** |
 | 2 NPU matmul smoke | `bench-matmul` on hardware | **Not done** — needs XRT, xclbins (host setup) |
 | 3 Q4_K weight path | Decode + one E2E matmul | Decoders + disk cache done; NPU E2E not validated |
 | 4 Full decoder layer | All ops on NPU | **Not done** |
 | 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — KV `-c`/cap fix done, attention dims fixed, not validated E2E |
-| 6 Production | Docker, 3B, L2 tiling | **Partial** — Docker runtime + builder images exist; xclbins not validated E2E |
+| 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; xclbins not validated E2E |
 | 7 Intel stub | Interface research | **Not started** |
 
 ### Phase 0 — Scaffold
 
 - [x] CMake project, C++20
 - [ ] CI (compile on x86; NPU tests `MANUAL`)
-- [x] `scripts/setup-host.sh` — host checks for Docker deployments (no XRT/mlir-aie install)
-- [x] `scripts/verify-npu.sh` — hardware, driver, accel0, optional Docker-oriented checks
-- [x] `docs/architecture.md`, `docs/amd-krackan.md`, `docs/docker.md`
-- [x] `docker/Dockerfile` — runtime image (Ubuntu 26.04, NPU-enabled `ggnpu`)
-- [x] `docker/Dockerfile.builder` — mlir-aie + kernel build
-- [x] `docker/docker-compose.yml` — `ggnpu` + `builder` profile
+- [x] `scripts/setup-host.sh` — host prerequisite checks and next steps
+- [x] `scripts/verify-npu.sh` — hardware, driver, accel0, XRT, cache checks
+- [x] `docs/architecture.md`, `docs/amd-krackan.md`, `docs/host-setup-guide.md`
 
-**Done when:** `docker compose build ggnpu` succeeds; host passes `verify-npu.sh` hardware checks; NPU opens inside container (`bench-matmul` reaches backend init).
+**Done when:** native configure/build succeeds; host passes `verify-npu.sh`; `./build-npu/ggnpu bench-matmul` reaches backend init on hardware.
 
 ### Phase 1 — GGUF loader
 
@@ -444,12 +432,11 @@ produces coherent text with all math on NPU.
 ### Phase 6 — Production
 
 - [ ] Llama 3.2 3B; L2-aware tiling
-- [x] Docker image + compose (`docker/Dockerfile`, `docker/Dockerfile.builder`, `docker-compose.yml`)
-- [ ] Ship validated prebuilt xclbins (builder populates `ggnpu-cache` volume; MLIR kernels still maturing)
+- [ ] Ship validated prebuilt xclbins or document local kernel build clearly
 - [ ] Clear errors: missing firmware, IOMMU off, memlock
 - [ ] `docs/usage.md`, README quick start, `ggnpu --help` in sync
 
-**Done when:** New user runs inference using only `README.md` + `docs/docker.md` (no host package installs beyond Docker + driver).
+**Done when:** New user runs inference using only `README.md` + `docs/host-setup-guide.md` on a native host install.
 
 ### Phase 7 — Intel stub (after Phase 5)
 
@@ -460,30 +447,29 @@ produces coherent text with all math on NPU.
 
 Assessment of whether the project can run a model on the NPU **today**.
 
-#### Ready (host + Docker)
+#### Ready (host-native)
 
 | Layer | Status | Notes |
 |-------|--------|-------|
 | NPU hardware | Present | PCI `1022:17f0` (Strix/Krackan) |
 | Kernel driver | Loaded | `amdxdna` module (host) |
-| Device node | Present | `/dev/accel/accel0` passed into container |
-| Firmware | Present | Bind-mount `/usr/lib/firmware/amdnpu` |
-| Docker runtime image | Builds | `docker/Dockerfile` on Ubuntu 26.04 |
-| NPU from container | Works | `NPU device opened: profile=npu6` in `docker run … bench-matmul` |
-| GGUF loading | Works | `--dump-tensors` (native dev or future container cmd) |
+| Device node | Present | `/dev/accel/accel0` on host |
+| Firmware | Present | `/usr/lib/firmware/amdnpu` |
+| Native configure/build | Works | `cmake -S . -B build-npu ...` |
+| GGUF loading | Works | `--dump-tensors` |
 | Test models | On disk | See §17 |
 
-**Host does not need:** XRT, `libxrt-dev`, mlir-aie, Peano, or a native `ggnpu` binary.
+**Host still needs:** XRT, `libxrt-dev`, and a native `ggnpu` build. `mlir-aie` and Peano are only needed to build kernels locally.
 
 #### Blocked (kernels)
 
 | Check | Status | Required |
 |-------|--------|----------|
-| `.xclbin` in `ggnpu-cache` volume | **Empty** | Run `docker compose --profile build run --rm builder` |
+| `.xclbin` in `~/.cache/ggnpu/xclbin` | **Empty** | Provide prebuilt kernels or run `./scripts/build-kernels.sh npu6 matmul` |
 | `bench-matmul` E2E | **Fails** | `matmul_npu6.xclbin` in cache volume |
 | Full inference on NPU | **Not validated** | Phase 2–5 |
 
-Production commands use **Docker only** (§10). Do **not** rely on `GGNPU_TEST_CPU=ON` — it allows silent CPU fallback, which violates §2.
+Production commands use the **native host build** (§9). Do **not** rely on `GGNPU_TEST_CPU=ON` — it allows silent CPU fallback, which violates §2.
 
 #### Known code gaps (remaining before Phase 5)
 
@@ -514,13 +500,14 @@ For Llama 3.2 1B at metadata ctx 131072: `2 × 16 × 131072 × 8 × 64 × 4 ≈ 
 #### What works today
 
 ```bash
-# Host check (no XRT/mlir-aie on host)
+# Host check
 bash scripts/verify-npu.sh
 
-# Docker runtime + NPU device open
-docker compose -f docker/docker-compose.yml build ggnpu
-docker compose -f docker/docker-compose.yml run --rm ggnpu bench-matmul
-# → opens NPU; fails until xclbins exist in ggnpu-cache volume
+# Native build + NPU device open
+cmake -S . -B build-npu -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
+cmake --build build-npu -j2
+./build-npu/ggnpu bench-matmul
+# → reaches backend init once xclbins exist locally
 
 # Contributor-only: unit tests on host CPU
 cd build && ctest
@@ -529,24 +516,20 @@ cd build && ctest
 #### What does not work today
 
 ```bash
-# Native host inference — not supported for users
-./build/ggnpu bench-matmul
-./build/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048
-
-# Docker inference — blocked until builder populates xclbins
-docker compose -f docker/docker-compose.yml run --rm ggnpu \
-  -m /models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048
+# Native host inference — still blocked until kernels are available and validated
+./build-npu/ggnpu bench-matmul
+./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048
 ```
 
-#### Minimum path to first NPU activity (Docker)
+#### Minimum path to first NPU activity (native host)
 
-1. Host: install Docker only; ensure `amdxdna`, `/dev/accel/accel0`, firmware — see §9
-2. `bash scripts/verify-npu.sh` (hardware section; ignore host XRT/mlir-aie failures)
-3. `docker compose -f docker/docker-compose.yml build ggnpu`
-4. `docker compose -f docker/docker-compose.yml build builder`
-5. `docker compose -f docker/docker-compose.yml --profile build run --rm builder` (populates `ggnpu-cache` volume)
-6. `docker compose -f docker/docker-compose.yml run --rm ggnpu bench-matmul`
-7. Inference via `docker compose run --rm ggnpu -m /models/… -p "…" -c 2048`
+1. Host: install `amdxdna`, XRT, build tools, ensure `/dev/accel/accel0`, firmware — see §9
+2. `bash scripts/setup-host.sh` and `bash scripts/verify-npu.sh`
+3. `cmake -S . -B build-npu -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON`
+4. `cmake --build build-npu -j2`
+5. Provide or build `matmul_npu6.xclbin` under `~/.cache/ggnpu/xclbin`
+6. `./build-npu/ggnpu bench-matmul`
+7. Inference via `./build-npu/ggnpu -m models/... -p "..." -c 2048`
 
 ### 7.2 Memory constraints (16 GB RAM dev machine)
 
@@ -554,8 +537,8 @@ Dev laptop has ~14 GiB RAM + 4 GiB swap. Cursor IDE can consume several GB; comb
 
 | Activity | RAM impact | Recommendation |
 |----------|------------|----------------|
-| Docker build `ggnpu` image | Low (~2–4 GB) | Fine on laptop |
-| Docker `builder` (mlir-aie + xclbins) | **Very high** (16–32 GB typical) | Runs inside container; use a machine with enough RAM |
+| Native `ggnpu` build | Low (~2–4 GB) | Fine on laptop |
+| Local mlir-aie kernel build | **Very high** (16–32 GB typical) | Use a machine with enough RAM or prebuilt kernels |
 | Load Llama 1B Q4_K_M (mmap) | ~770 MB virtual | Fine |
 | KV at **131k ctx** (current code) | **~8.6 GB** | **Will OOM** with IDE open |
 | KV at **2048 ctx** (after fix) | **~128 MB** | Comfortable |
@@ -619,19 +602,20 @@ ggnpu -m model.gguf --dump-tensors
 
 ---
 
-## 9. Host prerequisites (Docker deployments)
+## 9. Host prerequisites (native deployment)
 
-**ggnpu is Docker-only for users.** The host installs **only** what is needed to run containers with NPU passthrough. Do **not** install XRT, mlir-aie, or build `ggnpu` on the host.
+`ggnpu` is now intended to build and run on the host.
 
 ### Required on host
 
 | Item | Purpose |
 |------|---------|
 | Linux + `amdxdna` | NPU kernel driver |
-| `/dev/accel/accel0` | Passed into container via `--device` |
-| `/usr/lib/firmware/amdnpu` | Bind-mounted read-only into container |
-| Docker Engine (native Linux) | Run `ggnpu` and `ggnpu-builder` images |
-| User in `render` group | Open accel device from container (`RENDER_GID` in compose) |
+| `/dev/accel/accel0` | NPU device node |
+| `/usr/lib/firmware/amdnpu` | Firmware path |
+| `libxrt2`, `libxrt-npu2`, `libxrt-dev` | Runtime + headers |
+| CMake + C++ toolchain | Build `ggnpu` |
+| User in `render` group | Open accel device |
 | `amd_iommu=on` | Boot parameter |
 | BIOS NPU/IPU enabled | Hardware |
 
@@ -641,92 +625,57 @@ ggnpu -m model.gguf --dump-tensors
 # Driver (if not already present on your distro kernel)
 sudo apt install amdxdna-dkms   # or use distro kernel with amdxdna built-in
 
-# Docker
-sudo apt install docker.io docker-compose-v2
-sudo usermod -aG docker $USER
+# XRT + build tools
+sudo apt install libxrt2 libxrt-npu2 libxrt-dev build-essential cmake git
 
 # accel0 access
 sudo usermod -aG render $USER
 # Log out and back in
 
-# Verify hardware (does not require XRT on host)
+# Verify hardware
 lspci -vd 1022:17f0
 lsmod | grep amdxdna
 ls -la /dev/accel/accel0
 bash scripts/verify-npu.sh
 ```
 
-Copy `docker/.env.example` → `docker/.env` and set `RENDER_GID` to `$(getent group render | cut -d: -f3)`.
-
-### Not required on host
-
-- `libxrt2`, `libxrt-npu2`, `libxrt-dev`
-- mlir-aie, Peano, `aiecc.py`
-- `cmake` / native `ggnpu` build
-- `~/.cache/ggnpu` on host (use Docker volume `ggnpu-cache` instead)
-
-### Contributor native build (optional, unsupported for users)
-
-For `ctest` and debugging only:
+### Build `ggnpu`
 
 ```bash
-mkdir build && cd build
-cmake .. -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=ON
-make -j2 && ctest
+mkdir -p build-npu && cd build-npu
+cmake .. -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
+cmake --build . -j2
 ```
 
-Native NPU inference on the host is **not** a supported product path.
+### Kernel artifacts
+
+Place prebuilt `.xclbin` files in `~/.cache/ggnpu/xclbin/`, or build them locally with `mlir-aie` and Peano:
+
+```bash
+export AIE_HOME=/path/to/mlir-aie
+export PEANO_HOME=/path/to/peano
+./scripts/build-kernels.sh npu6 matmul
+```
 
 ---
 
-## 10. Docker (production)
+## 10. Native run flow
 
-**All user-facing commands run inside Docker.** See `docs/docker.md` for the full guide.
+**All user-facing commands now run on the host.** See `docs/host-setup-guide.md` for the full guide.
 
 ### Quick start
 
 ```bash
-cp docker/.env.example docker/.env
+cmake -S . -B build-npu -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
+cmake --build build-npu -j2
+./scripts/build-kernels.sh npu6 matmul
 
-docker compose -f docker/docker-compose.yml build ggnpu
-docker compose -f docker/docker-compose.yml build builder
-docker compose -f docker/docker-compose.yml --profile build run --rm builder
-
-docker compose -f docker/docker-compose.yml run --rm ggnpu bench-matmul
-docker compose -f docker/docker-compose.yml run --rm ggnpu \
-  -m /models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048 -n 32
+./build-npu/ggnpu bench-matmul
+./build-npu/ggnpu \
+  -m models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048 -n 32
 ```
 
-### Images
-
-| Image | Dockerfile | Contents |
-|-------|------------|----------|
-| `ggnpu:latest` | `docker/Dockerfile` | Ubuntu 26.04, XRT runtime, NPU-enabled `ggnpu` |
-| `ggnpu-builder:latest` | `docker/Dockerfile.builder` | mlir-aie toolchain + kernel compile |
-
-### Volumes
-
-| Volume | Purpose |
-|--------|---------|
-| `ggnpu-cache` | Shared xclbin cache (`/root/.cache/ggnpu/xclbin` in container) |
-| `../models` | GGUF models (read-only bind mount) |
-
-### Manual `docker run`
-
-```bash
-RENDER_GID="$(getent group render | cut -d: -f3)"
-
-docker run --rm \
-  --device=/dev/accel/accel0 \
-  --group-add "${RENDER_GID}" \
-  --ulimit memlock=-1:-1 \
-  -v /usr/lib/firmware/amdnpu:/usr/lib/firmware/amdnpu:ro \
-  -v ggnpu-cache:/root/.cache/ggnpu \
-  -v "$(pwd)/models:/models:ro" \
-  ggnpu:latest bench-matmul
-```
-
-**Requirements:** native `docker.io` on Linux (not Docker Desktop VM). Host provides driver + firmware only.
+**Requirements:** XRT installed on the host, `render` group membership, memlock configured, and local `.xclbin` kernels available.
 
 ---
 
@@ -791,14 +740,14 @@ Do not promise CUDA-class speed in v1.
 
 ## 15. Definition of done (v1)
 
-On **Ubuntu 26.04** + **Ryzen AI 7 350**, **via Docker only**:
+On **Ubuntu 24.04 or 26.04** + **Ryzen AI 7 350**, via the native host flow:
 
-1. User installs Docker and NPU driver on host (§9); no XRT/mlir-aie on host.
-2. User builds/pulls `ggnpu:latest` and runs the builder once for xclbins.
+1. User installs the NPU driver, XRT, and build prerequisites on host (§9).
+2. User builds `ggnpu` locally.
 3. User downloads a stock HuggingFace GGUF into `models/`.
-4. User runs `docker compose … run --rm ggnpu -m /models/model.gguf -p "…"` with no preprocessing.
-5. Model generates coherent text with transformer math on the NPU.
-6. `README`, `docs/docker.md`, and `ggnpu --help` explain how to run it.
+4. User provides or builds required `.xclbin` kernels locally.
+5. User runs `./build-npu/ggnpu -m models/model.gguf -p "..."` with no preprocessing.
+6. `README`, `docs/host-setup-guide.md`, and `ggnpu --help` explain how to run it.
 
 ---
 
@@ -822,13 +771,13 @@ When generating NPU kernel code (`kernels/amd/`), **always** apply the four guar
 - **No branches:** Zero `if/else`/`switch`/`while` in hot loops. Predication or lookup tables only.
 - **Two layers:** Control code (IRON API, DMA setup) never contains tensor math. Kernel code (Peano ELF) never handles DMA or launch.
 
-**Start here (2025-06-09):** Phase 1 gate passed. Docker runtime opens NPU from container. Next work, in order:
+**Start here (2025-06-10):** Phase 1 gate passed. Native host setup is now the documented path. Next work, in order:
 
-1. **Docker builder (Phase 2):** `docker compose --profile build run --rm builder` → populate `ggnpu-cache` with `matmul_npu6.xclbin`.
-2. **Phase 2 smoke:** `docker compose run --rm ggnpu bench-matmul` must pass with correct output.
-3. **Phase 3 E2E:** One `ffn_gate` matmul from GGUF on NPU vs CPU ref (in container).
-4. **Phases 4–5:** Full layer + inference MVP via `docker compose run --rm ggnpu -m /models/llama-3.2-1b-q4_k_m.gguf …`.
-5. **Docs:** Keep `README.md`, `docs/docker.md`, and §9–§10 aligned — **Docker-only** for users; native build is contributor-only.
+1. **Kernel availability (Phase 2):** provide or build `matmul_npu6.xclbin` under `~/.cache/ggnpu/xclbin`.
+2. **Phase 2 smoke:** `./build-npu/ggnpu bench-matmul` must pass with correct output.
+3. **Phase 3 E2E:** One `ffn_gate` matmul from GGUF on NPU vs CPU ref.
+4. **Phases 4–5:** Full layer + inference MVP via `./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf ...`.
+5. **Docs:** Keep `README.md`, `docs/host-setup-guide.md`, and §9–§10 aligned for native host usage.
 
 See §7.1 for full blocker list and §7.2 for RAM constraints.
 

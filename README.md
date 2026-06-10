@@ -2,21 +2,20 @@
 
 Run GGUF models on AMD NPUs (Krackan / XDNA2).
 
-## Docker required
+## Native host setup
 
-**ggnpu runs only inside Docker.** Do not install XRT, mlir-aie, Peano, or build `ggnpu` on the host.
+`ggnpu` is now intended to be built and run directly on the host.
 
-The container includes the `ggnpu` binary, XRT libraries, and (after a one-time builder step) NPU kernel artifacts. The host only provides the NPU driver and passes the device into the container.
+### Host prerequisites
 
-### Host prerequisites (minimal)
-
-| Required on host | Not required on host |
-|------------------|----------------------|
-| Linux with `amdxdna` loaded | XRT (`libxrt2`, `libxrt-dev`) |
-| `/dev/accel/accel0` | mlir-aie / Peano |
-| `/usr/lib/firmware/amdnpu` | `cmake`, native `ggnpu` build |
-| Native Docker (not Docker Desktop VM) | `render` group name inside container (use GID; see below) |
-| User in host `render` group | |
+| Required on host | Notes |
+|------------------|-------|
+| Linux with `amdxdna` loaded | Ryzen AI / XDNA-capable host |
+| `/dev/accel/accel0` | NPU device node |
+| `/usr/lib/firmware/amdnpu` | Firmware directory |
+| XRT runtime and headers | `libxrt2`, `libxrt-npu2`, `libxrt-dev` |
+| CMake and C++ toolchain | `cmake`, `g++`, `make` or Ninja |
+| User in host `render` group | Required to open the accel device |
 
 BIOS: NPU/IPU enabled. Boot: `amd_iommu=on`.
 
@@ -26,43 +25,43 @@ BIOS: NPU/IPU enabled. Boot: `amd_iommu=on`.
 git clone https://github.com/michaelstaake/ggnpu.git
 cd ggnpu
 
-# Copy and set your render group GID (usually 990)
-cp docker/.env.example docker/.env
+# Verify host prerequisites
+bash scripts/setup-host.sh
+bash scripts/verify-npu.sh
 
-# Build runtime image
-docker compose -f docker/docker-compose.yml build ggnpu
-
-# One-time: build NPU kernels inside Docker (30–90 min first run)
-docker compose -f docker/docker-compose.yml build builder
-docker compose -f docker/docker-compose.yml --profile build run --rm builder
+# Build ggnpu with the NPU backend
+cmake -S . -B build-npu \
+  -DGGNPU_NPU_BACKEND=ON \
+  -DGGNPU_TEST_CPU=OFF \
+  -DGGNPU_BUILD_TESTS=ON
+cmake --build build-npu -j2
 
 # Smoke test
-docker compose -f docker/docker-compose.yml run --rm ggnpu bench-matmul
+./build-npu/ggnpu bench-matmul
+
+# Optional: build xclbin kernels locally if ~/.cache/ggnpu/xclbin is empty
+# export AIE_HOME=/path/to/mlir-aie
+# export PEANO_HOME=/path/to/peano
+# ./scripts/build-kernels.sh npu6 matmul
 
 # Inference (put GGUF files in models/)
-docker compose -f docker/docker-compose.yml run --rm ggnpu \
-  -m /models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048 -n 32
+./build-npu/ggnpu \
+  -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048 -n 32
 ```
 
-Helper script:
+Full host setup details: [docs/host-setup-guide.md](docs/host-setup-guide.md)
+
+### Verify host
 
 ```bash
-./docker/build.sh all    # build images + populate kernel cache
-./docker/build.sh bench  # bench-matmul in container
-```
-
-Full details: [docs/docker.md](docs/docker.md)
-
-### Verify host (optional)
-
-```bash
+bash scripts/setup-host.sh
 bash scripts/verify-npu.sh
 ```
 
-Checks hardware, driver, and Docker-related host items. It does **not** require XRT or mlir-aie on the host.
+These scripts check hardware, driver, permissions, XRT, and the local xclbin cache.
 
 ---
 
 **Implementation spec:** [IMPLEMENTATION.md](IMPLEMENTATION.md) — complete handoff for contributors and AI agents.
 
-**Native builds:** For development and unit tests only (`ctest` on CPU). Production NPU inference is Docker-only.
+**Kernel builds:** Local kernel compilation still requires `mlir-aie` and Peano. If you already have prebuilt `.xclbin` files, place them under `~/.cache/ggnpu/xclbin/`.

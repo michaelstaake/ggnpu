@@ -92,7 +92,7 @@ if [ -n "${AIE_HOME:-}" ]; then
         AIECC_PATH="$AIE_HOME/bin/aiecc.py"
     else
         echo "ERROR: AIE_HOME=$AIE_HOME but bin/aiecc or bin/aiecc.py not found"
-        echo "  mlir-aie is not installed. See docs/docker.md or docs/host-setup-guide.md"
+        echo "  mlir-aie is not installed. See docs/host-setup-guide.md"
         exit 1
     fi
 elif command -v aiecc >/dev/null 2>&1; then

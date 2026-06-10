@@ -1,11 +1,10 @@
 #!/bin/bash
-# Host prerequisite checks for Docker-based GGNPU deployments.
-# ggnpu runs ONLY inside Docker — this script does NOT install XRT or mlir-aie.
-# Run on Ubuntu 26.04 with AMD Ryzen AI 7 350
+# Host prerequisite checks for native GGNPU deployments.
+# Run on Ubuntu 24.04 or 26.04 with an AMD Ryzen AI NPU.
 
 set -e
 
-echo "=== GGNPU Host Setup (Docker deployments) ==="
+echo "=== GGNPU Host Setup (native host) ==="
 
 # Check NPU hardware
 echo ""
@@ -87,12 +86,12 @@ fi
 echo ""
 echo "=== Setup Complete ==="
 echo ""
-echo "Next steps (Docker — do not install XRT/mlir-aie on host):"
-echo "  1. Install Docker: sudo apt install docker.io docker-compose-v2"
-echo "  2. Add to groups: sudo usermod -aG docker,render \$USER  (re-login)"
-echo "  3. cp docker/.env.example docker/.env  # set RENDER_GID"
-echo "  4. docker compose -f docker/docker-compose.yml build ggnpu"
-echo "  5. docker compose -f docker/docker-compose.yml --profile build run --rm builder"
-echo "  6. docker compose -f docker/docker-compose.yml run --rm ggnpu bench-matmul"
+echo "Next steps (native host):"
+echo "  1. Install build deps: sudo apt install build-essential cmake git libxrt2 libxrt-npu2 libxrt-dev"
+echo "  2. Add to render group: sudo usermod -aG render \$USER  (re-login)"
+echo "  3. Build: cmake -S . -B build-npu -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON"
+echo "  4. Compile: cmake --build build-npu -j2"
+echo "  5. If needed, build kernels: AIE_HOME=... PEANO_HOME=... ./scripts/build-kernels.sh npu6 matmul"
+echo "  6. Run: ./build-npu/ggnpu bench-matmul"
 echo ""
-echo "See README.md and docs/docker.md"
+echo "See README.md and docs/host-setup-guide.md"

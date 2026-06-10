@@ -1,28 +1,32 @@
-# Host Setup Guide for GGNPU NPU Development
+# Host Setup Guide for GGNPU
 
-This guide walks through the complete host setup required to build and run GGNPU with the AMD XDNA NPU backend.
+This guide walks through the host setup required to build and run `ggnpu` directly on an AMD XDNA NPU system.
 
 ## Prerequisites
 
-- Ubuntu 24.04 or 26.04 (tested on 26.04)
+- Ubuntu 24.04 or 26.04
 - AMD Ryzen AI processor (Strix Point / Krackan)
 - `lspci -vd 1022:17f0` shows the NPU device
 - `lsmod | grep amdxdna` shows the kernel driver loaded
 
-## Step 1: Install XRT
+## Step 1: Install build and runtime dependencies
 
 ```bash
+# Core build tools
+sudo apt update
+sudo apt install build-essential cmake git
+
 # Add AMD XRT PPA (if available)
 sudo add-apt-repository ppa:amd-team/xrt
 sudo apt update
 
 # Install XRT packages
-sudo apt install libxrt2 libxrt-npu2 amdxdna-dkms
+sudo apt install libxrt2 libxrt-npu2 libxrt-dev amdxdna-dkms
 
 # If PPA is not available, download from AMD's XRT releases:
 # https://github.com/Xilinx/XRT/releases
 # Then:
-# sudo dpkg -i libxrt2*.deb libxrt-npu2*.deb
+# sudo dpkg -i libxrt2*.deb libxrt-npu2*.deb libxrt-dev*.deb
 ```
 
 Verify installation:
@@ -85,7 +89,7 @@ echo "Groups: $(groups)"
 echo "XRT: $(ls /opt/xilinx/xrt/setup.sh 2>/dev/null || echo 'NOT FOUND')"
 ```
 
-## Step 6: Verify NPU Readiness
+## Step 6: Verify NPU readiness
 
 Run the repository's verification script:
 
@@ -124,7 +128,7 @@ Passed: 10
 Failed: 0
 ```
 
-## Step 7: Build with NPU Backend
+## Step 7: Build with the NPU backend
 
 ```bash
 # Create build directory
@@ -139,10 +143,26 @@ cmake .. -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
 #   CPU ref backend:    OFF
 
 # Build
-make -j2
+cmake --build . -j2
 ```
 
-## Step 8: Run Benchmark
+## Step 8: Provide kernels
+
+`bench-matmul` and NPU inference need `.xclbin` kernel artifacts in `~/.cache/ggnpu/xclbin/`.
+
+If you already have prebuilt kernels, copy them there.
+
+To build them locally, install `mlir-aie` and Peano, then run:
+
+```bash
+export AIE_HOME=/path/to/mlir-aie
+export PEANO_HOME=/path/to/peano
+./scripts/build-kernels.sh npu6 matmul
+```
+
+On lower-memory machines, use prebuilt `xclbin` files if available.
+
+## Step 9: Run benchmark
 
 ```bash
 # Run matmul benchmark (Phase 2 smoke test)
@@ -174,7 +194,7 @@ dpkg -l | grep xrt
 # Check if setup.sh exists
 ls -la /opt/xilinx/xrt/setup.sh
 
-# Source XRT environment manually
+# Source XRT environment manually if needed
 source /opt/xilinx/xrt/setup.sh
 ```
 
@@ -217,12 +237,12 @@ cat /proc/cmdline | grep iommu
 # Check cache directory
 ls -la ~/.cache/ggnpu/xclbin/
 
-# If empty, you need to build kernels:
-# Option A: Use prebuilt xclbins (recommended for 16GB RAM machines)
-# Option B: Build with mlir-aie (requires >32GB RAM)
+# If empty, you need to provide kernels:
+# Option A: Use prebuilt xclbins
+# Option B: Build with mlir-aie
 #   export AIE_HOME=/path/to/mlir-aie
-#   cmake .. -DGGNPU_BUILD_KERNELS=ON
-#   make build_npu_kernels
+#   export PEANO_HOME=/path/to/peano
+#   ./scripts/build-kernels.sh npu6 matmul
 ```
 
 ## Next Steps After Setup
