@@ -87,7 +87,7 @@ if [ -n "$TRITON_PY" ]; then
         bad "triton-xdna not importable in venv"
         echo "         bash scripts/setup-triton-env.sh"
     fi
-    if "$TRITON_PY" -c "import importlib.util; import pathlib; p=pathlib.Path('$TRITON_PY').resolve().parent.parent; assert any(p.glob('lib/python*/site-packages/llvm-aie'))" 2>/dev/null; then
+    if "$TRITON_PY" -c "import pathlib, sysconfig; assert (pathlib.Path(sysconfig.get_paths()['purelib']) / 'llvm-aie').is_dir()" 2>/dev/null; then
         ok "llvm-aie / PEANO wheel present"
     else
         bad "llvm-aie (PEANO) wheel missing from venv"
