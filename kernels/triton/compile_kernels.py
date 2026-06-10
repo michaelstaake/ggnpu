@@ -7,8 +7,11 @@ Triton-XDNA compile-only pipeline (no NPU hardware required when
 AMD_TRITON_NPU_TARGET is set).
 
 Usage:
-    python3 compile_kernels.py --op matmul --profile npu6 --M 64 --N 64 --K 64
+    python3 compile_kernels.py --op matmul --profile npu6 --M 256 --N 256 --K 256
     python3 compile_kernels.py --op silu --profile npu6 --N 8192
+
+Kernel sizes must match the fixed tiling in the transform scripts under
+transforms/ (e.g. matmul tiles 256-blocks to 64x64x64 L1 tiles).
 """
 
 from __future__ import annotations
@@ -29,21 +32,27 @@ TRANSFORMS_DIR = SCRIPT_DIR / "transforms"
 
 KERNELS = {
     "matmul": {
+        # Transform script tiles 256x256x256 blocks down to 64x64x64 L1 tiles;
+        # launching at 64x64x64 leaves no L3->L2 copy loops to tile and the
+        # script fails with empty transform handles.
         "description": "INT8 matrix multiplication",
         "params": ["M", "N", "K"],
-        "defaults": {"M": 64, "N": 64, "K": 64},
+        "defaults": {"M": 256, "N": 256, "K": 256},
         "transform": "matmul_aie2p.mlir",
     },
     "rmsnorm": {
+        # 2D BLOCK_M x N bf16 kernel (upstream rms_norm example); the 1D
+        # scalar-sum form is not tileable by the transform script.
         "description": "RMS normalization",
-        "params": ["N"],
-        "defaults": {"N": 2048},
+        "params": ["M", "N"],
+        "defaults": {"M": 32, "N": 256},
         "transform": "rmsnorm_aie2p.mlir",
     },
     "softmax": {
+        # 4 rows per program, bf16 (upstream test_softmax example).
         "description": "Softmax activation",
         "params": ["rows", "cols"],
-        "defaults": {"rows": 1, "cols": 1024},
+        "defaults": {"rows": 256, "cols": 256},
         "transform": "softmax_aie2p.mlir",
     },
     "silu": {
@@ -57,12 +66,20 @@ KERNELS = {
         "params": ["N", "dims"],
         "defaults": {"N": 2048, "dims": 64},
         "transform": "rope_aie2p.mlir",
+        "experimental": (
+            "rope uses gather loads (pair shuffles) and integer index math that the "
+            "Triton-XDNA elementwise transform recipes cannot lower yet"
+        ),
     },
     "flash_attn": {
         "description": "FlashAttention v1 (decomposed matmul path)",
         "params": ["n_head", "head_dim", "ctx_len"],
         "defaults": {"n_head": 8, "head_dim": 128, "ctx_len": 2048},
         "transform": "flash_attn_aie2p.mlir",
+        "experimental": (
+            "flash_attn has a loop-carried scf.for accumulator and 3 input copies; "
+            "the matmul transform recipe cannot apply (expects 2 linalg.copy + no iter_args)"
+        ),
     },
 }
 
@@ -450,7 +467,9 @@ def build_kernel_script(op: str, params: dict) -> str:
 
     if op == "matmul":
         launch = textwrap.dedent(f"""
-            M, N, K = {p.get("M", 64)}, {p.get("N", 64)}, {p.get("K", 64)}
+            # Block sizes must be >= 256 so the transform script has L3->L2
+            # copy loops to tile (it tiles 256-blocks down to 64x64x64 L1 tiles).
+            M, N, K = {p.get("M", 256)}, {p.get("N", 256)}, {p.get("K", 256)}
             a = torch.randint(-8, 8, (M, K), dtype=torch.int8)
             b = torch.randint(-8, 8, (K, N), dtype=torch.int8)
             c = torch.zeros((M, N), dtype=torch.int32)
@@ -458,7 +477,7 @@ def build_kernel_script(op: str, params: dict) -> str:
             compiled = matmul_kernel[grid](
                 a, b, c, M, N, K,
                 a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
-                BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64,
+                BLOCK_SIZE_M=256, BLOCK_SIZE_N=256, BLOCK_SIZE_K=K,
             )
         """)
         kernel_src = textwrap.dedent("""
@@ -480,47 +499,61 @@ def build_kernel_script(op: str, params: dict) -> str:
         """)
 
     elif op == "rmsnorm":
+        # 2D BLOCK_M-rows form (upstream rms_norm example): tl.sum over axis=1
+        # keeps a row dimension the transform script can tile at [1]. The 1D
+        # form reduces to a scalar chain that is not tileable.
         launch = textwrap.dedent(f"""
-            N = {p.get("N", 2048)}
-            x = torch.randn(N, dtype=torch.float32)
-            y = torch.empty(N, dtype=torch.float32)
-            grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
-            compiled = rmsnorm_kernel[grid](x, y, N, eps=1e-5, BLOCK_SIZE=1024)
+            M, N = {p.get("M", 32)}, {p.get("N", 256)}
+            BLOCK_M = 2
+            x = torch.randn(M, N, dtype=torch.bfloat16)
+            y = torch.empty(M, N, dtype=torch.bfloat16)
+            grid = (M // BLOCK_M,)
+            compiled = rmsnorm_kernel[grid](x, y, N, 1e-5, BLOCK_M=BLOCK_M, BLOCK_N=N)
         """)
         kernel_src = textwrap.dedent("""
             @triton.jit
-            def rmsnorm_kernel(input_ptr, output_ptr, N: tl.constexpr, eps: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+            def rmsnorm_kernel(X, Y, N: tl.constexpr, eps: tl.constexpr,
+                BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
                 pid = tl.program_id(0)
-                offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-                mask = offset < N
-                input_block = tl.load(input_ptr + offset, mask=mask)
-                mean_square = tl.sum(input_block * input_block, axis=0) / N
-                rms = tl.sqrt(mean_square + eps)
-                output_block = input_block / rms
-                tl.store(output_ptr + offset, output_block, mask=mask)
+                rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+                cols = tl.arange(0, BLOCK_N)
+                offsets = rows[:, None] * N + cols[None, :]
+                x = tl.load(X + offsets)
+                x_f32 = x.to(tl.float32)
+                x_sq = x_f32 * x_f32
+                x_sq_bf16 = x_sq.to(x.dtype)  # AIE2P only supports bf16 vector add
+                sum_sq = tl.sum(x_sq_bf16, axis=1).to(tl.float32)
+                mean_sq = sum_sq / N
+                rstd = tl.math.rsqrt(mean_sq + eps)
+                y = (x_f32 * rstd[:, None]).to(x.dtype)
+                tl.store(Y + offsets, y)
         """)
 
     elif op == "softmax":
+        # 4-rows-per-program bf16 form (upstream test_softmax example); the
+        # row-per-program f32 form leaves ops the transform script cannot map.
         launch = textwrap.dedent(f"""
-            rows, cols = {p.get("rows", 1)}, {p.get("cols", 1024)}
-            x = torch.randn(rows, cols, dtype=torch.float32)
-            y = torch.empty(rows, cols, dtype=torch.float32)
-            grid = lambda META: (rows,)
-            compiled = softmax_kernel[grid](x, y, rows, cols, cols, cols, BLOCK_SIZE=1024)
+            rows, cols = {p.get("rows", 256)}, {p.get("cols", 256)}
+            x = torch.randn(rows, cols, dtype=torch.bfloat16)
+            y = torch.empty(rows, cols, dtype=torch.bfloat16)
+            grid = (rows // 4, 1)
+            compiled = softmax_kernel[grid](x, y, cols, 1, cols, 1, cols, BLOCK_SIZE=4)
         """)
         kernel_src = textwrap.dedent("""
             @triton.jit
-            def softmax_kernel(input_ptr, output_ptr, rows: tl.constexpr, cols: tl.constexpr,
-                stride_row_in: tl.constexpr, stride_row_out: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-                row = tl.program_id(0)
-                offset = tl.arange(0, BLOCK_SIZE)
-                mask = offset < cols
-                input_block = tl.load(input_ptr + row * stride_row_in + offset, mask=mask)
-                max_val = tl.max(input_block, axis=0)
-                exp_vals = tl.exp(input_block - max_val)
-                sum_vals = tl.sum(exp_vals, axis=0)
-                output_block = exp_vals / sum_vals
-                tl.store(output_ptr + row * stride_row_out + offset, output_block, mask=mask)
+            def softmax_kernel(input_ptr, output_ptr,
+                input_stride_row: tl.constexpr, input_stride_col: tl.constexpr,
+                output_stride_row: tl.constexpr, output_stride_col: tl.constexpr,
+                n_cols: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                pid_row = tl.program_id(0)
+                offs_row = pid_row * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                offs_col = tl.arange(0, n_cols)
+                a_block = tl.load(input_ptr + offs_row[:, None] * input_stride_row + offs_col[None, :] * input_stride_col)
+                row_minus_max = a_block - tl.max(a_block, axis=1, keep_dims=True)
+                numerator = tl.exp(row_minus_max)
+                denominator = tl.sum(numerator, axis=1, keep_dims=True)
+                softmax_output = numerator / denominator
+                tl.store(output_ptr + offs_row[:, None] * output_stride_row + offs_col[None, :] * output_stride_col, softmax_output)
         """)
 
     elif op == "silu":
@@ -712,6 +745,12 @@ def compile_kernel(op: str, profile: str, params: dict, output_dir: Path, repo_r
         print(f"Error: Unknown kernel '{op}'")
         return False
 
+    exp_reason = KERNELS[op].get("experimental")
+    if exp_reason and not os.environ.get("GGNPU_EXPERIMENTAL"):
+        print(f"  SKIPPED: {op} is experimental — {exp_reason}.")
+        print("  Set GGNPU_EXPERIMENTAL=1 to try building it anyway.")
+        return False
+
     target = profile_to_target(profile)
     transform = transform_path(op)
     build_dir = repo_root / "build"
@@ -786,8 +825,10 @@ def compile_kernel(op: str, profile: str, params: dict, output_dir: Path, repo_r
 
     if not xclbin_src:
         print("  ERROR: aie.xclbin not found after compile")
-        print("  Ensure XRT headers (libxrt-dev) and PEANO (llvm-aie wheel) are available.")
-        print("  See docs/host-setup-guide.md Step 8.")
+        print("  The Triton/MLIR-AIR transform pipeline failed (see errors above).")
+        print("  This usually means the kernel IR does not match the transform script")
+        print(f"  ({transform.name}); kernel sizes must match the script's tiling.")
+        print("  Re-run with GGNPU_DEBUG=1 for the full compiler output.")
         return False
 
     output_dir.mkdir(parents=True, exist_ok=True)

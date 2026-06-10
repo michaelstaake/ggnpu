@@ -8,11 +8,12 @@
 #   ./scripts/build-kernels.sh matmul       # Build only matmul kernel
 #
 # Kernels built:
-#   - matmul: INT8/BF16 matrix multiplication (core bottleneck)
+#   - matmul: INT8 matrix multiplication (core bottleneck)
 #   - rmsnorm: RMS normalization
-#   - rope: Rotary positional embeddings
 #   - softmax: Softmax activation
 #   - silu: SiLU/Swish activation
+# Experimental (GGNPU_EXPERIMENTAL=1; no working transform recipe yet):
+#   - rope: Rotary positional embeddings
 #   - flash_attn: FlashAttention v1 (decomposed)
 
 set -euo pipefail
@@ -181,14 +182,23 @@ SUCCESS=0
 FAILED=0
 
 # Kernels to build: name:compile_script_args
+# Sizes must match what the transform scripts in kernels/triton/transforms/
+# were authored for (they tile fixed block shapes).
 Kernels=(
-    "matmul:--M 64 --N 64 --K 64"
-    "rmsnorm:--N 2048"
-    "rope:--N 2048 --dims 64"
-    "softmax:--rows 1 --cols 1024"
+    "matmul:--M 256 --N 256 --K 256"
+    "rmsnorm:--M 32 --N 256"
+    "softmax:--rows 256 --cols 256"
     "silu:--N 8192"
-    "flash_attn:--n_head 8 --head_dim 128 --ctx_len 2048"
 )
+
+# rope and flash_attn have no working Triton-XDNA transform recipe yet
+# (gather loads / loop-carried accumulators). Build with GGNPU_EXPERIMENTAL=1.
+if [ -n "${GGNPU_EXPERIMENTAL:-}" ]; then
+    Kernels+=(
+        "rope:--N 2048 --dims 64"
+        "flash_attn:--n_head 8 --head_dim 128 --ctx_len 2048"
+    )
+fi
 
 for kernel_def in "${Kernels[@]}"; do
     IFS=':' read -r kernel_name kernel_args <<< "$kernel_def"
@@ -248,7 +258,8 @@ if [ "$TOTAL" -eq 0 ]; then
     echo "ERROR: No kernels were built."
     if [ -n "${KERNEL_FILTER:-}" ]; then
         echo "  Unknown kernel filter: $KERNEL_FILTER"
-        echo "  Valid kernels: matmul rmsnorm rope softmax silu flash_attn"
+        echo "  Valid kernels: matmul rmsnorm softmax silu"
+        echo "  Experimental (need GGNPU_EXPERIMENTAL=1): rope flash_attn"
     fi
     exit 1
 fi
