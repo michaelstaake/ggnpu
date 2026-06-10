@@ -26,12 +26,12 @@ if [ "${1:-}" = "--tools" ]; then
     fi
     mkdir -p "$DL_DIR" "$SCRIPT_DIR/third_party/xrt-tools"
     cd "$DL_DIR"
-    echo "Downloading xrt-tools..."
-    if ! apt-get download xrt-tools; then
-        echo "ERROR: apt-get download xrt-tools failed. Try: sudo apt install xrt-tools"
+    echo "Downloading XRT utilities (xclbinutil)..."
+    if ! apt-get download libxrt-utils && ! apt-get download xrt-tools; then
+        echo "ERROR: apt-get download failed. Try: sudo apt install libxrt-utils libxrt-utils-npu"
         exit 1
     fi
-    TOOLS_DEB="$(ls -1 xrt-tools_*.deb 2>/dev/null | head -1)"
+    TOOLS_DEB="$(ls -1 libxrt-utils_*.deb xrt-tools_*.deb 2>/dev/null | head -1)"
     dpkg-deb -x "$TOOLS_DEB" "$SCRIPT_DIR/third_party/xrt-tools"
     test -x "$SCRIPT_DIR/third_party/xrt-tools/usr/bin/xclbinutil" || { echo "ERROR: xclbinutil missing after extract"; exit 1; }
     echo "xclbinutil ready at third_party/xrt-tools/usr/bin/xclbinutil"

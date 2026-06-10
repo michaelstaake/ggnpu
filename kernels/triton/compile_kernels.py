@@ -425,7 +425,7 @@ def setup_compile_env(repo_root: Path) -> dict[str, str]:
         else:
             print(
                 "  WARNING: xclbinutil not found — aie.xclbin packaging will be skipped.\n"
-                "  Install: sudo apt install xrt-tools\n"
+                "  Install: sudo apt install libxrt-utils libxrt-utils-npu (or xrt-tools)\n"
                 "  Or extract without sudo: bash scripts/fetch-xrt-dev.sh --tools"
             )
 
