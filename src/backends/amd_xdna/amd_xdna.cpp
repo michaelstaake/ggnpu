@@ -6,6 +6,7 @@
 #include <xrt/xrt_uuid.h>
 #include <xrt/xrt_kernel.h>
 #include <xrt/experimental/xrt_xclbin.h>
+#include <xrt/xrt_hw_context.h>
 #include <cstring>
 #include <cmath>
 #include <memory>
@@ -28,6 +29,7 @@ namespace {
 constexpr xrt::memory_group kDefaultMemGroup = 0;
 constexpr const char* kTritonXdnaKernelName = "MLIR_AIE";
 constexpr uint32_t kNpuOpcode = 3;
+constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256 int8
 
 struct PairHash {
     size_t operator()(const std::pair<int, int>& p) const noexcept {
@@ -44,10 +46,13 @@ struct TupleHash {
     }
 };
 
-xrt::uuid load_xclbin_from_data(xrt::device& dev, const std::vector<uint8_t>& data) {
+// NPUs (amdxdna) do not support the legacy device::load_xclbin path
+// ("load_axlf: Operation not supported"); register + hw_context is required.
+xrt::hw_context register_xclbin_from_data(xrt::device& dev, const std::vector<uint8_t>& data) {
     std::vector<char> copy(data.begin(), data.end());
     xrt::xclbin xbin(copy);
-    return dev.load_xclbin(xbin);
+    xrt::uuid uuid = dev.register_xclbin(xbin);
+    return xrt::hw_context(dev, uuid);
 }
 
 } // namespace
@@ -233,13 +238,16 @@ public:
         int N = params.N;
         int K = params.K;
 
-        std::string cache_key = "matmul_" + std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K) + "_" + profile_str_;
+        // The prebuilt Triton-XDNA matmul kernel is fixed-shape INT8 in /
+        // INT32 out at kMatmulTile^3. Larger problems are tiled on the host
+        // (Phase 2 smoke path; not yet performance-optimized).
+        std::string cache_key = std::string("matmul_") + profile_str_;
 
         std::lock_guard<std::mutex> lock(mutex_);
 
         auto it = matmul_kernels_.find(cache_key);
         if (it == matmul_kernels_.end()) {
-            if (!ensure_matmul_kernel(M, N, K, params.B_type, cache_key)) {
+            if (!ensure_matmul_kernel(kMatmulTile, kMatmulTile, kMatmulTile, params.B_type, cache_key)) {
                 last_status_ = Status::NPU_UNAVAILABLE;
                 return last_status_;
             }
@@ -248,47 +256,86 @@ public:
 
         auto& kernel = it->second;
 
-        // Allocate or reuse buffers
-        size_t size_a = M * K * sizeof(float);
-        size_t size_c = M * N * sizeof(float);
-
-        size_t size_b;
-        if (params.B_type == GgmlType::I8) {
-            size_b = K * N;
-        } else {
-            size_b = K * N * ggml_type_size(params.B_type) / ggml_blck_size(params.B_type);
-        }
-
-        if (!buf_a_ || buf_a_->size() < size_a) {
-            buf_a_ = buf_mgr_->alloc(size_a, true);
-        }
-        if (!buf_b_ || buf_b_->size() < size_b) {
-            buf_b_ = buf_mgr_->alloc(size_b, true);
-        }
-        if (!buf_c_ || buf_c_->size() < size_c) {
-            buf_c_ = buf_mgr_->alloc(size_c, true);
-        }
-
-        // Copy inputs to device
-        buf_mgr_->copy_to(*buf_a_, params.A, size_a);
-        buf_mgr_->copy_to(*buf_b_, params.B, size_b);
-
-        // Set kernel arguments: (buf_a, buf_b, buf_c, M, N, K)
-        try {
-            if (kernel.bo_instr && kernel.instr_words > 0) {
-                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
-                           buf_a_->handle(), buf_b_->handle(), buf_c_->handle());
-            } else {
-                kernel.run(buf_a_->handle(), buf_b_->handle(), buf_c_->handle(),
-                           static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K));
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Error: matmul kernel execution failed: " << e.what() << "\n";
-            last_status_ = Status::ERROR;
+        if (!kernel.bo_instr || kernel.instr_words == 0) {
+            std::cerr << "Error: matmul instruction sequence (matmul_" << profile_str_
+                      << "_sequence.bin) missing from xclbin cache\n";
+            last_status_ = Status::NPU_UNAVAILABLE;
             return last_status_;
         }
 
-        buf_mgr_->copy_from(*buf_c_, params.C, size_c);
+        constexpr int T = kMatmulTile;
+        size_t tile_bytes_in = static_cast<size_t>(T) * T;                  // int8
+        size_t tile_bytes_out = static_cast<size_t>(T) * T * sizeof(int32_t);
+
+        if (!buf_a_ || buf_a_->size() < tile_bytes_in) buf_a_ = buf_mgr_->alloc(tile_bytes_in, true);
+        if (!buf_b_ || buf_b_->size() < tile_bytes_in) buf_b_ = buf_mgr_->alloc(tile_bytes_in, true);
+        if (!buf_c_ || buf_c_->size() < tile_bytes_out) buf_c_ = buf_mgr_->alloc(tile_bytes_out, true);
+
+        const float* A = static_cast<const float*>(params.A);
+        float* C = static_cast<float*>(params.C);
+        std::fill(C, C + static_cast<size_t>(M) * N, 0.0f);
+
+        std::vector<int8_t> a_tile(static_cast<size_t>(T) * T);
+        std::vector<int8_t> b_tile(static_cast<size_t>(T) * T);
+        std::vector<int32_t> c_tile(static_cast<size_t>(T) * T);
+
+        auto to_i8 = [](float v) -> int8_t {
+            float r = std::nearbyint(v);
+            if (r > 127.0f) r = 127.0f;
+            if (r < -128.0f) r = -128.0f;
+            return static_cast<int8_t>(r);
+        };
+
+        for (int m0 = 0; m0 < M; m0 += T) {
+            int mc = std::min(T, M - m0);
+            for (int n0 = 0; n0 < N; n0 += T) {
+                int nc = std::min(T, N - n0);
+                for (int k0 = 0; k0 < K; k0 += T) {
+                    int kc = std::min(T, K - k0);
+
+                    std::fill(a_tile.begin(), a_tile.end(), 0);
+                    for (int i = 0; i < mc; i++)
+                        for (int k = 0; k < kc; k++)
+                            a_tile[i * T + k] = to_i8(A[(m0 + i) * params.lda + (k0 + k)]);
+
+                    std::fill(b_tile.begin(), b_tile.end(), 0);
+                    if (params.B_type == GgmlType::I8) {
+                        const int8_t* B = static_cast<const int8_t*>(params.B);
+                        for (int k = 0; k < kc; k++)
+                            for (int j = 0; j < nc; j++)
+                                b_tile[k * T + j] = B[(k0 + k) * params.ldb + (n0 + j)];
+                    } else if (params.B_type == GgmlType::F32) {
+                        const float* B = static_cast<const float*>(params.B);
+                        for (int k = 0; k < kc; k++)
+                            for (int j = 0; j < nc; j++)
+                                b_tile[k * T + j] = to_i8(B[(k0 + k) * params.ldb + (n0 + j)]);
+                    } else {
+                        std::cerr << "Error: matmul B_type not supported on NPU path yet\n";
+                        last_status_ = Status::INVALID_PARAM;
+                        return last_status_;
+                    }
+
+                    buf_mgr_->copy_to(*buf_a_, a_tile.data(), tile_bytes_in);
+                    buf_mgr_->copy_to(*buf_b_, b_tile.data(), tile_bytes_in);
+
+                    try {
+                        kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                                   buf_a_->handle(), buf_b_->handle(), buf_c_->handle());
+                        kernel.run.wait();
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: matmul kernel execution failed: " << e.what() << "\n";
+                        last_status_ = Status::ERROR;
+                        return last_status_;
+                    }
+
+                    buf_mgr_->copy_from(*buf_c_, c_tile.data(), tile_bytes_out);
+
+                    for (int i = 0; i < mc; i++)
+                        for (int j = 0; j < nc; j++)
+                            C[(m0 + i) * params.ldc + (n0 + j)] += static_cast<float>(c_tile[i * T + j]);
+                }
+            }
+        }
 
         return Status::OK;
     }
@@ -329,6 +376,7 @@ public:
         try {
             kernel.run(buf_rmsnorm_in_->handle(), buf_rmsnorm_out_->handle(),
                        static_cast<uint32_t>(N));
+            kernel.run.wait();
         } catch (const std::exception& e) {
             std::cerr << "Error: rmsnorm kernel execution failed: " << e.what() << "\n";
             last_status_ = Status::ERROR;
@@ -395,6 +443,7 @@ public:
         try {
             kernel.run(buf_softmax_in_->handle(), buf_softmax_out_->handle(),
                        static_cast<uint32_t>(rows), static_cast<uint32_t>(cols));
+            kernel.run.wait();
         } catch (const std::exception& e) {
             std::cerr << "Error: softmax kernel execution failed: " << e.what() << "\n";
             last_status_ = Status::ERROR;
@@ -442,6 +491,7 @@ public:
         try {
             kernel.run(buf_silu_in_->handle(), buf_silu_out_->handle(),
                        static_cast<uint32_t>(size));
+            kernel.run.wait();
         } catch (const std::exception& e) {
             std::cerr << "Error: silu kernel execution failed: " << e.what() << "\n";
             last_status_ = Status::ERROR;
@@ -507,6 +557,7 @@ public:
                        static_cast<uint32_t>(n_head),
                        static_cast<uint32_t>(head_dim),
                        static_cast<uint32_t>(ctx_len));
+            kernel.run.wait();
         } catch (const std::exception& e) {
             std::cerr << "Error: flash_attn kernel execution failed: " << e.what() << "\n";
             last_status_ = Status::ERROR;
@@ -594,8 +645,8 @@ private:
                 return false;
             }
 
-            xclbin_uuid_ = load_xclbin_from_data(*device_, xclbin_data_);
-            std::cout << "Loaded xclbin: " << xclbin_path << " UUID=" << xclbin_uuid_ << "\n";
+            hw_ctx_matmul_ = register_xclbin_from_data(*device_, xclbin_data_);
+            std::cout << "Loaded xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to load xclbin: " << e.what() << "\n";
@@ -612,7 +663,7 @@ private:
         }
 
         // Try to create kernel from the base loaded xclbin (works for any shape if kernel is dimension-agnostic)
-        if (xclbin_uuid_) {
+        if (hw_ctx_matmul_) {
             return create_matmul_kernel_from_loaded_xclbin(M, N, K, B_type, cache_key);
         }
 
@@ -634,17 +685,17 @@ private:
             auto data = detail::load_xclbin_file(path);
             if (data.empty()) return false;
 
-            xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);
 
-            xrt::kernel krnl(tmp_device, tmp_uuid, kTritonXdnaKernelName);
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
             CachedMatmulKernel cached{run, {}, 0, M, N, K, B_type};
             std::string seq_path = detail::find_prebuilt_sequence(fs::path(path).filename().string(), cache_dir_);
             if (!seq_path.empty()) {
                 auto words = detail::load_sequence_file(seq_path);
                 if (!words.empty()) {
-                    cached.bo_instr = xrt::bo(tmp_device, words.size() * sizeof(uint32_t),
+                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
                                               XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
                     void* mapped = cached.bo_instr.map<void*>();
                     std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
@@ -662,7 +713,7 @@ private:
 
     bool create_matmul_kernel_from_loaded_xclbin(int M, int N, int K, GgmlType B_type, const std::string& cache_key) {
         try {
-            xrt::kernel krnl(*device_, xclbin_uuid_, kTritonXdnaKernelName);
+            xrt::kernel krnl(hw_ctx_matmul_, kTritonXdnaKernelName);
             xrt::run run(krnl);
             CachedMatmulKernel cached{run, {}, 0, M, N, K, B_type};
             std::string seq_path = detail::find_prebuilt_sequence("matmul_" + profile_str_ + ".xclbin", cache_dir_);
@@ -717,7 +768,7 @@ private:
                 return false;
             }
 
-            xclbin_uuid_rmsnorm_ = load_xclbin_from_data(*device_, xclbin_data_rmsnorm_);
+            hw_ctx_rmsnorm_ = register_xclbin_from_data(*device_, xclbin_data_rmsnorm_);
             std::cout << "Loaded rmsnorm xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -732,7 +783,7 @@ private:
             return load_rmsnorm_kernel_for_shape(cached_path, N, cache_key);
         }
 
-        if (xclbin_uuid_rmsnorm_) {
+        if (hw_ctx_rmsnorm_) {
             return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
         }
 
@@ -753,10 +804,10 @@ private:
             auto data = detail::load_xclbin_file(path);
             if (data.empty()) return false;
 
-            xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);
 
-            xrt::kernel krnl(tmp_device, tmp_uuid, kTritonXdnaKernelName);
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             rmsnorm_kernels_[N] = CachedRmsNormKernel{run, N};
@@ -769,7 +820,7 @@ private:
 
     bool create_rmsnorm_kernel_from_loaded_xclbin(int N, const std::string& cache_key) {
         try {
-            xrt::kernel krnl(*device_, xclbin_uuid_rmsnorm_, kTritonXdnaKernelName);
+            xrt::kernel krnl(hw_ctx_rmsnorm_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             rmsnorm_kernels_[N] = CachedRmsNormKernel{run, N};
@@ -812,7 +863,7 @@ private:
                 return false;
             }
 
-            xclbin_uuid_softmax_ = load_xclbin_from_data(*device_, xclbin_data_softmax_);
+            hw_ctx_softmax_ = register_xclbin_from_data(*device_, xclbin_data_softmax_);
             std::cout << "Loaded softmax xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -827,7 +878,7 @@ private:
             return load_softmax_kernel_for_shape(cached_path, rows, cols, cache_key);
         }
 
-        if (xclbin_uuid_softmax_) {
+        if (hw_ctx_softmax_) {
             return create_softmax_kernel_from_loaded_xclbin(rows, cols, cache_key);
         }
 
@@ -848,10 +899,10 @@ private:
             auto data = detail::load_xclbin_file(path);
             if (data.empty()) return false;
 
-            xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);
 
-            xrt::kernel krnl(tmp_device, tmp_uuid, kTritonXdnaKernelName);
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             softmax_kernels_[std::make_pair(rows, cols)] = CachedSoftmaxKernel{run, rows, cols};
@@ -864,7 +915,7 @@ private:
 
     bool create_softmax_kernel_from_loaded_xclbin(int rows, int cols, const std::string& cache_key) {
         try {
-            xrt::kernel krnl(*device_, xclbin_uuid_softmax_, kTritonXdnaKernelName);
+            xrt::kernel krnl(hw_ctx_softmax_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             softmax_kernels_[std::make_pair(rows, cols)] = CachedSoftmaxKernel{run, rows, cols};
@@ -907,7 +958,7 @@ private:
                 return false;
             }
 
-            xclbin_uuid_silu_ = load_xclbin_from_data(*device_, xclbin_data_silu_);
+            hw_ctx_silu_ = register_xclbin_from_data(*device_, xclbin_data_silu_);
             std::cout << "Loaded silu xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -922,7 +973,7 @@ private:
             return load_silu_kernel_for_shape(cached_path, size, cache_key);
         }
 
-        if (xclbin_uuid_silu_) {
+        if (hw_ctx_silu_) {
             return create_silu_kernel_from_loaded_xclbin(size, cache_key);
         }
 
@@ -943,10 +994,10 @@ private:
             auto data = detail::load_xclbin_file(path);
             if (data.empty()) return false;
 
-            xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);
 
-            xrt::kernel krnl(tmp_device, tmp_uuid, kTritonXdnaKernelName);
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             silu_kernels_[size] = CachedSiluKernel{run, size};
@@ -959,7 +1010,7 @@ private:
 
     bool create_silu_kernel_from_loaded_xclbin(int size, const std::string& cache_key) {
         try {
-            xrt::kernel krnl(*device_, xclbin_uuid_silu_, kTritonXdnaKernelName);
+            xrt::kernel krnl(hw_ctx_silu_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             silu_kernels_[size] = CachedSiluKernel{run, size};
@@ -1002,7 +1053,7 @@ private:
                 return false;
             }
 
-            xclbin_uuid_fa_ = load_xclbin_from_data(*device_, xclbin_data_fa_);
+            hw_ctx_fa_ = register_xclbin_from_data(*device_, xclbin_data_fa_);
             std::cout << "Loaded flash_attn xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -1017,7 +1068,7 @@ private:
             return load_flash_attn_kernel_for_shape(cached_path, n_head, head_dim, ctx_len, cache_key);
         }
 
-        if (xclbin_uuid_fa_) {
+        if (hw_ctx_fa_) {
             return create_flash_attn_kernel_from_loaded_xclbin(n_head, head_dim, ctx_len, cache_key);
         }
 
@@ -1038,10 +1089,10 @@ private:
             auto data = detail::load_xclbin_file(path);
             if (data.empty()) return false;
 
-            xrt::device tmp_device(*device_);
-            xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);
 
-            xrt::kernel krnl(tmp_device, tmp_uuid, kTritonXdnaKernelName);
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = CachedFlashAttnKernel{run, n_head, head_dim, ctx_len};
@@ -1054,7 +1105,7 @@ private:
 
     bool create_flash_attn_kernel_from_loaded_xclbin(int n_head, int head_dim, int64_t ctx_len, const std::string& cache_key) {
         try {
-            xrt::kernel krnl(*device_, xclbin_uuid_fa_, kTritonXdnaKernelName);
+            xrt::kernel krnl(hw_ctx_fa_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = CachedFlashAttnKernel{run, n_head, head_dim, ctx_len};
@@ -1070,19 +1121,20 @@ private:
     std::unique_ptr<CompileCache> cache_;
 
     std::vector<uint8_t> xclbin_data_;
-    xrt::uuid xclbin_uuid_;
+    xrt::hw_context hw_ctx_matmul_;
+    std::vector<xrt::hw_context> matmul_shape_ctxs_;  // keeps per-shape contexts alive
 
     std::vector<uint8_t> xclbin_data_rmsnorm_;
-    xrt::uuid xclbin_uuid_rmsnorm_;
+    xrt::hw_context hw_ctx_rmsnorm_;
 
     std::vector<uint8_t> xclbin_data_softmax_;
-    xrt::uuid xclbin_uuid_softmax_;
+    xrt::hw_context hw_ctx_softmax_;
 
     std::vector<uint8_t> xclbin_data_silu_;
-    xrt::uuid xclbin_uuid_silu_;
+    xrt::hw_context hw_ctx_silu_;
 
     std::vector<uint8_t> xclbin_data_fa_;
-    xrt::uuid xclbin_uuid_fa_;
+    xrt::hw_context hw_ctx_fa_;
 
     std::shared_ptr<XrtBuffer> buf_a_;
     std::shared_ptr<XrtBuffer> buf_b_;

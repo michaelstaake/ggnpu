@@ -2,6 +2,17 @@
 
 Run GGUF models on AMD NPUs (Krackan / XDNA2).
 
+## Status (2026-06-10)
+
+**Phase 2 passed.** Prebuilt kernels (`matmul`, `rmsnorm`, `softmax`, `silu` for `npu6`) are in `~/.cache/ggnpu/xclbin/` and `./build-npu/ggnpu bench-matmul` runs and validates on real NPU hardware.
+
+Key facts for contributors:
+
+- The NPU rejects the legacy `device.load_xclbin()` path (`load_axlf: Operation not supported`). The backend now uses `xrt::register_xclbin` + `xrt::hw_context` + the opcode/instruction-sequence call convention (each xclbin has a matching `*_sequence.bin`).
+- The prebuilt matmul kernel is **fixed-shape 256×256×256, INT8 in / INT32 out**. The backend tiles bigger matmuls on the host and converts f32↔int8 per tile. This is correct but not yet fast; it's the Phase 2 smoke path.
+- The rmsnorm/softmax/silu kernels are **bf16**, but the backend currently sends f32 — those op paths still need dtype marshaling before Phase 4.
+- Next milestone: one `ffn_gate` matmul straight from GGUF on the NPU vs CPU reference (Phase 3 gate), then full layer + inference. See [IMPLEMENTATION.md](IMPLEMENTATION.md) §7.
+
 ## Native host setup
 
 `ggnpu` is intended to be built and run directly on the host. Docker is not used.
@@ -69,7 +80,7 @@ cmake --build build-npu -j2
 
 ### Build NPU kernels (Triton-XDNA)
 
-`bench-matmul` and inference need `.xclbin` kernel files in `~/.cache/ggnpu/xclbin/`.
+`bench-matmul` and inference need `.xclbin` kernel files **and their `*_sequence.bin` instruction files** in `~/.cache/ggnpu/xclbin/`. Both are produced by `scripts/build-kernels.sh`; if you copy kernels between machines, copy both files per op.
 No NPU hardware is needed to build kernels — compilation runs entirely on CPU.
 You can build on any Ubuntu 24.04+ machine (including WSL) with ~16 GB RAM
 (32 GB recommended) and copy the `.xclbin` files back to the NPU machine.
