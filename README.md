@@ -4,7 +4,7 @@ Run GGUF models on AMD NPUs (Krackan / XDNA2).
 
 ## Native host setup
 
-`ggnpu` is now intended to be built and run directly on the host.
+`ggnpu` is intended to be built and run directly on the host.
 
 ### Host prerequisites
 
