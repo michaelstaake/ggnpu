@@ -75,14 +75,24 @@ You can build on a separate machine (no NPU required) and copy the `.xclbin` fil
 
 **Install Triton-XDNA** (one-time, replaces mlir-aie + Peano):
 
-```bash
-# If you get "externally managed environment" error:
-pip install triton-xdna --break-system-packages
+Triton-XDNA is distributed via GitHub releases, not PyPI. Install it using:
 
-# Or use a venv:
+```bash
+# On the NPU host (system-wide):
+pip install triton-xdna --break-system-packages \
+  --find-links https://github.com/amd/Triton-XDNA/releases/expanded_assets/latest-wheels \
+  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
+  --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
+  --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
+
+# Or in a venv (for kernel building on a separate machine):
 python3 -m venv ~/triton-env
 source ~/triton-env/bin/activate
-pip install triton-xdna
+pip install triton-xdna \
+  --find-links https://github.com/amd/Triton-XDNA/releases/expanded_assets/latest-wheels \
+  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
+  --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
+  --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
 ```
 
 This installs the complete compiler stack (Triton + mlir-air + mlir-aie + llvm-aie) as Python wheels.
