@@ -146,74 +146,53 @@ cmake .. -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
 cmake --build . -j2
 ```
 
-## Step 8: Build NPU kernels (mlir-aie + Peano)
+## Step 8: Build NPU kernels (Triton-XDNA)
 
 `bench-matmul` and NPU inference need `.xclbin` kernel artifacts in `~/.cache/ggnpu/xclbin/`.
 No NPU hardware is needed to build kernels — the compilation runs entirely on CPU.
 
-### Option A: Build on an NPU machine (same machine)
+### Install Triton-XDNA
 
-Install mlir-aie and Peano, then run the kernel build script:
+Triton-XDNA replaces the old mlir-aie + Peano toolchain with a single pip install:
 
 ```bash
-# 1. Clone mlir-aie
-git clone https://github.com/Xilinx/mlir-aie.git ~/mlir-aie
-cd ~/mlir-aie
-git submodule update --init --recursive
+pip install triton-xdna
+```
 
-# 2. Create and activate venv (critical — pip will fail without it)
-python3 -m venv ironenv
-source ironenv/bin/activate
+This installs the complete compiler stack:
+- Triton (Python kernel language)
+- mlir-air (MLIR Air compiler)
+- mlir-aie (MLIR AIE compiler)
+- llvm-aie (Peano toolchain)
 
-# 3. Install Python deps
-pip install --upgrade pip
-pip install -r python/requirements.txt
-pip install -r python/requirements_dev.txt
-pip install nanobind
+### Build ggnpu kernels
 
-# 4. Build mlir-aie (uses pre-built LLVM/MLIR wheels — much lighter than building LLVM from source)
-bash ./utils/build-mlir-aie-from-wheels.sh
-source utils/env_setup.sh install
+```bash
+# Build all kernels for npu6 (Krackan)
+./scripts/build-kernels.sh npu6
 
-# 5. Clone and build Peano (AIE tile code compiler)
-git clone https://github.com/Xilinx/llvm-aie.git ~/llvm-aie
-cd ~/llvm-aie
-mkdir build && cd build
-cmake -GNinja ..
-ninja
-cd ../..
-
-# 6. Set environment variables
-export AIE_HOME=~/mlir-aie/build
-export PEANO_HOME=~/llvm-aie/build
-
-# 7. Build ggnpu kernels (start with matmul — the critical kernel)
-cd ~/Documents/GitHub/ggnpu
+# Build only specific kernel
 ./scripts/build-kernels.sh npu6 matmul
 
-# Build additional kernels as needed
-./scripts/build-kernels.sh npu6 rmsnorm
-./scripts/build-kernels.sh npu6 rope
-./scripts/build-kernels.sh npu6 softmax
-./scripts/build-kernels.sh npu6 silu
-./scripts/build-kernels.sh npu6 flash_attn
+# Build for multiple profiles
+./scripts/build-kernels.sh npu4 npu5 npu6
 ```
 
 Output goes to `~/.cache/ggnpu/xclbin/`.
 
-### Option B: Build on a separate machine (no NPU needed)
+### Building on a separate machine (no NPU needed)
 
 The kernel build machine only needs Ubuntu 24.04+, ~16 GB RAM (32 GB recommended), and ~50 GB disk.
 No NPU hardware, no `amdxdna` driver, no firmware required.
 
-1. Follow the same steps as Option A on the build machine
+1. Follow the same steps as above on the build machine
 2. After building, copy the xclbin files to the NPU machine:
    ```bash
    # On build machine
    scp -r ~/.cache/ggnpu/xclbin/* user@npu-machine:~/.cache/ggnpu/xclbin/
    ```
 
-### Option C: Use a cloud VM
+### Using a cloud VM
 
 Spin up a 32 GB RAM VM (GCP, AWS, Lambda Labs), clone the repo, build kernels, and copy the `.xclbin` files back.
 
@@ -297,6 +276,19 @@ cat /proc/cmdline | grep iommu
 # If missing, update GRUB as shown in Step 4
 ```
 
+### Triton-XDNA not found
+
+```bash
+# Check if Triton is installed
+python3 -c "import triton; print(triton.__version__)"
+
+# If not installed, install Triton-XDNA
+pip install triton-xdna
+
+# Or use prebuilt xclbins
+# Place .xclbin files in ~/.cache/ggnpu/xclbin/
+```
+
 ### No xclbin kernels found
 
 ```bash
@@ -304,11 +296,11 @@ cat /proc/cmdline | grep iommu
 ls -la ~/.cache/ggnpu/xclbin/
 
 # If empty, you need to provide kernels:
-# Option A: Use prebuilt xclbins
-# Option B: Build with mlir-aie
-#   export AIE_HOME=/path/to/mlir-aie
-#   export PEANO_HOME=/path/to/peano
+# Option A: Build with Triton-XDNA
+#   pip install triton-xdna
 #   ./scripts/build-kernels.sh npu6 matmul
+# Option B: Use prebuilt xclbins
+#   Place .xclbin files in ~/.cache/ggnpu/xclbin/
 ```
 
 ## Next Steps After Setup

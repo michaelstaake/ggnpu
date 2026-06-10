@@ -62,8 +62,7 @@ See **§9** and `docs/host-setup-guide.md`.
 |------|------|
 | Linux `amdxdna` kernel driver + firmware | Hardware access via `/dev/accel/accel0` |
 | **XRT** (`libxrt`, NPU plugin) | Runtime: open device, allocate buffers, load kernels, submit work |
-| **mlir-aie** | Build-time: compile spatial NPU programs → `.xclbin` |
-| **Peano** (`aie2p-none-unknown-elf`) | Build-time: compile C++ tile code inside mlir-aie pipeline |
+| **Triton-XDNA** | Build-time: pip install; compile Triton kernels → `.xclbin` via triton-shared + MLIR-AIR/AIE |
 | `cpu_ref` backend | **Unit tests only** (`GGNPU_TEST_CPU=1`), never production fallback |
 
 ### Production rule
@@ -107,9 +106,9 @@ LLMs confuse what code goes where when dealing with XRT. Clearly separate:
 | Layer | Where it runs | What it does |
 |-------|--------------|--------------|
 | **Control Code** | NPU internal microcontroller (core 0) | Data movement graph, DMA setup, kernel launch via IRON API / `XAie_TxnOpcode` sequence |
-| **Kernel Execution Code** | Spatial compute tile rows (Peano ELFs) | Vectorized INT8/BF16 math kernels, no branches, fully unrolled loops |
+| **Kernel Execution Code** | Spatial compute tile rows (Triton-XDNA compiled) | Vectorized INT8/BF16 math kernels, no branches, fully unrolled loops |
 
-The control code **never** contains tensor math. The kernel code **never** handles DMA setup or kernel launch. This separation is enforced by the IRON/mlir-aie compilation pipeline.
+The control code **never** contains tensor math. The kernel code **never** handles DMA setup or kernel launch. This separation is enforced by the triton-shared + MLIR-AIR/AIE compilation pipeline.
 
 ### "No conversion" clarified
 
@@ -146,7 +145,7 @@ Also detect at runtime: Strix Point (`npu4`/`npu5`) for broader testing; select 
 
 ---
 
-## 4. Dependency roles (XRT, mlir-aie, Peano)
+## 4. Dependency roles (XRT, Triton-XDNA)
 
 These are **not** inference frameworks. ggnpu builds the GGUF runtime; these handle NPU kernel compile and dispatch.
 
@@ -157,15 +156,14 @@ GGUF file
   → amdxdna kernel (/dev/accel/accel0)
 
 NPU kernels (.xclbin):
-  C++/IRON source → Peano (tile ELF) → mlir-aie (overlay) → xclbin
-                    ↑ build time / first-run cache miss only
+  @triton.jit → triton-shared (Linalg) → MLIR Transform dialect → MLIR-AIR / MLIR-AIE → xclbin
+                                                ↑ build time / first-run cache miss only
 ```
 
 | Tool | When it runs | What it does |
 |------|--------------|--------------|
 | **XRT** | Every inference | Open NPU, pinned `xrt::bo` buffers, load `.xclbin`, `xrt::run`, sync |
-| **mlir-aie** | Build / cache miss | Map ops onto AIE tiles, produce `.xclbin` + ctrlcode for DMA |
-| **Peano** | Build / cache miss | Compile vectorized INT8/BF16 C++ for individual AIE cores |
+| **Triton-XDNA** | Build / cache miss | `pip install triton-xdna`; compile Triton kernels → `.xclbin` via triton-shared + MLIR-AIR/AIE |
 
 **Why XRT not raw ioctls:** Raw `DRM_IOCTL_AMDXDNA_*` requires reimplementing BO lifecycle, PASID/IOMMU SVA, ERT mailbox, firmware coupling. XRT is the official shim (like libdrm for GPU).
 
@@ -266,7 +264,7 @@ Production: `AmdXdnaBackend`. Tests only: `cpu_ref`.
 The NPU backend consists of two code paths that must never mix:
 
 - **Control plane** (`amd_xdna.cpp`): XRT device management, buffer allocation, xclbin loading, kernel launch. Runs on host CPU, talks to NPU microcontroller via IRON API / `XAie_TxnOpcode`.
-- **Kernel plane** (`kernels/amd/`): Peano-compiled C++ tile code. Runs on spatial compute tiles. Vectorized intrinsics only, no branches, no scalar math.
+- **Kernel plane** (`kernels/triton/`): Triton-XDNA Python kernels. Runs on spatial compute tiles. Vectorized intrinsics only, no branches, no scalar math.
 
 **Bring-up:**
 
@@ -287,7 +285,17 @@ The NPU backend consists of two code paths that must never mix:
 | FFN gate/up | 8192 |
 | FFN down | 8192 → 3072 |
 
-Start from mlir-aie `programming_examples/matrix_multiplication`. Use `transform_aie2p.mlir` for Krackan ([Triton-XDNA](https://github.com/amd/Triton-XDNA)).
+Use the Triton-XDNA compilation flow:
+
+```
+Triton kernel (@triton.jit)
+  -> triton-shared (Linalg)
+    -> MLIR Transform dialect (tiling, bufferization, vectorization)
+      -> MLIR-AIR / MLIR-AIE
+        -> XRT binary (aie.xclbin)
+```
+
+Install with: `pip install triton-xdna`
 
 **NPU op rollout order:**
 
@@ -321,7 +329,7 @@ ggnpu/
 │   ├── amd-krackan.md
 │   ├── host-setup-guide.md
 │   └── intel-roadmap.md
-├── cmake/                         # FindXRT, FindPeano
+   ├── cmake/                         # FindXRT
 ├── third_party/                   # minimal only (xxhash, etc.)
 ├── include/ggnpu/
 │   ├── gguf.h, tensor.h, graph.h, backend.h, model.h
@@ -336,12 +344,8 @@ ggnpu/
 │   │   ├── cpu_ref/               # tests only
 │   │   └── amd_xdna/
 │   └── cli/main.cpp
-├── kernels/amd/
-│   ├── matmul_i8/
-│   ├── rmsnorm/
-│   ├── rope/
-│   ├── softmax/
-│   └── fused_attn/
+├── kernels/triton/
+│   └── compile_kernels.py
 ├── tests/
 └── scripts/
     ├── setup-host.sh
@@ -459,7 +463,7 @@ Assessment of whether the project can run a model on the NPU **today**.
 | GGUF loading | Works | `--dump-tensors` |
 | Test models | On disk | See §17 |
 
-**Host still needs:** XRT, `libxrt-dev`, and a native `ggnpu` build. `mlir-aie` and Peano are only needed to build kernels locally.
+**Host still needs:** XRT, `libxrt-dev`, and a native `ggnpu` build. `pip install triton-xdna` is only needed to build kernels locally.
 
 #### Blocked (kernels)
 
@@ -478,7 +482,7 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 | RoPE on CPU | `src/backends/amd_xdna/amd_xdna.cpp`, `main.cpp` | Explicit CPU fallback; OK for early MVP, not “all math on NPU” |
 | Logits projection on CPU | `src/cli/main.cpp` | Dot product not routed through `mul_mat_q` |
 | Residual adds on CPU | `src/cli/main.cpp` | Cheap; acceptable for MVP |
-| MLIR kernels skeletal | `kernels/amd/*` | Must compile with mlir-aie; not validated on hardware |
+| Triton kernels | `kernels/triton/compile_kernels.py` | Must compile with Triton-XDNA; not validated on hardware |
 | `execute_layer_graph()` unused | `src/cli/main.cpp` | Dead code; main calls backend directly |
 
 #### Recently fixed (2025-06-09)
@@ -538,7 +542,7 @@ Dev laptop has ~14 GiB RAM + 4 GiB swap. Cursor IDE can consume several GB; comb
 | Activity | RAM impact | Recommendation |
 |----------|------------|----------------|
 | Native `ggnpu` build | Low (~2–4 GB) | Fine on laptop |
-| Local mlir-aie kernel build | **Very high** (16–32 GB typical) | Use a machine with enough RAM or prebuilt kernels |
+| Local Triton-XDNA kernel build | **Low** (`pip install triton-xdna`) | No heavy build step required |
 | Load Llama 1B Q4_K_M (mmap) | ~770 MB virtual | Fine |
 | KV at **131k ctx** (current code) | **~8.6 GB** | **Will OOM** with IDE open |
 | KV at **2048 ctx** (after fix) | **~128 MB** | Comfortable |
@@ -548,7 +552,7 @@ Dev laptop has ~14 GiB RAM + 4 GiB swap. Cursor IDE can consume several GB; comb
 **RAM hygiene before inference:**
 
 - Run `ggnpu` from a plain terminal outside the IDE when memory is tight
-- Do not run `GGNPU_BUILD_KERNELS=ON` or mlir-aie builds on 16 GB RAM
+- Do not run `GGNPU_BUILD_KERNELS=ON` on 16 GB RAM (but Triton-XDNA `pip install` is lightweight)
 - Start with `models/llama-3.2-1b-q4_k_m.gguf` only; avoid 3B+ until KV is fixed
 - Set `ulimit -l unlimited` in the shell session
 
@@ -649,11 +653,10 @@ cmake --build . -j2
 
 ### Kernel artifacts
 
-Place prebuilt `.xclbin` files in `~/.cache/ggnpu/xclbin/`, or build them locally with `mlir-aie` and Peano:
+Place prebuilt `.xclbin` files in `~/.cache/ggnpu/xclbin/`, or build them locally with Triton-XDNA:
 
 ```bash
-export AIE_HOME=/path/to/mlir-aie
-export PEANO_HOME=/path/to/peano
+pip install triton-xdna
 ./scripts/build-kernels.sh npu6 matmul
 ```
 
@@ -714,8 +717,8 @@ Do not promise CUDA-class speed in v1.
 | First-run JIT latency | Prebuilt xclbins + persistent cache |
 | XRT/driver/firmware skew | Pin versions; `verify-npu.sh` checks |
 | 4 MB L2 limit | Tile matmuls; stream from DDR |
-| mlir-aie complexity | Start from upstream matmul example + [IRON tutorial PDF](https://www.amd.com/content/dam/amd/en/documents/products/processors/ryzen/ai/iron-for-ryzen-ai-tutorial-ipdps-2025.pdf) |
-| mlir-aie / xclbin build OOM | Do not build on 16 GB RAM; ship prebuilt xclbins or use remote builder |
+| Triton-XDNA complexity | Start from upstream examples + [IRON tutorial PDF](https://www.amd.com/content/dam/amd/en/documents/products/processors/ryzen/ai/iron-for-ryzen-ai-tutorial-ipdps-2025.pdf) |
+| Triton-XDNA / xclbin build OOM | `pip install triton-xdna` is lightweight; no heavy build step |
 | KV cache over-allocation | `init_kv_cache()` uses full GGUF `context_length`; must respect `-c` before inference on 16 GB hosts |
 | GGUF models with 128k+ ctx metadata | Cap KV at CLI `-c` or sensible MVP default (2048) regardless of metadata |
 | IDE memory pressure (Cursor) | Run heavy builds and inference outside IDE; use `make -j2` |
@@ -731,9 +734,8 @@ Do not promise CUDA-class speed in v1.
 | Kernel amdxdna docs | https://docs.kernel.org/accel/amdxdna/amdnpu.html |
 | xdna-driver | https://github.com/amd/xdna-driver |
 | XRT native APIs | https://xilinx.github.io/XRT/2024.2/html/xrt_native_apis.html |
-| mlir-aie | https://github.com/Xilinx/mlir-aie |
-| mlir-aie Ryzen build guide | https://github.com/Xilinx/mlir-aie/blob/main/docs/Building.md |
 | Triton-XDNA (AIE2P transforms) | https://github.com/amd/Triton-XDNA |
+| MLIR-AIR / MLIR-AIE | https://github.com/Xilinx/mlir-aie |
 | OllamaAMDNPU (matmul reference) | https://github.com/BrandedTamarasu-glitch/OllamaAMDNPU |
 
 ---
@@ -762,14 +764,14 @@ On **Ubuntu 24.04 or 26.04** + **Ryzen AI 7 350**, via the native host flow:
 7. Update `docs/usage.md` and `--help` whenever CLI flags change.
 8. Commit logically per phase; write clear commit messages.
 
-### AIE kernel rules (enforce on all code generation)
+### Triton kernel rules (enforce on all code generation)
 
-When generating NPU kernel code (`kernels/amd/`), **always** apply the four guardrails from Section 2:
+When generating NPU kernel code (`kernels/triton/`), **always** apply the four guardrails from Section 2:
 
 - **Memory-first:** Block-based DMA, no un-chunked reads, overlap compute with streaming.
 - **Vector intrinsics only:** No scalar `+`/`*` in kernels. Use AIE vector ops. Types: INT8, BF16, FP8.
 - **No branches:** Zero `if/else`/`switch`/`while` in hot loops. Predication or lookup tables only.
-- **Two layers:** Control code (IRON API, DMA setup) never contains tensor math. Kernel code (Peano ELF) never handles DMA or launch.
+- **Two layers:** Control code (IRON API, DMA setup) never contains tensor math. Kernel code (Triton-XDNA compiled) never handles DMA or launch.
 
 **Start here (2025-06-10):** Phase 1 gate passed. Native host setup is now the documented path. Next work, in order:
 

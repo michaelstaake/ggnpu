@@ -1,16 +1,14 @@
 #!/bin/bash
 # Build NPU kernels for GGNPU
-# Compiles MLIR kernel sources into .xclbin files for the AMD NPU
+# Compiles Triton Python kernels into .xclbin files using Triton-XDNA
 #
 # Usage:
 #   ./scripts/build-kernels.sh              # Build with available tools
-#   AIE_HOME=/path/to/mlir-aie ./scripts/build-kernels.sh
-#   PEANO_HOME=/path/to/peano ./scripts/build-kernels.sh
 #   ./scripts/build-kernels.sh npu6         # Build only for npu6 (Krackan)
 #   ./scripts/build-kernels.sh matmul       # Build only matmul kernel
 #
 # Kernels built:
-#   - matmul: INT8 matrix multiplication (core bottleneck)
+#   - matmul: INT8/BF16 matrix multiplication (core bottleneck)
 #   - rmsnorm: RMS normalization
 #   - rope: Rotary positional embeddings
 #   - softmax: Softmax activation
@@ -20,9 +18,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-KERNELS_DIR="$SCRIPT_DIR/kernels/amd"
 CACHE_DIR="${GGNPU_CACHE_DIR:-$HOME/.cache/ggnpu}"
 XCLBIN_DIR="$CACHE_DIR/xclbin"
+COMPILE_SCRIPT="$SCRIPT_DIR/kernels/triton/compile_kernels.py"
 
 # NPU profiles: 4=Strix Point, 5=Strix Point rev, 6=Krackan
 ALL_PROFILES=("4" "5" "6")
@@ -53,8 +51,7 @@ done
 
 mkdir -p "$XCLBIN_DIR"
 
-echo "=== GGNPU NPU Kernel Builder ==="
-echo "Kernels source: $KERNELS_DIR"
+echo "=== GGNPU NPU Kernel Builder (Triton-XDNA) ==="
 echo "Output directory: $XCLBIN_DIR"
 echo "NPU profiles: ${PROFILES[*]}"
 if [ -n "${KERNEL_FILTER:-}" ]; then
@@ -63,119 +60,50 @@ fi
 echo ""
 
 #====//
-# Check for aiecc / aiecc.py
+# Check for python3 and Triton-XDNA
 #====//
-AIECC_FOUND=false
-AIECC_PATH=""
+PYTHON3_FOUND=false
+PYTHON3_BIN=""
 
-if [ -z "${AIE_HOME:-}" ] && [ -f /etc/ggnpu-aie-home ]; then
-    AIE_HOME="$(cat /etc/ggnpu-aie-home)"
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON3_BIN="$(command -v python3)"
+    PYTHON3_FOUND=true
+elif command -v python >/dev/null 2>&1; then
+    PYTHON3_BIN="$(command -v python)"
+    PYTHON3_FOUND=true
 fi
 
-if [ -n "${AIE_HOME:-}" ]; then
-    if [[ "$AIE_HOME" == *"/path/to/"* ]] || [ ! -d "$AIE_HOME" ]; then
-        echo "ERROR: AIE_HOME is not a real mlir-aie install: $AIE_HOME"
-        echo ""
-        echo "  /path/to/mlir-aie is a documentation placeholder — set AIE_HOME to your"
-        echo "  actual mlir-aie build directory (the one that contains bin/aiecc.py)."
-        echo ""
-        echo "  Example after building mlir-aie:"
-        echo "    export AIE_HOME=\$HOME/mlir-aie/build"
-        echo "    ./scripts/build-kernels.sh npu6 matmul"
-        exit 1
-    fi
-    if [ -x "$AIE_HOME/bin/aiecc" ]; then
-        AIECC_FOUND=true
-        AIECC_PATH="$AIE_HOME/bin/aiecc"
-    elif [ -f "$AIE_HOME/bin/aiecc.py" ]; then
-        AIECC_FOUND=true
-        AIECC_PATH="$AIE_HOME/bin/aiecc.py"
-    else
-        echo "ERROR: AIE_HOME=$AIE_HOME but bin/aiecc or bin/aiecc.py not found"
-        echo "  mlir-aie is not installed. See docs/host-setup-guide.md"
-        exit 1
-    fi
-elif command -v aiecc >/dev/null 2>&1; then
-    AIECC_FOUND=true
-    AIECC_PATH="$(command -v aiecc)"
-elif command -v aiecc.py >/dev/null 2>&1; then
-    AIECC_FOUND=true
-    AIECC_PATH="$(command -v aiecc.py)"
-else
-    echo "ERROR: mlir-aie (aiecc.py) not found"
+if [ "$PYTHON3_FOUND" = false ]; then
+    echo "ERROR: python3 not found"
     echo ""
-    echo "To install mlir-aie:"
-    echo "  git clone https://github.com/Xilinx/mlir-aie.git"
-    echo "  cd mlir-aie && mkdir build && cd build"
-    echo "  cmake -G Ninja .. -DCMAKE_BUILD_TYPE=Release \\"
-    echo "      -DLLVM_ENABLE_PROJECTS=mlir \\"
-    echo "      -DMLIR_AIE_BUILD_TOOLS=ON"
-    echo "  ninja"
-    echo ""
-    echo "Or set AIE_HOME to your mlir-aie *build* directory (contains bin/aiecc.py):"
-    echo "  export AIE_HOME=\$HOME/mlir-aie/build"
-    echo "  ./scripts/build-kernels.sh npu6 matmul"
-    echo ""
-    echo "Build guide: https://github.com/Xilinx/mlir-aie/blob/main/docs/Building.md"
-    echo "Ryzen AI notes: https://github.com/Xilinx/mlir-aie/blob/main/docs/Building.md"
-    echo ""
-    echo "On 16GB RAM machines, prefer copying prebuilt xclbins into:"
-    echo "  $XCLBIN_DIR"
-    echo "  (needs at least matmul_npu6.xclbin for bench-matmul)"
+    echo "  Install Python 3.10+ and Triton-XDNA:"
+    echo "    sudo apt install python3 python3-pip"
+    echo "    pip install triton-xdna"
     exit 1
 fi
 
-echo "mlir-aie: $AIECC_PATH"
-
-if [ -n "${PEANO_HOME:-}" ] && [ -f "$PEANO_HOME/bin/aie2p-none-unknown-elf-g++" ]; then
-    echo "Peano: $PEANO_HOME"
-    PEANO_FLAGS="-I${PEANO_HOME}/include -L${PEANO_HOME}/lib"
-elif command -v aie2p-none-unknown-elf-g++ >/dev/null 2>&1; then
-    PEANO_DIR="$(dirname "$(dirname "$(command -v aie2p-none-unknown-elf-g++)")")"
-    echo "Peano: $PEANO_DIR"
-    PEANO_FLAGS="-I${PEANO_DIR}/include -L${PEANO_DIR}/lib"
-else
-    echo "Peano: not found (tile ELF compilation may fail)"
-    PEANO_FLAGS=""
+# Check if Triton is importable
+if ! $PYTHON3_BIN -c "import triton" 2>/dev/null; then
+    echo "ERROR: Triton-XDNA not installed"
+    echo ""
+    echo "  Install Triton-XDNA:"
+    echo "    pip install triton-xdna"
+    echo ""
+    echo "  Or use prebuilt xclbins in:"
+    echo "    $XCLBIN_DIR"
+    exit 1
 fi
+
+echo "Triton-XDNA: $PYTHON3_BIN"
+
+if [ ! -f "$COMPILE_SCRIPT" ]; then
+    echo "ERROR: Triton compile script not found: $COMPILE_SCRIPT"
+    echo "  Make sure kernels/triton/compile_kernels.py exists"
+    exit 1
+fi
+
+echo "Compile script: $COMPILE_SCRIPT"
 echo ""
-
-#====//
-# Compile a single MLIR file to xclbin
-#====//
-compile_kernel() {
-    local mlir_file="$1"
-    local output_xclbin="$2"
-    local profile="$3"
-    local kernel_name="$4"
-
-    local cmd="$AIECC_PATH --target=aie2p --npu-profile=$profile"
-
-    if [ -n "$PEANO_FLAGS" ]; then
-        cmd+=" $PEANO_FLAGS"
-    fi
-
-    # Add AIE_HOME include path if set
-    if [ -n "${AIE_HOME:-}" ]; then
-        cmd+=" -I${AIE_HOME}/include"
-    fi
-
-    cmd+=" \"$mlir_file\" -o \"$output_xclbin\""
-
-    echo -n "  [$kernel_name npu$profile] "
-
-    if eval "$cmd" 2>&1; then
-        if [ -f "$output_xclbin" ]; then
-            local size
-            size=$(stat -c%s "$output_xclbin" 2>/dev/null || stat -f%z "$output_xclbin" 2>/dev/null || echo "?")
-            echo "OK (${size} bytes)"
-            return 0
-        fi
-    fi
-
-    echo "FAILED"
-    return 1
-}
 
 #====//
 # Build kernels
@@ -184,25 +112,21 @@ TOTAL=0
 SUCCESS=0
 FAILED=0
 
-# Memory-limited kernel builds for 16 GB RAM machines.
-# Build only matmul first (critical path for bench-matmul).
-# Additional kernels can be built later with: ./scripts/build-kernels.sh npu6 rmsnorm
+# Kernels to build: name:compile_script_args
 Kernels=(
-    "matmul:matmul_i8/matmul.mlir:matmul"
+    "matmul:--M 256 --N 256 --K 256"
+    "rmsnorm:--N 2048"
+    "rope:--N 2048 --dims 64"
+    "softmax:--rows 1 --cols 1024"
+    "silu:--N 8192"
+    "flash_attn:--n_head 8 --head_dim 128 --ctx_len 2048"
 )
 
 for kernel_def in "${Kernels[@]}"; do
-    IFS=':' read -r kernel_name mlir_rel output_prefix <<< "$kernel_def"
+    IFS=':' read -r kernel_name kernel_args <<< "$kernel_def"
 
     # Apply kernel filter if set
     if [ -n "${KERNEL_FILTER:-}" ] && [ "$kernel_name" != "$KERNEL_FILTER" ]; then
-        continue
-    fi
-
-    mlir_file="$KERNELS_DIR/$mlir_rel"
-
-    if [ ! -f "$mlir_file" ]; then
-        echo "WARNING: MLIR source not found: $mlir_file (skipping $kernel_name)"
         continue
     fi
 
@@ -210,7 +134,7 @@ for kernel_def in "${Kernels[@]}"; do
 
     for profile in "${PROFILES[@]}"; do
         TOTAL=$((TOTAL + 1))
-        output_xclbin="$XCLBIN_DIR/${output_prefix}_npu${profile}.xclbin"
+        output_xclbin="$XCLBIN_DIR/${kernel_name}_npu${profile}.xclbin"
 
         if [ -f "$output_xclbin" ]; then
             echo "  [npu$profile] already exists, skipping"
@@ -218,9 +142,24 @@ for kernel_def in "${Kernels[@]}"; do
             continue
         fi
 
-        if compile_kernel "$mlir_file" "$output_xclbin" "$profile" "$kernel_name"; then
-            SUCCESS=$((SUCCESS + 1))
+        echo -n "  [npu$profile] "
+
+        if $PYTHON3_BIN "$COMPILE_SCRIPT" \
+            --op "$kernel_name" \
+            --profile "npu${profile}" \
+            --output-dir "$XCLBIN_DIR" \
+            $kernel_args 2>&1; then
+            
+            if [ -f "$output_xclbin" ]; then
+                size=$(stat -c%s "$output_xclbin" 2>/dev/null || stat -f%z "$output_xclbin" 2>/dev/null || echo "?")
+                echo "OK (${size} bytes)"
+                SUCCESS=$((SUCCESS + 1))
+            else
+                echo "FAILED (xclbin not produced)"
+                FAILED=$((FAILED + 1))
+            fi
         else
+            echo "FAILED"
             FAILED=$((FAILED + 1))
         fi
     done
@@ -249,11 +188,10 @@ fi
 if [ "$FAILED" -gt 0 ]; then
     echo "Some kernels failed to compile. Check the output above for errors."
     echo "Common issues:"
-    echo "  - MLIR syntax errors in source files"
-    echo "  - Missing Peano toolchain for tile code"
+    echo "  - Triton-XDNA not properly installed"
     echo "  - Insufficient memory during compilation"
     echo ""
-    echo "You can still run ggnpu with prebuilt xclbins or CPU reference backend."
+    echo "You can still run ggnpu with prebuilt xclbins."
     exit 1
 fi
 

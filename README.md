@@ -15,6 +15,7 @@ Run GGUF models on AMD NPUs (Krackan / XDNA2).
 | `/usr/lib/firmware/amdnpu` | Firmware directory |
 | XRT runtime and headers | `libxrt2`, `libxrt-npu2`, `libxrt-dev` |
 | CMake and C++ toolchain | `cmake`, `g++`, `make` or Ninja |
+| Python 3.10+ | For kernel compilation via Triton-XDNA |
 | User in host `render` group | Required to open the accel device |
 
 BIOS: NPU/IPU enabled. Boot: `amd_iommu=on`.
@@ -66,7 +67,7 @@ cmake --build build-npu -j2
   -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048 -n 32
 ```
 
-### Build NPU kernels (mlir-aie + Peano)
+### Build NPU kernels (Triton-XDNA)
 
 `bench-matmul` and inference need `.xclbin` kernel files in `~/.cache/ggnpu/xclbin/`.
 No NPU hardware is needed to build kernels — the compilation runs entirely on CPU.
@@ -79,52 +80,30 @@ sudo apt update
 sudo apt install build-essential cmake git clang lld ninja-build python3-pip python3-venv libssl-dev
 ```
 
+**Install Triton-XDNA** (one-time, replaces mlir-aie + Peano):
+
 ```bash
-# 1. Clone mlir-aie
-git clone https://github.com/Xilinx/mlir-aie.git ~/mlir-aie
-cd ~/mlir-aie
-git submodule update --init --recursive
+pip install triton-xdna
+```
 
-# 2. Create and activate venv (critical — pip will fail outside venv)
-python3 -m venv ironenv
-source ironenv/bin/activate
+This installs the complete compiler stack (Triton + mlir-air + mlir-aie + llvm-aie) as Python wheels.
 
-# 3. Install Python deps
-pip install --upgrade pip
-pip install -r python/requirements.txt
-pip install -r python/requirements_dev.txt
-pip install nanobind
+**Build ggnpu kernels:**
 
-# 4. Build mlir-aie using pre-built wheels (lightweight)
-bash ./utils/build-mlir-aie-from-wheels.sh
-source utils/env_setup.sh install
+```bash
+# Build all kernels for npu6 (Krackan)
+./scripts/build-kernels.sh npu6
 
-# 5. Clone and build Peano (AIE tile code compiler)
-git clone https://github.com/Xilinx/llvm-aie.git ~/llvm-aie
-cd ~/llvm-aie
-mkdir build && cd build
-cmake -GNinja ..
-ninja
-
-# 6. Set environment variables
-export AIE_HOME=~/mlir-aie/build
-export PEANO_HOME=~/llvm-aie/build
-
-# 7. Build ggnpu kernels (start with matmul — the critical kernel)
-cd ~/Documents/GitHub/ggnpu
+# Build only specific kernel
 ./scripts/build-kernels.sh npu6 matmul
 
-# Build additional kernels as needed
-./scripts/build-kernels.sh npu6 rmsnorm
-./scripts/build-kernels.sh npu6 rope
-./scripts/build-kernels.sh npu6 softmax
-./scripts/build-kernels.sh npu6 silu
-./scripts/build-kernels.sh npu6 flash_attn
+# Build for multiple profiles
+./scripts/build-kernels.sh npu4 npu5 npu6
 ```
 
 Output goes to `~/.cache/ggnpu/xclbin/`.
 
-**Building on a non-NPU machine:** Steps 1-7 work on any Ubuntu 24.04+ machine with ~16 GB RAM (32 GB recommended). No NPU, no `amdxdna` driver, no firmware needed. After building, copy the xclbins to the NPU machine:
+**Building on a non-NPU machine:** Steps work on any Ubuntu 24.04+ machine with ~16 GB RAM (32 GB recommended). No NPU, no `amdxdna` driver, no firmware needed. After building, copy the xclbins to the NPU machine:
 ```bash
 scp -r ~/.cache/ggnpu/xclbin/* user@npu-machine:~/.cache/ggnpu/xclbin/
 ```
@@ -144,4 +123,4 @@ These scripts check hardware, driver, permissions, XRT, and the local xclbin cac
 
 **Full host setup guide:** [docs/host-setup-guide.md](docs/host-setup-guide.md)
 
-**Kernel builds:** Local kernel compilation requires `mlir-aie` and Peano. If you already have prebuilt `.xclbin` files, place them under `~/.cache/ggnpu/xclbin/`.
+**Kernel builds:** Local kernel compilation requires `Triton-XDNA`. If you already have prebuilt `.xclbin` files, place them under `~/.cache/ggnpu/xclbin/`.

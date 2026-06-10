@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# CMake module path for FindPeano, FindXRT
+# CMake module path for FindXRT
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 # Options
@@ -13,7 +13,7 @@ option(GGNPU_BUILD_TESTS "Build unit tests" ON)
 option(GGNPU_NPU_BACKEND "Enable AMD NPU backend (requires XRT)" OFF)
 option(GGNPU_TEST_CPU "Enable CPU reference backend for testing" ON)
 option(GGNPU_BUILD_DOCS "Build documentation" OFF)
-option(GGNPU_BUILD_KERNELS "Build NPU kernels at build time (requires mlir-aie)" OFF)
+option(GGNPU_BUILD_KERNELS "Build NPU kernels at build time (requires Triton-XDNA)" OFF)
 
 # Compiler flags
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
@@ -32,6 +32,27 @@ if(GGNPU_NPU_BACKEND)
         set(GGNPU_NPU_BACKEND OFF)
     else()
         message(STATUS "XRT found: ${XRT_LIBRARIES} (headers: ${XRT_INCLUDE_DIRS})")
+    endif()
+endif()
+
+# Check for Triton-XDNA (for kernel building)
+set(TRITON_XDNA_FOUND OFF)
+if(GGNPU_BUILD_KERNELS)
+    find_program(PYTHON3_BIN python3)
+    if(PYTHON3_BIN)
+        execute_process(
+            COMMAND ${PYTHON3_BIN} -c "import triton; print('ok')"
+            RESULT_VARIABLE TRITON_RESULT
+            OUTPUT_QUIET
+            ERROR_QUIET
+        )
+        if(TRITON_RESULT EQUAL 0)
+            set(TRITON_XDNA_FOUND ON)
+            message(STATUS "Triton-XDNA found: ${PYTHON3_BIN}")
+        else()
+            message(WARNING "python3 found but triton module not available")
+            message(WARNING "  Install Triton-XDNA: pip install triton-xdna")
+        endif()
     endif()
 endif()
 
@@ -111,43 +132,22 @@ endif()
 install(TARGETS ggnpu DESTINATION bin)
 
 #====//
-# NPU Kernel Building (optional, requires mlir-aie + Peano)
-# Uses scripts/build-kernels.sh to compile all kernel types
+# NPU Kernel Building (optional, requires Triton-XDNA)
+# Uses scripts/build-kernels.sh to compile all kernel types via Triton-XDNA
 #====//
 if(GGNPU_BUILD_KERNELS)
-    set(AIECC_FOUND OFF)
-    set(AIE_HOME "" CACHE PATH "mlir-aie build directory")
-
-    if(AIE_HOME)
-        if(EXISTS "${AIE_HOME}/bin/aiecc.py")
-            set(AIECC_FOUND ON)
-            message(STATUS "mlir-aie found: ${AIE_HOME}/bin/aiecc.py")
-        else()
-            message(WARNING "AIE_HOME set to ${AIE_HOME} but aiecc.py not found")
-        endif()
-    else()
-        find_program(AIECC_BIN aiecc.py)
-        if(AIECC_BIN)
-            set(AIECC_FOUND ON)
-            message(STATUS "mlir-aie (aiecc.py) found: ${AIECC_BIN}")
-        endif()
-    endif()
-
-    if(AIECC_FOUND)
-        message(STATUS "NPU kernel building enabled (via scripts/build-kernels.sh)")
+    if(TRITON_XDNA_FOUND)
+        message(STATUS "NPU kernel building enabled (via Triton-XDNA)")
 
         # Create kernel output directory
         set(KERNEL_OUTPUT_DIR "${CMAKE_BINARY_DIR}/xclbin")
         file(MAKE_DIRECTORY "${KERNEL_OUTPUT_DIR}")
 
         # Build all kernels using the shell script
+        find_program(PYTHON3_BIN python3)
         add_custom_target(build_npu_kernels
-            COMMAND ${CMAKE_COMMAND} -E env
-                AIE_HOME=${AIE_HOME}
-                PEANO_HOME=${PEANO_HOME}
-                GGNPU_CACHE_DIR=${KERNEL_OUTPUT_DIR}
-            ${CMAKE_SOURCE_DIR}/scripts/build-kernels.sh
-            COMMENT "Building all NPU kernels (matmul, rmsnorm, rope, softmax, silu, flash_attn)"
+            COMMAND ${PYTHON3_BIN} ${CMAKE_SOURCE_DIR}/scripts/build-kernels.sh
+            COMMENT "Building all NPU kernels (matmul, rmsnorm, rope, softmax, silu, flash_attn) via Triton-XDNA"
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
             VERBATIM
         )
@@ -159,8 +159,9 @@ if(GGNPU_BUILD_KERNELS)
         )
 
     else()
-        message(STATUS "NPU kernel building disabled (aiecc.py not found)")
-        message(STATUS "  Install mlir-aie and set AIE_HOME, or enable prebuilt xclbins")
+        message(STATUS "NPU kernel building disabled (Triton-XDNA not found)")
+        message(STATUS "  Install Triton-XDNA: pip install triton-xdna")
+        message(STATUS "  Or use prebuilt xclbins in ~/.cache/ggnpu/xclbin/")
     endif()
 endif()
 
@@ -171,10 +172,10 @@ message(STATUS "  NPU backend:        ${GGNPU_NPU_BACKEND}")
 message(STATUS "  CPU ref backend:    ${GGNPU_TEST_CPU}")
 message(STATUS "  Tests:              ${GGNPU_BUILD_TESTS}")
 message(STATUS "  Kernel building:    ${GGNPU_BUILD_KERNELS}")
-if(AIECC_FOUND)
-    message(STATUS "  JIT compilation:    available")
+if(TRITON_XDNA_FOUND)
+    message(STATUS "  Triton-XDNA:       available")
 else()
-    message(STATUS "  JIT compilation:    not available (requires mlir-aie)")
+    message(STATUS "  Triton-XDNA:       not available (requires pip install triton-xdna)")
 endif()
 message(STATUS "=================================")
 message(STATUS "")
