@@ -146,21 +146,87 @@ cmake .. -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
 cmake --build . -j2
 ```
 
-## Step 8: Provide kernels
+## Step 8: Build NPU kernels (mlir-aie + Peano)
 
 `bench-matmul` and NPU inference need `.xclbin` kernel artifacts in `~/.cache/ggnpu/xclbin/`.
+No NPU hardware is needed to build kernels — the compilation runs entirely on CPU.
 
-If you already have prebuilt kernels, copy them there.
+### Option A: Build on an NPU machine (same machine)
 
-To build them locally, install `mlir-aie` and Peano, then run:
+Install mlir-aie and Peano, then run the kernel build script:
 
 ```bash
-export AIE_HOME=/path/to/mlir-aie
-export PEANO_HOME=/path/to/peano
+# 1. Clone mlir-aie
+git clone https://github.com/Xilinx/mlir-aie.git ~/mlir-aie
+cd ~/mlir-aie
+git submodule update --init --recursive
+
+# 2. Create and activate venv (critical — pip will fail without it)
+python3 -m venv ironenv
+source ironenv/bin/activate
+
+# 3. Install Python deps
+pip install --upgrade pip
+pip install -r python/requirements.txt
+pip install -r python/requirements_dev.txt
+pip install nanobind
+
+# 4. Build mlir-aie (uses pre-built LLVM/MLIR wheels — much lighter than building LLVM from source)
+bash ./utils/build-mlir-aie-from-wheels.sh
+source utils/env_setup.sh install
+
+# 5. Clone and build Peano (AIE tile code compiler)
+git clone https://github.com/Xilinx/llvm-aie.git ~/llvm-aie
+cd ~/llvm-aie
+mkdir build && cd build
+cmake -GNinja ..
+ninja
+cd ../..
+
+# 6. Set environment variables
+export AIE_HOME=~/mlir-aie/build
+export PEANO_HOME=~/llvm-aie/build
+
+# 7. Build ggnpu kernels (start with matmul — the critical kernel)
+cd ~/Documents/GitHub/ggnpu
 ./scripts/build-kernels.sh npu6 matmul
+
+# Build additional kernels as needed
+./scripts/build-kernels.sh npu6 rmsnorm
+./scripts/build-kernels.sh npu6 rope
+./scripts/build-kernels.sh npu6 softmax
+./scripts/build-kernels.sh npu6 silu
+./scripts/build-kernels.sh npu6 flash_attn
 ```
 
-On lower-memory machines, use prebuilt `xclbin` files if available.
+Output goes to `~/.cache/ggnpu/xclbin/`.
+
+### Option B: Build on a separate machine (no NPU needed)
+
+The kernel build machine only needs Ubuntu 24.04+, ~16 GB RAM (32 GB recommended), and ~50 GB disk.
+No NPU hardware, no `amdxdna` driver, no firmware required.
+
+1. Follow the same steps as Option A on the build machine
+2. After building, copy the xclbin files to the NPU machine:
+   ```bash
+   # On build machine
+   scp -r ~/.cache/ggnpu/xclbin/* user@npu-machine:~/.cache/ggnpu/xclbin/
+   ```
+
+### Option C: Use a cloud VM
+
+Spin up a 32 GB RAM VM (GCP, AWS, Lambda Labs), clone the repo, build kernels, and copy the `.xclbin` files back.
+
+## Step 9: Provide kernels (quick reference)
+
+After building, verify the xclbin files are in place:
+
+```bash
+ls -la ~/.cache/ggnpu/xclbin/
+# Expected: matmul_npu6.xclbin, rmsnorm_npu6.xclbin, etc.
+```
+
+If you built on a different machine, copy them there.
 
 ## Step 9: Run benchmark
 
