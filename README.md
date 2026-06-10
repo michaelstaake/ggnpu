@@ -13,7 +13,7 @@ Run GGUF models on AMD NPUs (Krackan / XDNA2).
 | Linux with `amdxdna` loaded | Ryzen AI / XDNA-capable host |
 | `/dev/accel/accel0` | NPU device node |
 | `/usr/lib/firmware/amdnpu` | Firmware directory |
-| XRT runtime and headers | `libxrt2`, `libxrt-npu2`, `libxrt-dev` |
+| XRT runtime, headers, tools | `libxrt2`, `libxrt-npu2`, `libxrt-dev`, `libxrt-utils` (xclbinutil) |
 | CMake and C++ toolchain | `cmake`, `g++`, `make` or Ninja |
 | Python 3.10+ | For kernel compilation via Triton-XDNA |
 | User in host `render` group | Required to open the accel device |
@@ -30,7 +30,7 @@ sudo apt install build-essential cmake git clang lld ninja-build python3-pip pyt
 # 2. XRT runtime + NPU driver (from AMD PPA)
 sudo add-apt-repository ppa:amd-team/xrt
 sudo apt update
-sudo apt install libxrt2 libxrt-npu2 libxrt-dev amdxdna-dkms
+sudo apt install libxrt2 libxrt-npu2 libxrt-dev libxrt-utils libxrt-utils-npu amdxdna-dkms
 
 # 3. Memlock limits (required for NPU pinned DMA buffers)
 echo '* soft memlock unlimited' | sudo tee /etc/security/limits.d/99-amdxdna.conf
@@ -105,7 +105,7 @@ Add the AMD PPA and install just the dev packages (no driver/firmware needed):
 ```bash
 sudo add-apt-repository -y ppa:amd-team/xrt
 sudo apt update
-sudo apt install -y libxrt2 libxrt-dev uuid-dev
+sudo apt install -y libxrt2 libxrt-dev libxrt-utils uuid-dev
 ```
 
 If the PPA isn't available, `./scripts/build-kernels.sh` will try
@@ -177,6 +177,7 @@ scp -r ~/.cache/ggnpu/xclbin/* user@npu-machine:~/.cache/ggnpu/xclbin/
 | `ERROR: Triton-XDNA not installed` | venv not activated, or installed without `--find-links` URLs. Run `bash scripts/setup-triton-env.sh` then `source ~/triton-env/bin/activate`. |
 | `Python.h` not found / launcher link fails | `sudo apt install python3-dev` |
 | `XRT development files not found` | Step 2: install `libxrt2 libxrt-dev uuid-dev` from the AMD PPA. |
+| `xclbinutil not found, skipping xclbin generation` | `sudo apt install libxrt-utils libxrt-utils-npu` (or `bash scripts/fetch-xrt-dev.sh --tools`). |
 | Build killed / OOM in WSL | Raise `memory=` in `.wslconfig` (Step 0), then `wsl --shutdown`. |
 | Symlink or random I/O errors in WSL | Repo is on `/mnt/c` — re-clone to `~/ggnpu`. |
 | Wheels not found for your Python | Use Ubuntu's default `python3` (3.10+); avoid exotic interpreters. |

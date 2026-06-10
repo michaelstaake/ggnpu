@@ -21,7 +21,7 @@ sudo add-apt-repository ppa:amd-team/xrt
 sudo apt update
 
 # Install XRT packages
-sudo apt install libxrt2 libxrt-npu2 libxrt-dev amdxdna-dkms
+sudo apt install libxrt2 libxrt-npu2 libxrt-dev libxrt-utils libxrt-utils-npu amdxdna-dkms
 
 # If PPA is not available, download from AMD's XRT releases:
 # https://github.com/Xilinx/XRT/releases

@@ -92,6 +92,13 @@ if [ -n "$TRITON_PY" ]; then
     else
         bad "llvm-aie (PEANO) wheel missing from venv"
     fi
+    if command -v xclbinutil >/dev/null 2>&1 \
+        || test -x /opt/xilinx/xrt/bin/xclbinutil \
+        || test -x "$SCRIPT_DIR/third_party/xrt-tools/usr/bin/xclbinutil"; then
+        ok "xclbinutil present (xclbin packaging)"
+    else
+        bad "xclbinutil missing — install libxrt-utils libxrt-utils-npu (or scripts/fetch-xrt-dev.sh --tools)"
+    fi
 else
     bad "No triton venv found (~/triton-env or .venv-triton)"
     echo "         bash scripts/setup-triton-env.sh"
