@@ -656,9 +656,12 @@ cmake --build . -j2
 Place prebuilt `.xclbin` files in `~/.cache/ggnpu/xclbin/`, or build them locally with Triton-XDNA:
 
 ```bash
-pip install triton-xdna
+bash scripts/setup-triton-env.sh
+source ~/triton-env/bin/activate
 ./scripts/build-kernels.sh npu6 matmul
 ```
+
+Kernel authoring uses Triton-XDNA (`kernels/triton/compile_kernels.py`). IRON/`XAie_TxnOpcode` references in this document describe the XRT control plane inside compiled xclbins, not a separate ggnpu build dependency.
 
 ---
 
@@ -671,6 +674,7 @@ pip install triton-xdna
 ```bash
 cmake -S . -B build-npu -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
 cmake --build build-npu -j2
+bash scripts/setup-triton-env.sh && source ~/triton-env/bin/activate
 ./scripts/build-kernels.sh npu6 matmul
 
 ./build-npu/ggnpu bench-matmul

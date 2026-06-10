@@ -1,9 +1,10 @@
 # Build artifacts
 build/
 build-*/
+build/air_cache/
 *.o
 *.a
-ggnpu
+/ggnpu
 test_gguf
 test_quant
 test_graph
@@ -27,6 +28,11 @@ Thumbs.db
 # Cache
 .cache/
 Testing/
+air_project/
+air_project_*/
+
+# Python venv for Triton-XDNA kernel builds
+.venv-triton/
 
 # Local dev package extracts (when system packages need sudo)
 third_party/xrt-dev/

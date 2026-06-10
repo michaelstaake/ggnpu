@@ -4,7 +4,7 @@ Run GGUF models on AMD NPUs (Krackan / XDNA2).
 
 ## Native host setup
 
-`ggnpu` is intended to be built and run directly on the host.
+`ggnpu` is intended to be built and run directly on the host. Docker is not used.
 
 ### Host prerequisites
 
@@ -96,6 +96,13 @@ pip install triton-xdna \
 ```
 
 This installs the complete compiler stack (Triton + mlir-air + mlir-aie + llvm-aie) as Python wheels.
+
+**Set up Triton-XDNA (one-time, for kernel builds):**
+
+```bash
+bash scripts/setup-triton-env.sh          # creates ~/triton-env (or .venv-triton)
+source ~/triton-env/bin/activate        # or: source .venv-triton/bin/activate
+```
 
 **Build ggnpu kernels:**
 

@@ -18,6 +18,21 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Auto-activate Triton venv when present
+if [ -z "${VIRTUAL_ENV:-}" ]; then
+    if [ -n "${GGNPU_TRITON_VENV:-}" ] && [ -f "${GGNPU_TRITON_VENV}/bin/activate" ]; then
+        # shellcheck disable=SC1091
+        source "${GGNPU_TRITON_VENV}/bin/activate"
+    elif [ -f "${SCRIPT_DIR}/.venv-triton/bin/activate" ]; then
+        # shellcheck disable=SC1091
+        source "${SCRIPT_DIR}/.venv-triton/bin/activate"
+    elif [ -f "${HOME}/triton-env/bin/activate" ]; then
+        # shellcheck disable=SC1091
+        source "${HOME}/triton-env/bin/activate"
+    fi
+fi
+
 CACHE_DIR="${GGNPU_CACHE_DIR:-$HOME/.cache/ggnpu}"
 XCLBIN_DIR="$CACHE_DIR/xclbin"
 COMPILE_SCRIPT="$SCRIPT_DIR/kernels/triton/compile_kernels.py"
@@ -83,11 +98,12 @@ if [ "$PYTHON3_FOUND" = false ]; then
 fi
 
 # Check if Triton is importable
-if ! $PYTHON3_BIN -c "import triton" 2>/dev/null; then
+if ! $PYTHON3_BIN -c "from triton.backends.amd_triton_npu.driver import NPUDriver" 2>/dev/null; then
     echo "ERROR: Triton-XDNA not installed"
     echo ""
-    echo "  Install Triton-XDNA:"
-    echo "    pip install triton-xdna"
+    echo "  Install with:"
+    echo "    bash scripts/setup-triton-env.sh"
+    echo "    source ~/triton-env/bin/activate   # or .venv-triton"
     echo ""
     echo "  Or use prebuilt xclbins in:"
     echo "    $XCLBIN_DIR"
@@ -114,7 +130,7 @@ FAILED=0
 
 # Kernels to build: name:compile_script_args
 Kernels=(
-    "matmul:--M 256 --N 256 --K 256"
+    "matmul:--M 64 --N 64 --K 64"
     "rmsnorm:--N 2048"
     "rope:--N 2048 --dims 64"
     "softmax:--rows 1 --cols 1024"

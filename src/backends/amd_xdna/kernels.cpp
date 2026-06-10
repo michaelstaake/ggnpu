@@ -80,6 +80,33 @@ std::vector<uint8_t> load_xclbin_file(const std::string& path) {
 //====//
 // Try to find prebuilt xclbin in common locations
 //====//
+std::string find_prebuilt_sequence(const std::string& xclbin_name, const std::string& cache_dir) {
+    std::string base = xclbin_name;
+    if (base.size() > 7 && base.substr(base.size() - 7) == ".xclbin") {
+        base = base.substr(0, base.size() - 7);
+    }
+    std::vector<std::string> candidates = {
+        base + "_sequence.bin",
+        base + ".sequence.bin",
+    };
+    for (const auto& name : candidates) {
+        fs::path p = fs::path(cache_dir) / "xclbin" / name;
+        if (fs::exists(p)) return p.string();
+    }
+    return "";
+}
+
+std::vector<uint32_t> load_sequence_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return {};
+    std::streamsize size = file.tellg();
+    if (size <= 0 || (size % 4) != 0) return {};
+    file.seekg(0, std::ios::beg);
+    std::vector<uint32_t> words(static_cast<size_t>(size / 4));
+    file.read(reinterpret_cast<char*>(words.data()), size);
+    return words;
+}
+
 std::string find_prebuilt_xclbin(const std::string& xclbin_name, const std::string& cache_dir) {
     // Check cache/xclbin directory first
     fs::path cache_path = fs::path(cache_dir) / "xclbin" / xclbin_name;
@@ -140,9 +167,8 @@ std::string find_python() {
 bool triton_xdna_available() {
     std::string python = find_python();
     if (python.empty()) return false;
-    
-    // Check if triton is importable
-    std::string cmd = python + " -c \"import triton; print('ok')\" 2>/dev/null";
+
+    std::string cmd = python + " -c \"from triton.backends.amd_triton_npu.driver import NPUDriver; print('ok')\" 2>/dev/null";
     return std::system(cmd.c_str()) == 0;
 }
 

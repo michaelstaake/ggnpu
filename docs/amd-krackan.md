@@ -11,7 +11,7 @@
 ## Kernel Requirements
 
 ```
-CONFIG_DRM_ACCEL_AMDXDMA=y
+CONFIG_DRM_ACCEL_AMDXDNA=y
 CONFIG_AMD_IOMMU=y
 ```
 

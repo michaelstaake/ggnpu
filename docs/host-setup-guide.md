@@ -1,6 +1,6 @@
 # Host Setup Guide for GGNPU
 
-This guide walks through the host setup required to build and run `ggnpu` directly on an AMD XDNA NPU system.
+This guide walks through the host setup required to build and run `ggnpu` directly on an AMD XDNA NPU system. Docker is not used — all builds and runs happen on the host.
 
 ## Prerequisites
 
@@ -120,11 +120,15 @@ Firmware:
   [PASS] NPU firmware
 
 XRT:
-  [PASS] XRT library
-  [PASS] XRT include
+  [PASS] XRT runtime (libxrt_coreutil)
+  [PASS] XRT NPU plugin (libxrt_driver_xdna)
+  [PASS] XRT headers (libxrt-dev)
+
+Kernels:
+  [PASS] xclbin cache present
 
 === Results ===
-Passed: 10
+Passed: 12
 Failed: 0
 ```
 
@@ -151,37 +155,29 @@ cmake --build . -j2
 `bench-matmul` and NPU inference need `.xclbin` kernel artifacts in `~/.cache/ggnpu/xclbin/`.
 No NPU hardware is needed to build kernels — the compilation runs entirely on CPU.
 
-### Install Triton-XDNA
+### Install Triton-XDNA (recommended: venv)
 
-Triton-XDNA is distributed via GitHub releases, not PyPI. Install it using:
+Kernel compilation uses a dedicated Python venv so compiler wheels stay isolated from system Python. C++ / XRT builds do not need the venv.
 
 ```bash
-# On the NPU host (system-wide):
-pip install triton-xdna --break-system-packages \
-  --find-links https://github.com/amd/Triton-XDNA/releases/expanded_assets/latest-wheels \
-  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
-  --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
-  --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
+# Recommended (creates ~/triton-env by default):
+bash scripts/setup-triton-env.sh
 
-# Or in a venv (for kernel building on a separate machine):
-python3 -m venv ~/triton-env
-source ~/triton-env/bin/activate
-pip install triton-xdna \
-  --find-links https://github.com/amd/Triton-XDNA/releases/expanded_assets/latest-wheels \
-  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
-  --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
-  --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
+# Or project-local venv:
+bash scripts/setup-triton-env.sh .venv-triton
+
+source ~/triton-env/bin/activate   # or: source .venv-triton/bin/activate
 ```
 
-This installs the complete compiler stack:
-- Triton (Python kernel language)
-- mlir-air (MLIR Air compiler)
-- mlir-aie (MLIR AIE compiler)
-- llvm-aie (Peano toolchain)
+The setup script installs `triton-xdna` plus transitive wheels (mlir-air, mlir-aie, llvm-aie/Peano) via GitHub find-links. You can also install system-wide on Ubuntu 24.04+ with `pip install triton-xdna --break-system-packages` and the same find-links URLs from [README.md](../README.md).
+
+Requires `libxrt-dev` (or `third_party/xrt-dev/`) and `uuid-dev` headers for the compile-only launcher build.
 
 ### Build ggnpu kernels
 
 ```bash
+source ~/triton-env/bin/activate   # if not already active
+
 # Build all kernels for npu6 (Krackan)
 ./scripts/build-kernels.sh npu6
 
@@ -216,10 +212,24 @@ After building, verify the xclbin files are in place:
 
 ```bash
 ls -la ~/.cache/ggnpu/xclbin/
-# Expected: matmul_npu6.xclbin, rmsnorm_npu6.xclbin, etc.
+# Expected: matmul_npu6.xclbin, matmul_npu6_sequence.bin, rmsnorm_npu6.xclbin, etc.
 ```
 
 If you built on a different machine, copy them there.
+
+### Register custom xclbins (unsigned kernels)
+
+The `amdxdna` driver loads verified firmware from `/lib/firmware/amdipu/`. For locally compiled (unsigned) xclbins, register them with XRT:
+
+```bash
+source /opt/xilinx/xrt/setup.sh
+sudo /opt/xilinx/xrt/amdxdna/setup_xclbin_firmware.sh -list
+# Example for Krackan:
+sudo /opt/xilinx/xrt/amdxdna/setup_xclbin_firmware.sh -dev Krackan \
+  -xclbin ~/.cache/ggnpu/xclbin/matmul_npu6.xclbin
+```
+
+Repeat for each kernel xclbin you need at runtime.
 
 ## Step 10: Run benchmark
 

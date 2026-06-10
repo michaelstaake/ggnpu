@@ -1,401 +1,501 @@
 #!/usr/bin/env python3
 """
-Triton-XDNA kernel definitions for ggnpu.
+Triton-XDNA kernel compiler for ggnpu.
 
-Replaces the mlir-aie/IRON kernel sources with Triton Python kernels.
-Compiled to .xclbin files using the Triton-XDNA compiler pipeline.
+Compiles @triton.jit kernels to .xclbin + sequence binaries using the
+Triton-XDNA compile-only pipeline (no NPU hardware required when
+AMD_TRITON_NPU_TARGET is set).
 
 Usage:
-    python3 compile_kernels.py --op matmul --profile npu6 --M 256 --N 256 --K 256
-    python3 compile_kernels.py --op rmsnorm --profile npu6 --N 2048
-    python3 compile_kernels.py --op softmax --profile npu6 --rows 1 --cols 1024
+    python3 compile_kernels.py --op matmul --profile npu6 --M 64 --N 64 --K 64
     python3 compile_kernels.py --op silu --profile npu6 --N 8192
 """
 
-import argparse
-import sys
-import os
-import subprocess
-import tempfile
-import shutil
+from __future__ import annotations
 
-# Kernel definitions
+import argparse
+import glob
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent.parent
+TRANSFORMS_DIR = SCRIPT_DIR / "transforms"
+
 KERNELS = {
     "matmul": {
-        "func": "matmul_kernel",
-        "description": "INT8/BF16 matrix multiplication",
+        "description": "INT8 matrix multiplication",
         "params": ["M", "N", "K"],
-        "dtype_in": "bfloat16",
-        "dtype_out": "float32",
+        "defaults": {"M": 64, "N": 64, "K": 64},
+        "transform": "matmul_aie2p.mlir",
     },
     "rmsnorm": {
-        "func": "rmsnorm_kernel",
         "description": "RMS normalization",
         "params": ["N"],
-        "dtype_in": "float32",
-        "dtype_out": "float32",
+        "defaults": {"N": 2048},
+        "transform": "rmsnorm_aie2p.mlir",
     },
     "softmax": {
-        "func": "softmax_kernel",
         "description": "Softmax activation",
         "params": ["rows", "cols"],
-        "dtype_in": "float32",
-        "dtype_out": "float32",
+        "defaults": {"rows": 1, "cols": 1024},
+        "transform": "softmax_aie2p.mlir",
     },
     "silu": {
-        "func": "silu_kernel",
         "description": "SiLU/Swish activation",
         "params": ["N"],
-        "dtype_in": "float32",
-        "dtype_out": "float32",
+        "defaults": {"N": 8192},
+        "transform": "silu_aie2p.mlir",
     },
     "rope": {
-        "func": "rope_kernel",
         "description": "Rotary positional embeddings",
         "params": ["N", "dims"],
-        "dtype_in": "float32",
-        "dtype_out": "float32",
+        "defaults": {"N": 2048, "dims": 64},
+        "transform": "rope_aie2p.mlir",
     },
     "flash_attn": {
-        "func": "flash_attn_kernel",
-        "description": "FlashAttention v1 (decomposed)",
+        "description": "FlashAttention v1 (decomposed matmul path)",
         "params": ["n_head", "head_dim", "ctx_len"],
-        "dtype_in": "float32",
-        "dtype_out": "float32",
+        "defaults": {"n_head": 8, "head_dim": 128, "ctx_len": 2048},
+        "transform": "flash_attn_aie2p.mlir",
     },
 }
 
-# Triton kernel source code
-KERNEL_SOURCES = {
-    "matmul": """
-import triton
-import triton.language as tl
-
-@triton.jit
-def matmul_kernel(
-    A, B, C,
-    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    stride_am: tl.constexpr, stride_ak: tl.constexpr,
-    stride_bk: tl.constexpr, stride_bn: tl.constexpr,
-    stride_cm: tl.constexpr, stride_cn: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    a_block = tl.load(A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_block = tl.load(B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-
-    c_block = tl.dot(a_block, b_block)
-
-    tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, c_block)
-""",
-    "rmsnorm": """
-import triton
-import triton.language as tl
-
-@triton.jit
-def rmsnorm_kernel(
-    input_ptr, output_ptr,
-    N: tl.constexpr,
-    eps: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offset < N
-
-    input_block = tl.load(input_ptr + offset, mask=mask)
-    
-    # Compute RMS
-    mean_square = tl.sum(input_block * input_block, axis=0) / N
-    rms = tl.sqrt(mean_square + eps)
-    
-    output_block = input_block / rms
-    
-    tl.store(output_ptr + offset, output_block, mask=mask)
-""",
-    "softmax": """
-import triton
-import triton.language as tl
-
-@triton.jit
-def softmax_kernel(
-    input_ptr, output_ptr,
-    rows: tl.constexpr, cols: tl.constexpr,
-    stride_row_in: tl.constexpr, stride_row_out: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offset < cols
-
-    for row in range(rows):
-        input_block = tl.load(input_ptr + row * stride_row_in + offset, mask=mask)
-        
-        # Subtract max for numerical stability
-        max_val = tl.max(input_block, axis=0)
-        exp_vals = tl.exp(input_block - max_val)
-        
-        # Normalize
-        sum_vals = tl.sum(exp_vals, axis=0)
-        output_block = exp_vals / sum_vals
-        
-        tl.store(output_ptr + row * stride_row_out + offset, output_block, mask=mask)
-""",
-    "silu": """
-import triton
-import triton.language as tl
-
-@triton.jit
-def silu_kernel(
-    input_ptr, output_ptr,
-    N: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offset < N
-
-    input_block = tl.load(input_ptr + offset, mask=mask)
-    
-    # SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-    output_block = input_block / (1.0 + tl.exp(-input_block))
-    
-    tl.store(output_ptr + offset, output_block, mask=mask)
-""",
-    "rope": """
-import triton
-import triton.language as tl
-import math
-
-@triton.jit
-def rope_kernel(
-    input_ptr, output_ptr,
-    N: tl.constexpr, dims: tl.constexpr,
-    offset: tl.constexpr, freq_base: tl.constexpr, freq_scale: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offset_idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offset_idx < N
-
-    input_block = tl.load(input_ptr + offset_idx, mask=mask)
-    
-    # Apply RoPE rotation (simplified - actual implementation needs pair-wise rotation)
-    # This is a placeholder - full RoPE requires pair-wise operations
-    output_block = input_block  # TODO: implement full RoPE
-    
-    tl.store(output_ptr + offset_idx, output_block, mask=mask)
-""",
-    "flash_attn": """
-import triton
-import triton.language as tl
-
-@triton.jit
-def flash_attn_kernel(
-    Q, K, V, output,
-    n_head: tl.constexpr, head_dim: tl.constexpr, ctx_len: tl.constexpr,
-    stride_qh: tl.constexpr, stride_kh: tl.constexpr, stride_vh: tl.constexpr,
-    stride_oh: tl.constexpr,
-    BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-):
-    # FlashAttention v1 (decomposed)
-    # TODO: Full implementation with tiling and memory optimization
-    pid = tl.program_id(0)
-    
-    # Load Q, K, V blocks
-    # Compute attention scores
-    # Apply softmax
-    # Weighted sum
-    # TODO: Implement full FlashAttention
-    pass
-""",
+# npu4/5/6 (Strix/Krackan) -> Triton target npu2 (AIE2P)
+PROFILE_TO_TARGET = {
+    "npu4": "npu2",
+    "npu5": "npu2",
+    "npu6": "npu2",
+    "npu1": "npu1",
 }
 
 
-def compile_kernel(op, profile, params, output_dir):
-    """Compile a single Triton kernel to xclbin using Triton-XDNA."""
-    
+def setup_compile_env(repo_root: Path) -> dict[str, str]:
+    """Return environment variables needed for Triton-XDNA compile-only builds."""
+    env = os.environ.copy()
+
+    xrt_candidates = [
+        Path("/opt/xilinx/xrt"),
+        repo_root / "third_party/xrt-dev/usr",
+    ]
+    for candidate in xrt_candidates:
+        if (candidate / "include/xrt").is_dir() and (candidate / "lib").is_dir():
+            env["XILINX_XRT"] = str(candidate)
+            break
+
+    uuid_inc = repo_root / "third_party/uuid-dev/usr/include"
+    if uuid_inc.is_dir():
+        inc = env.get("CPLUS_INCLUDE_PATH", "")
+        env["CPLUS_INCLUDE_PATH"] = f"{uuid_inc}:{inc}" if inc else str(uuid_inc)
+        lib = repo_root / "third_party/uuid-dev/usr/lib/x86_64-linux-gnu"
+        if lib.is_dir():
+            env["LIBRARY_PATH"] = f"{lib}:{env.get('LIBRARY_PATH', '')}"
+
+    if "XILINX_XRT" in env:
+        xrt_lib = Path(env["XILINX_XRT"]) / "lib/x86_64-linux-gnu"
+        if xrt_lib.is_dir():
+            env["LIBRARY_PATH"] = f"{xrt_lib}:{env.get('LIBRARY_PATH', '')}"
+
+    venv = os.environ.get("VIRTUAL_ENV") or os.environ.get("GGNPU_TRITON_VENV")
+    if not venv:
+        for candidate in (repo_root / ".venv-triton", Path.home() / "triton-env"):
+            if (candidate / "bin/python").exists():
+                venv = str(candidate)
+                break
+
+    if venv:
+        peano = Path(venv) / "lib"
+        for site in peano.glob("python*/site-packages/llvm-aie"):
+            env["PEANO_INSTALL_DIR"] = str(site)
+            env["PATH"] = f"{site}/bin:{env.get('PATH', '')}"
+            mlir_aie_bin = site.parent / "mlir_aie/bin"
+            if mlir_aie_bin.is_dir():
+                env["PATH"] = f"{mlir_aie_bin}:{env['PATH']}"
+            break
+
+    return env
+
+
+def profile_to_target(profile: str) -> str:
+    return PROFILE_TO_TARGET.get(profile, "npu2")
+
+
+def transform_path(op: str) -> Path:
+    script = KERNELS[op]["transform"]
+    path = TRANSFORMS_DIR / script
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing transform script for {op}: {path}")
+    return path.resolve()
+
+
+def build_kernel_script(op: str, params: dict) -> str:
+    """Generate a Python source file that compiles one kernel (Triton requires a file)."""
+    p = params
+
+    if op == "matmul":
+        launch = textwrap.dedent(f"""
+            M, N, K = {p.get("M", 64)}, {p.get("N", 64)}, {p.get("K", 64)}
+            a = torch.randint(-8, 8, (M, K), dtype=torch.int8)
+            b = torch.randint(-8, 8, (K, N), dtype=torch.int8)
+            c = torch.zeros((M, N), dtype=torch.int32)
+            grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]))
+            compiled = matmul_kernel[grid](
+                a, b, c, M, N, K,
+                a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+                BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64,
+            )
+        """)
+        kernel_src = textwrap.dedent("""
+            @triton.jit
+            def matmul_kernel(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                stride_am: tl.constexpr, stride_ak: tl.constexpr,
+                stride_bk: tl.constexpr, stride_bn: tl.constexpr,
+                stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+                BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+                pid_m = tl.program_id(0)
+                pid_n = tl.program_id(1)
+                offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+                offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                offs_k = tl.arange(0, BLOCK_SIZE_K)
+                a_block = tl.load(A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+                b_block = tl.load(B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+                c_block = tl.dot(a_block, b_block)
+                tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, c_block)
+        """)
+
+    elif op == "rmsnorm":
+        launch = textwrap.dedent(f"""
+            N = {p.get("N", 2048)}
+            x = torch.randn(N, dtype=torch.float32)
+            y = torch.empty(N, dtype=torch.float32)
+            grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
+            compiled = rmsnorm_kernel[grid](x, y, N, eps=1e-5, BLOCK_SIZE=1024)
+        """)
+        kernel_src = textwrap.dedent("""
+            @triton.jit
+            def rmsnorm_kernel(input_ptr, output_ptr, N: tl.constexpr, eps: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                pid = tl.program_id(0)
+                offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                mask = offset < N
+                input_block = tl.load(input_ptr + offset, mask=mask)
+                mean_square = tl.sum(input_block * input_block, axis=0) / N
+                rms = tl.sqrt(mean_square + eps)
+                output_block = input_block / rms
+                tl.store(output_ptr + offset, output_block, mask=mask)
+        """)
+
+    elif op == "softmax":
+        launch = textwrap.dedent(f"""
+            rows, cols = {p.get("rows", 1)}, {p.get("cols", 1024)}
+            x = torch.randn(rows, cols, dtype=torch.float32)
+            y = torch.empty(rows, cols, dtype=torch.float32)
+            grid = lambda META: (rows,)
+            compiled = softmax_kernel[grid](x, y, rows, cols, cols, cols, BLOCK_SIZE=1024)
+        """)
+        kernel_src = textwrap.dedent("""
+            @triton.jit
+            def softmax_kernel(input_ptr, output_ptr, rows: tl.constexpr, cols: tl.constexpr,
+                stride_row_in: tl.constexpr, stride_row_out: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                row = tl.program_id(0)
+                offset = tl.arange(0, BLOCK_SIZE)
+                mask = offset < cols
+                input_block = tl.load(input_ptr + row * stride_row_in + offset, mask=mask)
+                max_val = tl.max(input_block, axis=0)
+                exp_vals = tl.exp(input_block - max_val)
+                sum_vals = tl.sum(exp_vals, axis=0)
+                output_block = exp_vals / sum_vals
+                tl.store(output_ptr + row * stride_row_out + offset, output_block, mask=mask)
+        """)
+
+    elif op == "silu":
+        launch = textwrap.dedent(f"""
+            N = {p.get("N", 8192)}
+            x = torch.randn(N, dtype=torch.bfloat16)
+            y = torch.empty(N, dtype=torch.bfloat16)
+            grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
+            compiled = silu_kernel[grid](x, y, N, BLOCK_SIZE=1024)
+        """)
+        kernel_src = textwrap.dedent("""
+            @triton.jit
+            def silu_kernel(X, Y, n_elements: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                pid = tl.program_id(0)
+                offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                x = tl.load(X + offsets)
+                x_f32 = x.to(tl.float32)
+                sig = tl.sigmoid(x_f32)
+                y = (x_f32 * sig).to(x.dtype)
+                tl.store(Y + offsets, y)
+        """)
+
+    elif op == "rope":
+        launch = textwrap.dedent(f"""
+            N, dims = {p.get("N", 2048)}, {p.get("dims", 64)}
+            x = torch.randn(N, dtype=torch.float32)
+            y = torch.empty(N, dtype=torch.float32)
+            grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
+            compiled = rope_kernel[grid](x, y, N, dims, 0, 10000.0, 1.0, BLOCK_SIZE=1024)
+        """)
+        kernel_src = textwrap.dedent("""
+            @triton.jit
+            def rope_kernel(input_ptr, output_ptr, N: tl.constexpr, dims: tl.constexpr,
+                offset: tl.constexpr, freq_base: tl.constexpr, freq_scale: tl.constexpr,
+                BLOCK_SIZE: tl.constexpr):
+                pid = tl.program_id(0)
+                idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                mask = idx < N
+                x = tl.load(input_ptr + idx, mask=mask, other=0.0)
+                pair_idx = idx // 2
+                is_odd = (idx % 2) != 0
+                ratio = 1.0 / tl.exp2((2.0 * pair_idx.to(tl.float32)) * (3.32192809489 / dims))
+                angle = offset * ratio * freq_scale
+                cos_val = tl.cos(angle)
+                sin_val = tl.sin(angle)
+                x_pair = tl.load(input_ptr + (pair_idx * 2 + (1 - is_odd.to(tl.int32))), mask=mask, other=0.0)
+                out = tl.where(is_odd, x * cos_val + x_pair * sin_val, x * cos_val - x_pair * sin_val)
+                tl.store(output_ptr + idx, out, mask=mask)
+        """)
+
+    elif op == "flash_attn":
+        launch = textwrap.dedent(f"""
+            n_head, head_dim, ctx_len = {p.get("n_head", 8)}, {p.get("head_dim", 128)}, {p.get("ctx_len", 2048)}
+            Q = torch.randn(n_head, head_dim, dtype=torch.float32)
+            K = torch.randn(ctx_len, head_dim, dtype=torch.float32)
+            V = torch.randn(ctx_len, head_dim, dtype=torch.float32)
+            O = torch.empty(n_head, head_dim, dtype=torch.float32)
+            grid = lambda META: (n_head,)
+            compiled = flash_attn_kernel[grid](
+                Q, K, V, O, n_head, head_dim, ctx_len,
+                head_dim, ctx_len * head_dim, ctx_len * head_dim, head_dim,
+                BLOCK_SIZE_Q=64, BLOCK_SIZE_K=64,
+            )
+        """)
+        kernel_src = textwrap.dedent("""
+            @triton.jit
+            def flash_attn_kernel(Q, K, V, output, n_head: tl.constexpr, head_dim: tl.constexpr, ctx_len: tl.constexpr,
+                stride_qh: tl.constexpr, stride_kh: tl.constexpr, stride_vh: tl.constexpr, stride_oh: tl.constexpr,
+                BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+                pid = tl.program_id(0)
+                q = tl.load(Q + pid * stride_qh + tl.arange(0, head_dim))
+                scores = tl.zeros([BLOCK_SIZE_K], dtype=tl.float32)
+                for k in range(0, ctx_len, BLOCK_SIZE_K):
+                    k_idx = k + tl.arange(0, BLOCK_SIZE_K)
+                    k_mask = k_idx < ctx_len
+                    k_row = tl.load(K + k_idx[:, None] * head_dim + tl.arange(0, head_dim)[None, :], mask=k_mask[:, None])
+                    dot = tl.sum(q[None, :] * k_row, axis=1)
+                    scores = tl.where(k_mask, dot, scores)
+                max_s = tl.max(scores, axis=0)
+                exp_s = tl.exp(scores - max_s)
+                sum_s = tl.sum(exp_s, axis=0)
+                weights = exp_s / sum_s
+                out = tl.zeros([head_dim], dtype=tl.float32)
+                for k in range(0, ctx_len, BLOCK_SIZE_K):
+                    k_idx = k + tl.arange(0, BLOCK_SIZE_K)
+                    k_mask = k_idx < ctx_len
+                    v_row = tl.load(V + k_idx[:, None] * head_dim + tl.arange(0, head_dim)[None, :], mask=k_mask[:, None])
+                    w = tl.load(weights + k_idx - k, mask=k_mask, other=0.0)
+                    out += tl.sum(v_row * w[:, None], axis=0)
+                tl.store(output + pid * stride_oh + tl.arange(0, head_dim), out)
+        """)
+    else:
+        raise ValueError(f"Unknown op: {op}")
+
+    launch_body = textwrap.indent(launch.strip(), "    ")
+    return (
+        "import os\n"
+        "import torch\n"
+        "import triton\n"
+        "import triton.language as tl\n"
+        "from triton.backends.amd_triton_npu.driver import NPUDriver, get_npu_cache_dir\n"
+        "from triton.backends.amd_triton_npu.config import npu_config\n"
+        "\n"
+        "triton.runtime.driver.set_active(NPUDriver())\n"
+        "npu_config.compile_only = True\n"
+        "npu_config.target = os.environ.get('AMD_TRITON_NPU_TARGET', 'npu2')\n"
+        "npu_config.output_format = os.environ.get('AMD_TRITON_NPU_OUTPUT_FORMAT', 'xclbin')\n"
+        "npu_config.air_project_path = os.environ.get('AMD_TRITON_NPU_AIR_PROJECT_PATH', './air_project')\n"
+        "\n"
+        f"{kernel_src.strip()}\n"
+        "\n"
+        "def main():\n"
+        f"{launch_body}\n"
+        "    cache = get_npu_cache_dir(compiled)\n"
+        "    print('NPU_CACHE_DIR=' + (cache or ''))\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n"
+    )
+
+
+def run_aircc_fallback(air_project: Path, env: dict[str, str]) -> None:
+    """Run aircc directly when Triton exits before writing aie.xclbin."""
+    mlir = air_project / "asm_air_output.mlir"
+    if not mlir.is_file():
+        nested = air_project / "air_project" / "asm_air_output.mlir"
+        if nested.is_file():
+            mlir = nested
+        else:
+            return
+
+    aircc = None
+    for site in Path(sys.executable).parent.parent.glob("lib/python*/site-packages/mlir_air/bin/aircc"):
+        if site.is_file():
+            aircc = site
+            break
+    if not aircc:
+        return
+
+    insts = air_project / "insts.bin"
+    xclbin = air_project / "aie.xclbin"
+    cmd = [
+        str(aircc),
+        "--device", env.get("AMD_TRITON_NPU_TARGET", "npu2"),
+        "--no-xchesscc", "--no-xbridge",
+        "--output-format", "xclbin",
+        "-i", str(insts),
+        "-o", str(xclbin),
+        "--air-runtime-loop-tiling-sizes=4",
+        "--air-runtime-loop-tiling-sizes=4",
+        "--stack-size", "2048",
+        str(mlir),
+    ]
+    subprocess.run(cmd, env=env, cwd=str(mlir.parent), capture_output=True, timeout=600)
+
+
+def find_artifacts(search_roots: list[Path]) -> tuple[Path | None, Path | None]:
+    """Locate aie.xclbin and insts.bin under Triton/air project directories."""
+    xclbin = None
+    insts = None
+    for root in search_roots:
+        if not root or not root.exists():
+            continue
+        for hit in root.rglob("aie.xclbin"):
+            if hit.is_file() and hit.stat().st_size > 0:
+                xclbin = hit
+                break
+        for hit in root.rglob("insts.bin"):
+            if hit.is_file() and hit.stat().st_size > 0:
+                insts = hit
+        if xclbin and insts:
+            break
+    return xclbin, insts
+
+
+def compile_kernel(op: str, profile: str, params: dict, output_dir: Path, repo_root: Path) -> bool:
     if op not in KERNELS:
-        print(f"Error: Unknown kernel '{op}'. Available: {list(KERNELS.keys())}")
+        print(f"Error: Unknown kernel '{op}'")
         return False
-    
-    if op not in KERNEL_SOURCES:
-        print(f"Error: No Triton source for kernel '{op}'")
-        return False
-    
-    # Get kernel info
-    kernel_info = KERNELS[op]
-    print(f"Compiling {op}: {kernel_info['description']}")
-    
-    # Create temporary Python script
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        script_path = f.name
-        f.write(KERNEL_SOURCES[op])
-        f.write("\n\n")
-        
-        # Build the parameter values for the generated script
-        # We need to embed the actual values, not reference a 'params' dict
-        p = params
 
-        # Add compilation code
-        f.write(f'''
-import triton
-from triton.backends.amd_triton_npu.driver import NPUDriver
+    target = profile_to_target(profile)
+    transform = transform_path(op)
+    build_dir = repo_root / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    air_project = Path(tempfile.mkdtemp(prefix=f"ggnpu_{op}_{profile}_", dir=str(build_dir)))
 
-# Set NPU backend
-triton.runtime.driver.set_active(NPUDriver())
+    env = setup_compile_env(repo_root)
+    env["AMD_TRITON_NPU_TARGET"] = target
+    env["AMD_TRITON_NPU_OUTPUT_FORMAT"] = "xclbin"
+    env["AMD_TRITON_NPU_COMPILE_ONLY"] = "1"
+    env["AIR_TRANSFORM_TILING_SCRIPT"] = str(transform)
+    env["AMD_TRITON_NPU_AIR_PROJECT_PATH"] = str(air_project)
 
-# Get kernel function
-kernel_func = {kernel_info['func']}
+    print(f"Compiling {op}: {KERNELS[op]['description']}")
+    print(f"  profile={profile} target={target}")
+    print(f"  transform={transform.name}")
 
-# Build grid based on kernel type
-if "{op}" == "matmul":
-    M, N, K = {p.get("M", 256)}, {p.get("N", 256)}, {p.get("K", 256)}
-    BLOCK_SIZE_M = 256
-    BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = K
-    grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]))
-    kernel_func[grid](
-        None, None, None,  # Dummy pointers for compilation
-        M, N, K,
-        K, 1,  # stride_am, stride_ak (dummy)
-        N, 1,  # stride_bk, stride_bn (dummy)
-        N, 1,  # stride_cm, stride_cn (dummy)
-        BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
-    )
-elif "{op}" == "rmsnorm":
-    N = {p.get("N", 2048)}
-    BLOCK_SIZE = 1024
-    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
-    kernel_func[grid](
-        None, None,  # Dummy pointers
-        N, 1e-5,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-elif "{op}" == "softmax":
-    rows, cols = {p.get("rows", 1)}, {p.get("cols", 1024)}
-    BLOCK_SIZE = 1024
-    grid = lambda META: (triton.cdiv(rows, META["BLOCK_SIZE"]),)
-    kernel_func[grid](
-        None, None,  # Dummy pointers
-        rows, cols,
-        cols, cols,  # stride_row_in, stride_row_out
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-elif "{op}" == "silu":
-    N = {p.get("N", 8192)}
-    BLOCK_SIZE = 1024
-    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
-    kernel_func[grid](
-        None, None,  # Dummy pointers
-        N,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-elif "{op}" == "rope":
-    N, dims = {p.get("N", 2048)}, {p.get("dims", 64)}
-    BLOCK_SIZE = 1024
-    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
-    kernel_func[grid](
-        None, None,  # Dummy pointers
-        N, dims,
-        0, 500000, 1.0,  # offset, freq_base, freq_scale
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-elif "{op}" == "flash_attn":
-    n_head, head_dim, ctx_len = {p.get("n_head", 8)}, {p.get("head_dim", 128)}, {p.get("ctx_len", 2048)}
-    BLOCK_SIZE_Q = 64
-    BLOCK_SIZE_K = 64
-    grid = lambda META: (n_head,)
-    kernel_func[grid](
-        None, None, None, None,  # Dummy pointers
-        n_head, head_dim, ctx_len,
-        head_dim, ctx_len * head_dim, ctx_len * head_dim,  # strides
-        head_dim,  # stride_oh
-        BLOCK_SIZE_Q=BLOCK_SIZE_Q, BLOCK_SIZE_K=BLOCK_SIZE_K,
-    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=f"_{op}_compile.py", delete=False) as f:
+        f.write(build_kernel_script(op, params))
+        compile_script = f.name
 
-print(f"Compiled {op} kernel successfully")
-''')
-    
+    npu_cache_dir = None
     try:
-        # Run compilation
-        print(f"  Running Triton-XDNA compiler...")
+        print("  Running Triton-XDNA compiler...")
         result = subprocess.run(
-            [sys.executable, script_path],
+            [sys.executable, compile_script],
             capture_output=True,
             text=True,
-            timeout=300  # 5 minute timeout
+            timeout=600,
+            env=env,
+            cwd=str(repo_root),
         )
-        
+        if result.stdout:
+            for line in result.stdout.splitlines():
+                if line.startswith("NPU_CACHE_DIR="):
+                    npu_cache_dir = line.split("=", 1)[1].strip() or None
+                elif line.strip():
+                    print(f"  {line}")
         if result.returncode != 0:
-            print(f"  ERROR: Compilation failed")
-            print(f"  stdout: {result.stdout}")
-            print(f"  stderr: {result.stderr}")
-            return False
-        
-        print(f"  Compilation successful")
-        return True
-        
+            print("  Triton compile returned non-zero; trying aircc fallback...")
+            if result.stderr:
+                print(result.stderr[-2000:])
+            run_aircc_fallback(air_project, env)
     except subprocess.TimeoutExpired:
-        print(f"  ERROR: Compilation timed out")
+        print("  ERROR: Compilation timed out")
         return False
     finally:
-        # Clean up temp file
-        os.unlink(script_path)
+        os.unlink(compile_script)
+
+    search_roots = [Path(npu_cache_dir) if npu_cache_dir else None, air_project, air_project / "air_project"]
+    xclbin_src, insts_src = find_artifacts([r for r in search_roots if r])
+
+    if not xclbin_src:
+        print("  ERROR: aie.xclbin not found after compile")
+        print("  Ensure XRT headers (libxrt-dev) and PEANO (llvm-aie wheel) are available.")
+        print("  See docs/host-setup-guide.md Step 8.")
+        return False
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    xclbin_dst = output_dir / f"{op}_{profile}.xclbin"
+    shutil.copy2(xclbin_src, xclbin_dst)
+
+    if insts_src:
+        insts_dst = output_dir / f"{op}_{profile}_sequence.bin"
+        shutil.copy2(insts_src, insts_dst)
+
+    size = xclbin_dst.stat().st_size
+    print(f"  Wrote {xclbin_dst} ({size} bytes)")
+    if insts_src:
+        print(f"  Wrote {output_dir / f'{op}_{profile}_sequence.bin'}")
+
+    try:
+        shutil.rmtree(air_project, ignore_errors=True)
+    except OSError:
+        pass
+    return True
 
 
 def main():
     parser = argparse.ArgumentParser(description="Compile ggnpu Triton kernels to xclbin")
-    parser.add_argument("--op", required=True, choices=list(KERNELS.keys()),
-                       help="Kernel type to compile")
-    parser.add_argument("--profile", default="npu6", choices=["npu4", "npu5", "npu6"],
-                       help="NPU profile (npu4/5/6)")
-    parser.add_argument("--output-dir", default="~/.cache/ggnpu/xclbin",
-                       help="Output directory for xclbin files")
-    
-    # Kernel-specific parameters
-    parser.add_argument("--M", type=int, help="Matmul M dimension")
-    parser.add_argument("--N", type=int, help="Matmul/RMSNorm/SiLU/N dimension")
-    parser.add_argument("--K", type=int, help="Matmul K dimension")
-    parser.add_argument("--rows", type=int, help="Softmax rows")
-    parser.add_argument("--cols", type=int, help="Softmax cols")
-    parser.add_argument("--dims", type=int, help="RoPE dims")
-    parser.add_argument("--n_head", type=int, help="FlashAttention n_head")
-    parser.add_argument("--head_dim", type=int, help="FlashAttention head_dim")
-    parser.add_argument("--ctx_len", type=int, help="FlashAttention ctx_len")
-    
+    parser.add_argument("--op", required=True, choices=list(KERNELS.keys()))
+    parser.add_argument("--profile", default="npu6", choices=["npu4", "npu5", "npu6", "npu1"])
+    parser.add_argument("--output-dir", default="~/.cache/ggnpu/xclbin")
+    parser.add_argument("--M", type=int)
+    parser.add_argument("--N", type=int)
+    parser.add_argument("--K", type=int)
+    parser.add_argument("--rows", type=int)
+    parser.add_argument("--cols", type=int)
+    parser.add_argument("--dims", type=int)
+    parser.add_argument("--n_head", type=int)
+    parser.add_argument("--head_dim", type=int)
+    parser.add_argument("--ctx_len", type=int)
     args = parser.parse_args()
-    
-    # Expand output directory
-    output_dir = os.path.expanduser(args.output_dir)
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Build parameters dict
-    params = {}
-    if args.M: params["M"] = args.M
-    if args.N: params["N"] = args.N
-    if args.K: params["K"] = args.K
-    if args.rows: params["rows"] = args.rows
-    if args.cols: params["cols"] = args.cols
-    if args.dims: params["dims"] = args.dims
-    if args.n_head: params["n_head"] = args.n_head
-    if args.head_dim: params["head_dim"] = args.head_dim
-    if args.ctx_len: params["ctx_len"] = args.ctx_len
-    
-    # Compile kernel
-    success = compile_kernel(args.op, args.profile, params, output_dir)
-    
-    if success:
-        xclbin_path = os.path.join(output_dir, f"{args.op}_{args.profile}.xclbin")
-        print(f"\nKernel compiled: {xclbin_path}")
+
+    output_dir = Path(os.path.expanduser(args.output_dir))
+    defaults = KERNELS[args.op]["defaults"].copy()
+    for key in KERNELS[args.op]["params"]:
+        val = getattr(args, key, None)
+        if val is not None:
+            defaults[key] = val
+
+    ok = compile_kernel(args.op, args.profile, defaults, output_dir, REPO_ROOT)
+    if ok:
+        print(f"\nKernel compiled: {output_dir / f'{args.op}_{args.profile}.xclbin'}")
     else:
-        print(f"\nKernel compilation FAILED")
+        print("\nKernel compilation FAILED")
         sys.exit(1)
 
 

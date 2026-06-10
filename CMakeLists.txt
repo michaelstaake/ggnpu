@@ -41,7 +41,7 @@ if(GGNPU_BUILD_KERNELS)
     find_program(PYTHON3_BIN python3)
     if(PYTHON3_BIN)
         execute_process(
-            COMMAND ${PYTHON3_BIN} -c "import triton; print('ok')"
+            COMMAND ${PYTHON3_BIN} -c "from triton.backends.amd_triton_npu.driver import NPUDriver; print('ok')"
             RESULT_VARIABLE TRITON_RESULT
             OUTPUT_QUIET
             ERROR_QUIET
@@ -144,9 +144,9 @@ if(GGNPU_BUILD_KERNELS)
         file(MAKE_DIRECTORY "${KERNEL_OUTPUT_DIR}")
 
         # Build all kernels using the shell script
-        find_program(PYTHON3_BIN python3)
+        find_program(BASH_BIN bash)
         add_custom_target(build_npu_kernels
-            COMMAND ${PYTHON3_BIN} ${CMAKE_SOURCE_DIR}/scripts/build-kernels.sh
+            COMMAND ${BASH_BIN} ${CMAKE_SOURCE_DIR}/scripts/build-kernels.sh
             COMMENT "Building all NPU kernels (matmul, rmsnorm, rope, softmax, silu, flash_attn) via Triton-XDNA"
             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
             VERBATIM

@@ -34,7 +34,7 @@ GGNPU is a custom C++20 inference runtime that runs standard GGUF models on AMD 
 ### Layer 6: AMD XDNA Backend
 - XRT device management
 - Buffer allocation (pinned memory)
-- Kernel compilation (mlir-aie, Peano)
+- Kernel compilation (Triton-XDNA → xclbin)
 - Work submission and sync
 
 ## Data Flow

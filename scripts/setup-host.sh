@@ -79,7 +79,7 @@ if ls "$HOME/.cache/ggnpu/xclbin/"*.xclbin >/dev/null 2>&1; then
     echo "  xclbin cache: $(ls "$HOME/.cache/ggnpu/xclbin/"*.xclbin | wc -l) file(s)"
 else
     echo "  WARNING: no xclbins in ~/.cache/ggnpu/xclbin/"
-    echo "    Build with mlir-aie: AIE_HOME=... ./scripts/build-kernels.sh npu6"
+    echo "    Build with Triton-XDNA: bash scripts/setup-triton-env.sh && ./scripts/build-kernels.sh npu6"
     echo "    Or copy prebuilt xclbins into that directory"
 fi
 
@@ -91,7 +91,7 @@ echo "  1. Install build deps: sudo apt install build-essential cmake git libxrt
 echo "  2. Add to render group: sudo usermod -aG render \$USER  (re-login)"
 echo "  3. Build: cmake -S . -B build-npu -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON"
 echo "  4. Compile: cmake --build build-npu -j2"
-echo "  5. If needed, build kernels: AIE_HOME=... PEANO_HOME=... ./scripts/build-kernels.sh npu6 matmul"
+echo "  5. If needed, build kernels: bash scripts/setup-triton-env.sh && ./scripts/build-kernels.sh npu6 matmul"
 echo "  6. Run: ./build-npu/ggnpu bench-matmul"
 echo ""
 echo "See README.md and docs/host-setup-guide.md"

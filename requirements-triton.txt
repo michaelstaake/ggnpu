@@ -1,0 +1,4 @@
+# Triton-XDNA and transitive compiler wheels.
+# Do not pip install this file directly — use scripts/setup-triton-env.sh
+# which passes the required --find-links URLs for GitHub release wheels.
+triton-xdna

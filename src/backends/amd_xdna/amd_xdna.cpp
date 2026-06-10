@@ -26,6 +26,8 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr xrt::memory_group kDefaultMemGroup = 0;
+constexpr const char* kTritonXdnaKernelName = "MLIR_AIE";
+constexpr uint32_t kNpuOpcode = 3;
 
 struct PairHash {
     size_t operator()(const std::pair<int, int>& p) const noexcept {
@@ -54,6 +56,8 @@ xrt::uuid load_xclbin_from_data(xrt::device& dev, const std::vector<uint8_t>& da
 namespace detail {
     std::vector<uint8_t> load_xclbin_file(const std::string& path);
     std::string find_prebuilt_xclbin(const std::string& xclbin_name, const std::string& cache_dir);
+    std::string find_prebuilt_sequence(const std::string& xclbin_name, const std::string& cache_dir);
+    std::vector<uint32_t> load_sequence_file(const std::string& path);
     std::vector<uint8_t> jit_compile_matmul(int M, int N, int K, int profile);
     std::vector<uint8_t> jit_compile_rmsnorm(int N, int profile);
     std::vector<uint8_t> jit_compile_rope(int n_dims, int profile);
@@ -128,6 +132,8 @@ private:
 // Cached kernel for matmul: holds xrt::run for a specific shape
 struct CachedMatmulKernel {
     xrt::run run;
+    xrt::bo bo_instr;
+    size_t instr_words = 0;
     int M, N, K;
     GgmlType B_type;
 };
@@ -210,8 +216,8 @@ public:
         if (!any_kernel_loaded) {
             std::cerr << "Warning: no NPU kernels available. Matmul and rmsnorm xclbins not found.\n";
             std::cerr << "  Run with --dump-tensors to test GGUF parsing without NPU.\n";
-            std::cerr << "  Prebuilt xclbins are needed, or set AIE_HOME for JIT compilation.\n";
-            std::cerr << "  Use scripts/build-kernels.sh to compile kernels from source.\n";
+            std::cerr << "  Prebuilt xclbins are needed, or install Triton-XDNA for JIT compilation.\n";
+            std::cerr << "  Run: bash scripts/setup-triton-env.sh && ./scripts/build-kernels.sh npu6\n";
         }
     }
 
@@ -269,8 +275,13 @@ public:
 
         // Set kernel arguments: (buf_a, buf_b, buf_c, M, N, K)
         try {
-            kernel.run(buf_a_->handle(), buf_b_->handle(), buf_c_->handle(),
-                       static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K));
+            if (kernel.bo_instr && kernel.instr_words > 0) {
+                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                           buf_a_->handle(), buf_b_->handle(), buf_c_->handle());
+            } else {
+                kernel.run(buf_a_->handle(), buf_b_->handle(), buf_c_->handle(),
+                           static_cast<uint32_t>(M), static_cast<uint32_t>(N), static_cast<uint32_t>(K));
+            }
         } catch (const std::exception& e) {
             std::cerr << "Error: matmul kernel execution failed: " << e.what() << "\n";
             last_status_ = Status::ERROR;
@@ -572,7 +583,7 @@ private:
         if (xclbin_path.empty()) {
             std::cerr << "Warning: no matmul xclbin found for profile " << profile_str_ << "\n";
             std::cerr << "  Place prebuilt xclbin at: " << xclbin_path << "\n";
-            std::cerr << "  Or build with mlir-aie to generate one.\n";
+            std::cerr << "  Build kernels: bash scripts/setup-triton-env.sh && ./scripts/build-kernels.sh npu6 matmul\n";
             return false;
         }
 
@@ -626,10 +637,22 @@ private:
             xrt::device tmp_device(*device_);
             xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
 
-            xrt::kernel krnl(tmp_device, tmp_uuid, "matmul");
+            xrt::kernel krnl(tmp_device, tmp_uuid, kTritonXdnaKernelName);
             xrt::run run(krnl);
-
-            matmul_kernels_[cache_key] = CachedMatmulKernel{run, M, N, K, B_type};
+            CachedMatmulKernel cached{run, {}, 0, M, N, K, B_type};
+            std::string seq_path = detail::find_prebuilt_sequence(fs::path(path).filename().string(), cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    cached.bo_instr = xrt::bo(tmp_device, words.size() * sizeof(uint32_t),
+                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            matmul_kernels_[cache_key] = std::move(cached);
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Warning: failed to load matmul kernel from cache: " << e.what() << "\n";
@@ -639,10 +662,22 @@ private:
 
     bool create_matmul_kernel_from_loaded_xclbin(int M, int N, int K, GgmlType B_type, const std::string& cache_key) {
         try {
-            xrt::kernel krnl(*device_, xclbin_uuid_, "matmul");
+            xrt::kernel krnl(*device_, xclbin_uuid_, kTritonXdnaKernelName);
             xrt::run run(krnl);
-
-            matmul_kernels_[cache_key] = CachedMatmulKernel{run, M, N, K, B_type};
+            CachedMatmulKernel cached{run, {}, 0, M, N, K, B_type};
+            std::string seq_path = detail::find_prebuilt_sequence("matmul_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            matmul_kernels_[cache_key] = std::move(cached);
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to create matmul kernel: " << e.what() << "\n";
@@ -721,7 +756,7 @@ private:
             xrt::device tmp_device(*device_);
             xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
 
-            xrt::kernel krnl(tmp_device, tmp_uuid, "rmsnorm");
+            xrt::kernel krnl(tmp_device, tmp_uuid, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             rmsnorm_kernels_[N] = CachedRmsNormKernel{run, N};
@@ -734,7 +769,7 @@ private:
 
     bool create_rmsnorm_kernel_from_loaded_xclbin(int N, const std::string& cache_key) {
         try {
-            xrt::kernel krnl(*device_, xclbin_uuid_rmsnorm_, "rmsnorm");
+            xrt::kernel krnl(*device_, xclbin_uuid_rmsnorm_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             rmsnorm_kernels_[N] = CachedRmsNormKernel{run, N};
@@ -816,7 +851,7 @@ private:
             xrt::device tmp_device(*device_);
             xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
 
-            xrt::kernel krnl(tmp_device, tmp_uuid, "softmax");
+            xrt::kernel krnl(tmp_device, tmp_uuid, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             softmax_kernels_[std::make_pair(rows, cols)] = CachedSoftmaxKernel{run, rows, cols};
@@ -829,7 +864,7 @@ private:
 
     bool create_softmax_kernel_from_loaded_xclbin(int rows, int cols, const std::string& cache_key) {
         try {
-            xrt::kernel krnl(*device_, xclbin_uuid_softmax_, "softmax");
+            xrt::kernel krnl(*device_, xclbin_uuid_softmax_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             softmax_kernels_[std::make_pair(rows, cols)] = CachedSoftmaxKernel{run, rows, cols};
@@ -911,7 +946,7 @@ private:
             xrt::device tmp_device(*device_);
             xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
 
-            xrt::kernel krnl(tmp_device, tmp_uuid, "silu");
+            xrt::kernel krnl(tmp_device, tmp_uuid, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             silu_kernels_[size] = CachedSiluKernel{run, size};
@@ -924,7 +959,7 @@ private:
 
     bool create_silu_kernel_from_loaded_xclbin(int size, const std::string& cache_key) {
         try {
-            xrt::kernel krnl(*device_, xclbin_uuid_silu_, "silu");
+            xrt::kernel krnl(*device_, xclbin_uuid_silu_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             silu_kernels_[size] = CachedSiluKernel{run, size};
@@ -1006,7 +1041,7 @@ private:
             xrt::device tmp_device(*device_);
             xrt::uuid tmp_uuid = load_xclbin_from_data(tmp_device, data);
 
-            xrt::kernel krnl(tmp_device, tmp_uuid, "flash_attn");
+            xrt::kernel krnl(tmp_device, tmp_uuid, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = CachedFlashAttnKernel{run, n_head, head_dim, ctx_len};
@@ -1019,7 +1054,7 @@ private:
 
     bool create_flash_attn_kernel_from_loaded_xclbin(int n_head, int head_dim, int64_t ctx_len, const std::string& cache_key) {
         try {
-            xrt::kernel krnl(*device_, xclbin_uuid_fa_, "flash_attn");
+            xrt::kernel krnl(*device_, xclbin_uuid_fa_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
             flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = CachedFlashAttnKernel{run, n_head, head_dim, ctx_len};
