@@ -412,6 +412,23 @@ def setup_compile_env(repo_root: Path) -> dict[str, str]:
                 env["PATH"] = f"{mlir_aie_bin}:{env['PATH']}"
             break
 
+    # xclbinutil is needed by aiecc to package aie.xclbin (XRT tools).
+    if not shutil.which("xclbinutil", path=env.get("PATH")):
+        for candidate in (
+            Path("/opt/xilinx/xrt/bin"),
+            repo_root / "third_party/xrt-tools/usr/bin",
+            repo_root / "third_party/xrt-dev/usr/bin",
+        ):
+            if (candidate / "xclbinutil").is_file():
+                env["PATH"] = f"{candidate}:{env.get('PATH', '')}"
+                break
+        else:
+            print(
+                "  WARNING: xclbinutil not found — aie.xclbin packaging will be skipped.\n"
+                "  Install: sudo apt install xrt-tools\n"
+                "  Or extract without sudo: bash scripts/fetch-xrt-dev.sh --tools"
+            )
+
     return env
 
 

@@ -18,6 +18,26 @@ have_headers() {
         && test -f "$UUID_ROOT/include/uuid/uuid.h"
 }
 
+if [ "${1:-}" = "--tools" ]; then
+    # Fetch xrt-tools (xclbinutil etc.) without sudo.
+    if command -v xclbinutil >/dev/null 2>&1 || test -x "$SCRIPT_DIR/third_party/xrt-tools/usr/bin/xclbinutil"; then
+        echo "xclbinutil already available"
+        exit 0
+    fi
+    mkdir -p "$DL_DIR" "$SCRIPT_DIR/third_party/xrt-tools"
+    cd "$DL_DIR"
+    echo "Downloading xrt-tools..."
+    if ! apt-get download xrt-tools; then
+        echo "ERROR: apt-get download xrt-tools failed. Try: sudo apt install xrt-tools"
+        exit 1
+    fi
+    TOOLS_DEB="$(ls -1 xrt-tools_*.deb 2>/dev/null | head -1)"
+    dpkg-deb -x "$TOOLS_DEB" "$SCRIPT_DIR/third_party/xrt-tools"
+    test -x "$SCRIPT_DIR/third_party/xrt-tools/usr/bin/xclbinutil" || { echo "ERROR: xclbinutil missing after extract"; exit 1; }
+    echo "xclbinutil ready at third_party/xrt-tools/usr/bin/xclbinutil"
+    exit 0
+fi
+
 if [ "${1:-}" = "--check" ]; then
     if have_headers; then
         exit 0
