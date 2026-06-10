@@ -31,6 +31,65 @@ constexpr const char* kTritonXdnaKernelName = "MLIR_AIE";
 constexpr uint32_t kNpuOpcode = 3;
 constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256 int8
 
+//====//
+// BF16 conversion utilities
+// The rmsnorm/softmax/silu kernels are BF16, but the backend sends F32.
+// These functions convert between f32 (host) and bf16 (device).
+//====//
+
+// Convert a single f32 value to bf16 (round to nearest, ties to even)
+static inline uint16_t f32_to_bf16(float f) {
+    uint32_t* bits = reinterpret_cast<uint32_t*>(&f);
+    uint32_t sign = (*bits >> 16) & 0x8000;
+    uint32_t exp = (*bits >> 16) & 0x7f80;
+    uint32_t frac = (*bits >> 16) & 0x7fff;
+
+    // Handle NaNs
+    if (exp == 0x7f80) {
+        return sign | 0x7e00 | (frac ? 0x0200 : 0);
+    }
+
+    // Handle overflow/underflow to inf/zeros
+    if (exp < 0x3880) {  // subnormal or zero -> 0.0
+        return sign;
+    }
+    if (exp > 0x5080) {  // overflow -> inf
+        return sign | 0x7f80;
+    }
+
+    // Round: take the top 16 bits and round the 17th bit
+    uint32_t rounded = (frac & 0x4000) ? ((frac >> 16) + 1) : (frac >> 16);
+    return sign | (exp - 0x3800) | rounded;
+}
+
+// Convert a single bf16 value to f32
+static inline float bf16_to_f32(uint16_t b) {
+    uint32_t bits = static_cast<uint32_t>(b) << 16;
+    float* result = reinterpret_cast<float*>(&bits);
+    return *result;
+}
+
+// Convert f32 vector to bf16 vector (in-place, writes to separate buffer)
+static std::vector<uint8_t> convert_f32_to_bf16(const void* f32_data, size_t count) {
+    const float* f32 = static_cast<const float*>(f32_data);
+    std::vector<uint8_t> bf16_buf(count * 2);  // 2 bytes per bf16
+    for (size_t i = 0; i < count; i++) {
+        uint16_t* bf16_ptr = reinterpret_cast<uint16_t*>(bf16_buf.data() + i * 2);
+        *bf16_ptr = f32_to_bf16(f32[i]);
+    }
+    return bf16_buf;
+}
+
+// Convert bf16 vector to f32 vector
+static std::vector<float> convert_bf16_to_f32(const void* bf16_data, size_t count) {
+    const uint16_t* bf16 = static_cast<const uint16_t*>(bf16_data);
+    std::vector<float> f32_buf(count);
+    for (size_t i = 0; i < count; i++) {
+        f32_buf[i] = bf16_to_f32(bf16[i]);
+    }
+    return f32_buf;
+}
+
 struct PairHash {
     size_t operator()(const std::pair<int, int>& p) const noexcept {
         return std::hash<int>{}(p.first) ^ (std::hash<int>{}(p.second) << 1);
@@ -143,9 +202,11 @@ struct CachedMatmulKernel {
     GgmlType B_type;
 };
 
-// Cached kernel for RMSNorm
+// Cached kernel for RMSNorm (BF16)
 struct CachedRmsNormKernel {
     xrt::run run;
+    xrt::bo bo_instr;
+    size_t instr_words = 0;
     int N;
 };
 
@@ -155,15 +216,19 @@ struct CachedRopeKernel {
     int n_dims;
 };
 
-// Cached kernel for softmax
+// Cached kernel for Softmax (BF16)
 struct CachedSoftmaxKernel {
     xrt::run run;
+    xrt::bo bo_instr;
+    size_t instr_words = 0;
     int rows, cols;
 };
 
-// Cached kernel for SiLU
+// Cached kernel for SiLU (BF16)
 struct CachedSiluKernel {
     xrt::run run;
+    xrt::bo bo_instr;
+    size_t instr_words = 0;
     int size;
 };
 
@@ -363,27 +428,67 @@ public:
 
         auto& kernel = it->second;
 
-        size_t size_bytes = N * sizeof(float);
-        if (!buf_rmsnorm_in_ || buf_rmsnorm_in_->size() < size_bytes) {
-            buf_rmsnorm_in_ = buf_mgr_->alloc(size_bytes, true);
-        }
-        if (!buf_rmsnorm_out_ || buf_rmsnorm_out_->size() < size_bytes) {
-            buf_rmsnorm_out_ = buf_mgr_->alloc(size_bytes, true);
-        }
+        // RMSNorm kernels are BF16 — convert f32 input → bf16 for DMA
+        size_t bf16_bytes = N * sizeof(uint16_t);
+        std::vector<uint8_t> bf16_input;
+        xrt::bo buf_bf16_in;
 
-        buf_mgr_->copy_to(*buf_rmsnorm_in_, params.input, size_bytes);
+        if (kernel.bo_instr && kernel.instr_words > 0) {
+            // BF16 kernel with instruction sequence: convert f32→bf16, pass opcode+instr
+            bf16_input = convert_f32_to_bf16(params.input, N);
 
-        try {
-            kernel.run(buf_rmsnorm_in_->handle(), buf_rmsnorm_out_->handle(),
-                       static_cast<uint32_t>(N));
-            kernel.run.wait();
-        } catch (const std::exception& e) {
-            std::cerr << "Error: rmsnorm kernel execution failed: " << e.what() << "\n";
-            last_status_ = Status::ERROR;
-            return last_status_;
+            buf_bf16_in = xrt::bo(*device_, bf16_bytes,
+                                  XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+            void* mapped = buf_bf16_in.map<void*>();
+            std::memcpy(mapped, bf16_input.data(), bf16_bytes);
+            buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+            // Output buffer (BF16)
+            xrt::bo buf_bf16_out(*device_, bf16_bytes,
+                                 XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+
+            try {
+                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                           buf_bf16_in, buf_bf16_out);
+                kernel.run.wait();
+            } catch (const std::exception& e) {
+                std::cerr << "Error: rmsnorm kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
+            }
+
+            // Convert bf16 output → f32
+            std::vector<uint8_t> bf16_out_data(bf16_bytes);
+            buf_bf16_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            void* mapped_out = buf_bf16_out.map<void*>();
+            std::memcpy(bf16_out_data.data(), mapped_out, bf16_bytes);
+            auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
+            std::memcpy(params.output, f32_result.data(), N * sizeof(float));
+
+        } else {
+            // Fallback: F32 kernel without instruction sequence (legacy path)
+            size_t size_bytes = N * sizeof(float);
+            if (!buf_rmsnorm_in_ || buf_rmsnorm_in_->size() < size_bytes) {
+                buf_rmsnorm_in_ = buf_mgr_->alloc(size_bytes, true);
+            }
+            if (!buf_rmsnorm_out_ || buf_rmsnorm_out_->size() < size_bytes) {
+                buf_rmsnorm_out_ = buf_mgr_->alloc(size_bytes, true);
+            }
+
+            buf_mgr_->copy_to(*buf_rmsnorm_in_, params.input, size_bytes);
+
+            try {
+                kernel.run(buf_rmsnorm_in_->handle(), buf_rmsnorm_out_->handle(),
+                           static_cast<uint32_t>(N));
+                kernel.run.wait();
+            } catch (const std::exception& e) {
+                std::cerr << "Error: rmsnorm kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
+            }
+
+            buf_mgr_->copy_from(*buf_rmsnorm_out_, params.output, size_bytes);
         }
-
-        buf_mgr_->copy_from(*buf_rmsnorm_out_, params.output, size_bytes);
 
         return Status::OK;
     }
@@ -430,27 +535,68 @@ public:
 
         auto& kernel = it->second;
 
-        size_t size_bytes = rows * cols * sizeof(float);
-        if (!buf_softmax_in_ || buf_softmax_in_->size() < size_bytes) {
-            buf_softmax_in_ = buf_mgr_->alloc(size_bytes, true);
-        }
-        if (!buf_softmax_out_ || buf_softmax_out_->size() < size_bytes) {
-            buf_softmax_out_ = buf_mgr_->alloc(size_bytes, true);
-        }
+        // Softmax kernels are BF16 — convert f32 input → bf16 for DMA
+        size_t total_elements = rows * cols;
+        size_t bf16_bytes = total_elements * sizeof(uint16_t);
+        std::vector<uint8_t> bf16_input;
+        xrt::bo buf_bf16_in;
 
-        buf_mgr_->copy_to(*buf_softmax_in_, params.input, size_bytes);
+        if (kernel.bo_instr && kernel.instr_words > 0) {
+            // BF16 kernel with instruction sequence: convert f32→bf16, pass opcode+instr
+            bf16_input = convert_f32_to_bf16(params.input, total_elements);
 
-        try {
-            kernel.run(buf_softmax_in_->handle(), buf_softmax_out_->handle(),
-                       static_cast<uint32_t>(rows), static_cast<uint32_t>(cols));
-            kernel.run.wait();
-        } catch (const std::exception& e) {
-            std::cerr << "Error: softmax kernel execution failed: " << e.what() << "\n";
-            last_status_ = Status::ERROR;
-            return last_status_;
+            buf_bf16_in = xrt::bo(*device_, bf16_bytes,
+                                  XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+            void* mapped = buf_bf16_in.map<void*>();
+            std::memcpy(mapped, bf16_input.data(), bf16_bytes);
+            buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+            // Output buffer (BF16)
+            xrt::bo buf_bf16_out(*device_, bf16_bytes,
+                                 XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+
+            try {
+                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                           buf_bf16_in, buf_bf16_out);
+                kernel.run.wait();
+            } catch (const std::exception& e) {
+                std::cerr << "Error: softmax kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
+            }
+
+            // Convert bf16 output → f32
+            std::vector<uint8_t> bf16_out_data(bf16_bytes);
+            buf_bf16_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            void* mapped_out = buf_bf16_out.map<void*>();
+            std::memcpy(bf16_out_data.data(), mapped_out, bf16_bytes);
+            auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), total_elements);
+            std::memcpy(params.output, f32_result.data(), total_elements * sizeof(float));
+
+        } else {
+            // Fallback: F32 kernel without instruction sequence (legacy path)
+            size_t size_bytes = rows * cols * sizeof(float);
+            if (!buf_softmax_in_ || buf_softmax_in_->size() < size_bytes) {
+                buf_softmax_in_ = buf_mgr_->alloc(size_bytes, true);
+            }
+            if (!buf_softmax_out_ || buf_softmax_out_->size() < size_bytes) {
+                buf_softmax_out_ = buf_mgr_->alloc(size_bytes, true);
+            }
+
+            buf_mgr_->copy_to(*buf_softmax_in_, params.input, size_bytes);
+
+            try {
+                kernel.run(buf_softmax_in_->handle(), buf_softmax_out_->handle(),
+                           static_cast<uint32_t>(rows), static_cast<uint32_t>(cols));
+                kernel.run.wait();
+            } catch (const std::exception& e) {
+                std::cerr << "Error: softmax kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
+            }
+
+            buf_mgr_->copy_from(*buf_softmax_out_, params.output, size_bytes);
         }
-
-        buf_mgr_->copy_from(*buf_softmax_out_, params.output, size_bytes);
 
         return Status::OK;
     }
@@ -478,27 +624,67 @@ public:
 
         auto& kernel = it->second;
 
-        size_t size_bytes = size * sizeof(float);
-        if (!buf_silu_in_ || buf_silu_in_->size() < size_bytes) {
-            buf_silu_in_ = buf_mgr_->alloc(size_bytes, true);
-        }
-        if (!buf_silu_out_ || buf_silu_out_->size() < size_bytes) {
-            buf_silu_out_ = buf_mgr_->alloc(size_bytes, true);
-        }
+        // SiLU kernels are BF16 — convert f32 input → bf16 for DMA
+        size_t bf16_bytes = size * sizeof(uint16_t);
+        std::vector<uint8_t> bf16_input;
+        xrt::bo buf_bf16_in;
 
-        buf_mgr_->copy_to(*buf_silu_in_, params.input, size_bytes);
+        if (kernel.bo_instr && kernel.instr_words > 0) {
+            // BF16 kernel with instruction sequence: convert f32→bf16, pass opcode+instr
+            bf16_input = convert_f32_to_bf16(params.input, size);
 
-        try {
-            kernel.run(buf_silu_in_->handle(), buf_silu_out_->handle(),
-                       static_cast<uint32_t>(size));
-            kernel.run.wait();
-        } catch (const std::exception& e) {
-            std::cerr << "Error: silu kernel execution failed: " << e.what() << "\n";
-            last_status_ = Status::ERROR;
-            return last_status_;
+            buf_bf16_in = xrt::bo(*device_, bf16_bytes,
+                                  XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+            void* mapped = buf_bf16_in.map<void*>();
+            std::memcpy(mapped, bf16_input.data(), bf16_bytes);
+            buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+            // Output buffer (BF16)
+            xrt::bo buf_bf16_out(*device_, bf16_bytes,
+                                 XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+
+            try {
+                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                           buf_bf16_in, buf_bf16_out);
+                kernel.run.wait();
+            } catch (const std::exception& e) {
+                std::cerr << "Error: silu kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
+            }
+
+            // Convert bf16 output → f32
+            std::vector<uint8_t> bf16_out_data(bf16_bytes);
+            buf_bf16_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            void* mapped_out = buf_bf16_out.map<void*>();
+            std::memcpy(bf16_out_data.data(), mapped_out, bf16_bytes);
+            auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), size);
+            std::memcpy(params.output, f32_result.data(), size * sizeof(float));
+
+        } else {
+            // Fallback: F32 kernel without instruction sequence (legacy path)
+            size_t size_bytes = size * sizeof(float);
+            if (!buf_silu_in_ || buf_silu_in_->size() < size_bytes) {
+                buf_silu_in_ = buf_mgr_->alloc(size_bytes, true);
+            }
+            if (!buf_silu_out_ || buf_silu_out_->size() < size_bytes) {
+                buf_silu_out_ = buf_mgr_->alloc(size_bytes, true);
+            }
+
+            buf_mgr_->copy_to(*buf_silu_in_, params.input, size_bytes);
+
+            try {
+                kernel.run(buf_silu_in_->handle(), buf_silu_out_->handle(),
+                           static_cast<uint32_t>(size));
+                kernel.run.wait();
+            } catch (const std::exception& e) {
+                std::cerr << "Error: silu kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
+            }
+
+            buf_mgr_->copy_from(*buf_silu_out_, params.output, size_bytes);
         }
-
-        buf_mgr_->copy_from(*buf_silu_out_, params.output, size_bytes);
 
         return Status::OK;
     }
@@ -810,7 +996,21 @@ private:
             xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            rmsnorm_kernels_[N] = CachedRmsNormKernel{run, N};
+            CachedRmsNormKernel cached{run, {}, 0, N};
+            // Load instruction sequence for BF16 kernel (opcode-3 convention)
+            std::string seq_path = detail::find_prebuilt_sequence("rmsnorm_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            rmsnorm_kernels_[N] = std::move(cached);
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Warning: failed to load rmsnorm kernel: " << e.what() << "\n";
@@ -823,7 +1023,21 @@ private:
             xrt::kernel krnl(hw_ctx_rmsnorm_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            rmsnorm_kernels_[N] = CachedRmsNormKernel{run, N};
+            CachedRmsNormKernel cached{run, {}, 0, N};
+            // Load instruction sequence for BF16 kernel (opcode-3 convention)
+            std::string seq_path = detail::find_prebuilt_sequence("rmsnorm_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            rmsnorm_kernels_[N] = std::move(cached);
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to create rmsnorm kernel: " << e.what() << "\n";
@@ -905,7 +1119,21 @@ private:
             xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            softmax_kernels_[std::make_pair(rows, cols)] = CachedSoftmaxKernel{run, rows, cols};
+            CachedSoftmaxKernel cached{run, {}, 0, rows, cols};
+            // Load instruction sequence for BF16 kernel (opcode-3 convention)
+            std::string seq_path = detail::find_prebuilt_sequence("softmax_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            softmax_kernels_[std::make_pair(rows, cols)] = std::move(cached);
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Warning: failed to load softmax kernel: " << e.what() << "\n";
@@ -918,7 +1146,21 @@ private:
             xrt::kernel krnl(hw_ctx_softmax_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            softmax_kernels_[std::make_pair(rows, cols)] = CachedSoftmaxKernel{run, rows, cols};
+            CachedSoftmaxKernel cached{run, {}, 0, rows, cols};
+            // Load instruction sequence for BF16 kernel (opcode-3 convention)
+            std::string seq_path = detail::find_prebuilt_sequence("softmax_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            softmax_kernels_[std::make_pair(rows, cols)] = std::move(cached);
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to create softmax kernel: " << e.what() << "\n";
@@ -1000,7 +1242,21 @@ private:
             xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            silu_kernels_[size] = CachedSiluKernel{run, size};
+            CachedSiluKernel cached{run, {}, 0, size};
+            // Load instruction sequence for BF16 kernel (opcode-3 convention)
+            std::string seq_path = detail::find_prebuilt_sequence("silu_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            silu_kernels_[size] = std::move(cached);
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Warning: failed to load silu kernel: " << e.what() << "\n";
@@ -1013,7 +1269,21 @@ private:
             xrt::kernel krnl(hw_ctx_silu_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            silu_kernels_[size] = CachedSiluKernel{run, size};
+            CachedSiluKernel cached{run, {}, 0, size};
+            // Load instruction sequence for BF16 kernel (opcode-3 convention)
+            std::string seq_path = detail::find_prebuilt_sequence("silu_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            silu_kernels_[size] = std::move(cached);
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to create silu kernel: " << e.what() << "\n";
