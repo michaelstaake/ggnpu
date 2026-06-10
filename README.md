@@ -73,16 +73,15 @@ cmake --build build-npu -j2
 No NPU hardware is needed to build kernels — the compilation runs entirely on CPU.
 You can build on a separate machine (no NPU required) and copy the `.xclbin` files to the NPU machine.
 
-**System dependencies** (install on the build machine):
-
-```bash
-sudo apt update
-sudo apt install build-essential cmake git clang lld ninja-build python3-pip python3-venv libssl-dev
-```
-
 **Install Triton-XDNA** (one-time, replaces mlir-aie + Peano):
 
 ```bash
+# If you get "externally managed environment" error:
+pip install triton-xdna --break-system-packages
+
+# Or use a venv:
+python3 -m venv ~/triton-env
+source ~/triton-env/bin/activate
 pip install triton-xdna
 ```
 

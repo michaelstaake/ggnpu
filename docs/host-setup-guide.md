@@ -156,6 +156,12 @@ No NPU hardware is needed to build kernels — the compilation runs entirely on 
 Triton-XDNA replaces the old mlir-aie + Peano toolchain with a single pip install:
 
 ```bash
+# If you get "externally managed environment" error:
+pip install triton-xdna --break-system-packages
+
+# Or use a venv:
+python3 -m venv ~/triton-env
+source ~/triton-env/bin/activate
 pip install triton-xdna
 ```
 
