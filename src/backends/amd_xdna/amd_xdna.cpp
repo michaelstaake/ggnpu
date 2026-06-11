@@ -205,6 +205,7 @@ struct CachedMatmulKernel {
 // Cached kernel for RMSNorm (BF16)
 struct CachedRmsNormKernel {
     xrt::run run;
+    xrt::kernel krnl;
     xrt::bo bo_instr;
     size_t instr_words = 0;
     int N;
@@ -219,6 +220,7 @@ struct CachedRopeKernel {
 // Cached kernel for Softmax (BF16)
 struct CachedSoftmaxKernel {
     xrt::run run;
+    xrt::kernel krnl;
     xrt::bo bo_instr;
     size_t instr_words = 0;
     int rows, cols;
@@ -227,6 +229,7 @@ struct CachedSoftmaxKernel {
 // Cached kernel for SiLU (BF16)
 struct CachedSiluKernel {
     xrt::run run;
+    xrt::kernel krnl;
     xrt::bo bo_instr;
     size_t instr_words = 0;
     int size;
@@ -438,14 +441,14 @@ public:
             bf16_input = convert_f32_to_bf16(params.input, N);
 
             buf_bf16_in = xrt::bo(*device_, bf16_bytes,
-                                  XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+                                  XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
             void* mapped = buf_bf16_in.map<void*>();
             std::memcpy(mapped, bf16_input.data(), bf16_bytes);
             buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
             // Output buffer (BF16)
             xrt::bo buf_bf16_out(*device_, bf16_bytes,
-                                 XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+                                 XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
 
             try {
                 kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
@@ -546,14 +549,14 @@ public:
             bf16_input = convert_f32_to_bf16(params.input, total_elements);
 
             buf_bf16_in = xrt::bo(*device_, bf16_bytes,
-                                  XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+                                  XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
             void* mapped = buf_bf16_in.map<void*>();
             std::memcpy(mapped, bf16_input.data(), bf16_bytes);
             buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
             // Output buffer (BF16)
             xrt::bo buf_bf16_out(*device_, bf16_bytes,
-                                 XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+                                 XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
 
             try {
                 kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
@@ -634,14 +637,14 @@ public:
             bf16_input = convert_f32_to_bf16(params.input, size);
 
             buf_bf16_in = xrt::bo(*device_, bf16_bytes,
-                                  XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+                                  XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
             void* mapped = buf_bf16_in.map<void*>();
             std::memcpy(mapped, bf16_input.data(), bf16_bytes);
             buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
             // Output buffer (BF16)
             xrt::bo buf_bf16_out(*device_, bf16_bytes,
-                                 XCL_BO_FLAGS_CACHEABLE, kernel.run.group_id(0));
+                                 XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
 
             try {
                 kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
@@ -996,7 +999,7 @@ private:
             xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            CachedRmsNormKernel cached{run, {}, 0, N};
+            CachedRmsNormKernel cached{run, krnl, {}, 0, N};
             // Load instruction sequence for BF16 kernel (opcode-3 convention)
             std::string seq_path = detail::find_prebuilt_sequence("rmsnorm_" + profile_str_ + ".xclbin", cache_dir_);
             if (!seq_path.empty()) {
@@ -1023,7 +1026,7 @@ private:
             xrt::kernel krnl(hw_ctx_rmsnorm_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            CachedRmsNormKernel cached{run, {}, 0, N};
+            CachedRmsNormKernel cached{run, krnl, {}, 0, N};
             // Load instruction sequence for BF16 kernel (opcode-3 convention)
             std::string seq_path = detail::find_prebuilt_sequence("rmsnorm_" + profile_str_ + ".xclbin", cache_dir_);
             if (!seq_path.empty()) {
@@ -1119,7 +1122,7 @@ private:
             xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            CachedSoftmaxKernel cached{run, {}, 0, rows, cols};
+            CachedSoftmaxKernel cached{run, krnl, {}, 0, rows, cols};
             // Load instruction sequence for BF16 kernel (opcode-3 convention)
             std::string seq_path = detail::find_prebuilt_sequence("softmax_" + profile_str_ + ".xclbin", cache_dir_);
             if (!seq_path.empty()) {
@@ -1146,7 +1149,7 @@ private:
             xrt::kernel krnl(hw_ctx_softmax_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            CachedSoftmaxKernel cached{run, {}, 0, rows, cols};
+            CachedSoftmaxKernel cached{run, krnl, {}, 0, rows, cols};
             // Load instruction sequence for BF16 kernel (opcode-3 convention)
             std::string seq_path = detail::find_prebuilt_sequence("softmax_" + profile_str_ + ".xclbin", cache_dir_);
             if (!seq_path.empty()) {
@@ -1242,7 +1245,7 @@ private:
             xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            CachedSiluKernel cached{run, {}, 0, size};
+            CachedSiluKernel cached{run, krnl, {}, 0, size};
             // Load instruction sequence for BF16 kernel (opcode-3 convention)
             std::string seq_path = detail::find_prebuilt_sequence("silu_" + profile_str_ + ".xclbin", cache_dir_);
             if (!seq_path.empty()) {
@@ -1269,7 +1272,7 @@ private:
             xrt::kernel krnl(hw_ctx_silu_, kTritonXdnaKernelName);
             xrt::run run(krnl);
 
-            CachedSiluKernel cached{run, {}, 0, size};
+            CachedSiluKernel cached{run, krnl, {}, 0, size};
             // Load instruction sequence for BF16 kernel (opcode-3 convention)
             std::string seq_path = detail::find_prebuilt_sequence("silu_" + profile_str_ + ".xclbin", cache_dir_);
             if (!seq_path.empty()) {

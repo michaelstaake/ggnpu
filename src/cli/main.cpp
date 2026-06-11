@@ -40,6 +40,8 @@ struct CliParams {
     bool verbose = false;
     bool dump_tensors = false;
     bool bench_matmul = false;
+    bool bench_layer = false;
+    int bench_layer_num = 0;
     bool show_version = false;
 };
 
@@ -54,6 +56,7 @@ void print_help() {
     std::cout << "  (default)                          Text generation\n";
     std::cout << "  --dump-tensors                     List tensors; no NPU\n";
     std::cout << "  bench-matmul                       NPU matmul benchmark\n";
+    std::cout << "  bench-layer [options]              Validate one decoder layer on NPU vs CPU ref\n";
     std::cout << "  --version                          Version + backend info\n\n";
     std::cout << "Flags:\n";
     std::cout << "  -m, --model <path>                 Path to .gguf (required)\n";
@@ -67,6 +70,7 @@ void print_help() {
     std::cout << "      --no-cache                     Disable caches\n";
     std::cout << "      --cache-dir <path>             Cache directory (default: ~/.cache/ggnpu)\n";
     std::cout << "  -v, --verbose                      Per-op timings\n";
+    std::cout << "      --layer <n>                    Layer number for bench-layer (default: 0)\n";
     std::cout << "  -h, --help                         Print help\n";
     std::cout << "      --version                      Print version\n\n";
     std::cout << "Examples:\n";
@@ -90,6 +94,8 @@ CliParams parse_args(int argc, char* argv[]) {
             params.dump_tensors = true;
         } else if (arg == "bench-matmul") {
             params.bench_matmul = true;
+        } else if (arg == "bench-layer") {
+            params.bench_layer = true;
         } else if (arg == "-m" || arg == "--model") {
             if (i + 1 < argc) params.model_path = argv[++i];
         } else if (arg == "-p" || arg == "--prompt") {
@@ -112,6 +118,8 @@ CliParams parse_args(int argc, char* argv[]) {
             if (i + 1 < argc) params.cache_dir = argv[++i];
         } else if (arg == "-v" || arg == "--verbose") {
             params.verbose = true;
+        } else if (arg == "--layer") {
+            if (i + 1 < argc) params.bench_layer_num = std::atoi(argv[++i]);
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
             print_help();
@@ -610,6 +618,362 @@ int main(int argc, char* argv[]) {
         }
         backend->mul_mat_q(mat_params);
     };
+
+    //====//
+    // bench-layer: Validate one decoder layer on NPU vs CPU reference
+    //====//
+    if (params.bench_layer) {
+        std::cout << "GGNPU Layer Benchmark\n";
+        std::cout << "=====================\n\n";
+
+        std::shared_ptr<Backend> npu_backend;
+#ifdef GGNPU_HAS_NPU_BACKEND
+        npu_backend = create_amd_xdna_backend(params.npu_device);
+        if (!npu_backend || !npu_backend->is_available()) {
+            std::cerr << "Error: NPU backend unavailable for bench-layer\n";
+            return 1;
+        }
+#else
+        std::cerr << "Error: NPU backend not compiled in. Build with -DGGNPU_NPU_BACKEND=ON\n";
+        return 1;
+#endif
+
+        std::shared_ptr<Backend> cpu_backend = create_cpu_ref_backend();
+
+        int layer_idx = params.bench_layer_num;
+        if (layer_idx < 0 || layer_idx >= num_layers) {
+            std::cerr << "Error: layer " << layer_idx << " out of range [0, "
+                      << num_layers - 1 << "]\n";
+            return 1;
+        }
+
+        std::cout << "Model: " << params.model_path << "\n";
+        std::cout << "Layer: " << layer_idx << "\n";
+        std::cout << "Hidden: " << hidden_size << "\n";
+        std::cout << "FFN size: " << ffn_size << "\n\n";
+
+        // Single test token activations (random but deterministic)
+        std::mt19937 rng(42);
+        std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+        std::vector<float> test_input(static_cast<size_t>(hidden_size));
+        for (size_t i = 0; i < test_input.size(); i++) {
+            test_input[i] = dist(rng);
+        }
+
+        // RMSNorm reference (CPU)
+        std::vector<float> normed(hidden_size);
+        RmsNormParams rms_params;
+        rms_params.input = test_input.data();
+        rms_params.output = normed.data();
+        rms_params.size = hidden_size;
+        rms_params.eps = rms_eps;
+        cpu_backend->rms_norm(rms_params);
+
+        std::cout << "Testing FFN gate matmul (Phase 3 E2E gate)...\n";
+
+        Status st;
+
+        // Test 1: FFN gate matmul — CPU ref vs NPU
+        {
+            const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer_idx);
+            if (!ffn_gate_w) {
+                std::cerr << "Error: ffn_gate.weight not found for layer " << layer_idx << "\n";
+                return 1;
+            }
+
+            // Decode weights for NPU (INT8 cache)
+            const int8_t* decoded_npu = weight_cache.get_or_decode(ffn_gate_w->name,
+                ffn_gate_w->data, ffn_gate_w->data_size(), ffn_gate_w->type);
+            if (!decoded_npu) {
+                std::cerr << "Error: failed to decode ffn_gate.weight\n";
+                return 1;
+            }
+
+            // CPU reference: full float matmul (dequantize on the fly)
+            std::vector<float> cpu_output(static_cast<size_t>(ffn_size), 0.0f);
+            MulMatParams cpu_params;
+            cpu_params.A = normed.data();
+            cpu_params.B = ffn_gate_w->data;
+            cpu_params.C = cpu_output.data();
+            cpu_params.M = 1;
+            cpu_params.N = ffn_size;
+            cpu_params.K = hidden_size;
+            cpu_params.lda = hidden_size;
+            cpu_params.ldb = ffn_size;
+            cpu_params.ldc = ffn_size;
+            cpu_params.n_batches = 1;
+            cpu_params.B_type = ffn_gate_w->type;
+            cpu_backend->mul_mat_q(cpu_params);
+
+            // NPU path: mul_mat_q with decoded INT8 weights
+            std::vector<float> npu_output(static_cast<size_t>(ffn_size), 0.0f);
+            MulMatParams npu_params;
+            npu_params.A = normed.data();
+            npu_params.B = decoded_npu;
+            npu_params.C = npu_output.data();
+            npu_params.M = 1;
+            npu_params.N = ffn_size;
+            npu_params.K = hidden_size;
+            npu_params.lda = hidden_size;
+            npu_params.ldb = ffn_size;
+            npu_params.ldc = ffn_size;
+            npu_params.n_batches = 1;
+            npu_params.B_type = ffn_gate_w->type;
+            if (ffn_gate_w->type == GgmlType::Q4_K || ffn_gate_w->type == GgmlType::Q6_K) {
+                const auto& scales = weight_cache.get_scales(ffn_gate_w->name);
+                if (!scales.empty()) {
+                    npu_params.scales = scales.data();
+                }
+            }
+
+            Status st = npu_backend->mul_mat_q(npu_params);
+            npu_backend->sync();
+            if (st != Status::OK) {
+                std::cerr << "Error: NPU matmul failed: " << status_name(st) << "\n";
+                return 1;
+            }
+
+            // Compare outputs
+            float max_diff = 0.0f;
+            float max_cpu = 0.0f;
+            int mismatches = 0;
+            for (int i = 0; i < ffn_size; i++) {
+                float diff = std::fabs(cpu_output[i] - npu_output[i]);
+                if (diff > max_diff) max_diff = diff;
+                if (std::fabs(cpu_output[i]) > max_cpu) max_cpu = std::fabs(cpu_output[i]);
+                if (diff > 2.0f) mismatches++;  // tolerance: 2.0 for INT8 quantization error
+            }
+
+            float rel_error = max_cpu > 0.0f ? max_diff / max_cpu : max_diff;
+            std::cout << "  FFN gate matmul (1 x " << hidden_size << " x " << ffn_size << "):\n";
+            std::cout << "    Type: " << ggml_type_name(ffn_gate_w->type) << "\n";
+            std::cout << "    Max absolute diff: " << max_diff << "\n";
+            std::cout << "    Max CPU value: " << max_cpu << "\n";
+            std::cout << "    Relative error: " << rel_error << "\n";
+            std::cout << "    Mismatches (>2.0): " << mismatches << " / " << ffn_size << "\n";
+
+            if (rel_error < 0.1f && mismatches < ffn_size / 10) {
+                std::cout << "    Result: PASS\n\n";
+            } else {
+                std::cout << "    Result: FAIL (tolerance exceeded)\n\n";
+                return 1;
+            }
+        }
+
+        // Test 2: FFN up matmul
+        {
+            const TensorView* ffn_up_w = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", layer_idx);
+            if (!ffn_up_w) {
+                std::cerr << "Error: ffn_up.weight not found for layer " << layer_idx << "\n";
+                return 1;
+            }
+
+            const int8_t* decoded_npu = weight_cache.get_or_decode(ffn_up_w->name,
+                ffn_up_w->data, ffn_up_w->data_size(), ffn_up_w->type);
+            if (!decoded_npu) {
+                std::cerr << "Error: failed to decode ffn_up.weight\n";
+                return 1;
+            }
+
+            std::vector<float> cpu_output(static_cast<size_t>(ffn_size), 0.0f);
+            MulMatParams cpu_params;
+            cpu_params.A = normed.data();
+            cpu_params.B = ffn_up_w->data;
+            cpu_params.C = cpu_output.data();
+            cpu_params.M = 1;
+            cpu_params.N = ffn_size;
+            cpu_params.K = hidden_size;
+            cpu_params.lda = hidden_size;
+            cpu_params.ldb = ffn_size;
+            cpu_params.ldc = ffn_size;
+            cpu_params.n_batches = 1;
+            cpu_params.B_type = ffn_up_w->type;
+            cpu_backend->mul_mat_q(cpu_params);
+
+            std::vector<float> npu_output(static_cast<size_t>(ffn_size), 0.0f);
+            MulMatParams npu_params;
+            npu_params.A = normed.data();
+            npu_params.B = decoded_npu;
+            npu_params.C = npu_output.data();
+            npu_params.M = 1;
+            npu_params.N = ffn_size;
+            npu_params.K = hidden_size;
+            npu_params.lda = hidden_size;
+            npu_params.ldb = ffn_size;
+            npu_params.ldc = ffn_size;
+            npu_params.n_batches = 1;
+            npu_params.B_type = ffn_up_w->type;
+            if (ffn_up_w->type == GgmlType::Q4_K || ffn_up_w->type == GgmlType::Q6_K) {
+                const auto& scales = weight_cache.get_scales(ffn_up_w->name);
+                if (!scales.empty()) {
+                    npu_params.scales = scales.data();
+                }
+            }
+
+            st = npu_backend->mul_mat_q(npu_params);
+            npu_backend->sync();
+            if (st != Status::OK) {
+                std::cerr << "Error: NPU matmul failed: " << status_name(st) << "\n";
+                return 1;
+            }
+
+            float max_diff = 0.0f;
+            float max_cpu = 0.0f;
+            int mismatches = 0;
+            for (int i = 0; i < ffn_size; i++) {
+                float diff = std::fabs(cpu_output[i] - npu_output[i]);
+                if (diff > max_diff) max_diff = diff;
+                if (std::fabs(cpu_output[i]) > max_cpu) max_cpu = std::fabs(cpu_output[i]);
+                if (diff > 2.0f) mismatches++;
+            }
+
+            float rel_error = max_cpu > 0.0f ? max_diff / max_cpu : max_diff;
+            std::cout << "  FFN up matmul (1 x " << hidden_size << " x " << ffn_size << "):\n";
+            std::cout << "    Type: " << ggml_type_name(ffn_up_w->type) << "\n";
+            std::cout << "    Max absolute diff: " << max_diff << "\n";
+            std::cout << "    Relative error: " << rel_error << "\n";
+            std::cout << "    Mismatches (>2.0): " << mismatches << " / " << ffn_size << "\n";
+
+            if (rel_error < 0.1f && mismatches < ffn_size / 10) {
+                std::cout << "    Result: PASS\n\n";
+            } else {
+                std::cout << "    Result: FAIL\n\n";
+                return 1;
+            }
+        }
+
+        // Test 3: FFN down matmul (gate * silu(up)) -> hidden_size
+        {
+            const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer_idx);
+            const TensorView* ffn_up_w = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", layer_idx);
+            const TensorView* ffn_down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", layer_idx);
+
+            if (!ffn_gate_w || !ffn_up_w || !ffn_down_w) {
+                std::cerr << "Error: FFN weights not found for layer " << layer_idx << "\n";
+                return 1;
+            }
+
+            // Compute gate and up on NPU
+            const int8_t* decoded_gate = weight_cache.get_or_decode(ffn_gate_w->name,
+                ffn_gate_w->data, ffn_gate_w->data_size(), ffn_gate_w->type);
+            const int8_t* decoded_up = weight_cache.get_or_decode(ffn_up_w->name,
+                ffn_up_w->data, ffn_up_w->data_size(), ffn_up_w->type);
+
+            std::vector<float> gate_out(static_cast<size_t>(ffn_size), 0.0f);
+            std::vector<float> up_out(static_cast<size_t>(ffn_size), 0.0f);
+
+            MulMatParams gate_params;
+            gate_params.A = normed.data();
+            gate_params.B = decoded_gate;
+            gate_params.C = gate_out.data();
+            gate_params.M = 1;
+            gate_params.N = ffn_size;
+            gate_params.K = hidden_size;
+            gate_params.lda = hidden_size;
+            gate_params.ldb = ffn_size;
+            gate_params.ldc = ffn_size;
+            gate_params.n_batches = 1;
+            gate_params.B_type = ffn_gate_w->type;
+            npu_backend->mul_mat_q(gate_params);
+
+            MulMatParams up_params;
+            up_params.A = normed.data();
+            up_params.B = decoded_up;
+            up_params.C = up_out.data();
+            up_params.M = 1;
+            up_params.N = ffn_size;
+            up_params.K = hidden_size;
+            up_params.lda = hidden_size;
+            up_params.ldb = ffn_size;
+            up_params.ldc = ffn_size;
+            up_params.n_batches = 1;
+            up_params.B_type = ffn_up_w->type;
+            npu_backend->mul_mat_q(up_params);
+            npu_backend->sync();
+
+            // SwiGLU: gate * silu(up)
+            std::vector<float> swiglu(static_cast<size_t>(ffn_size));
+            for (int i = 0; i < ffn_size; i++) {
+                float up_silu = up_out[i] / (1.0f + std::exp(-up_out[i]));
+                swiglu[i] = gate_out[i] * up_silu;
+            }
+
+            // FFN down matmul on NPU
+            const int8_t* decoded_down = weight_cache.get_or_decode(ffn_down_w->name,
+                ffn_down_w->data, ffn_down_w->data_size(), ffn_down_w->type);
+
+            std::vector<float> npu_output(static_cast<size_t>(hidden_size), 0.0f);
+            MulMatParams down_params;
+            down_params.A = swiglu.data();
+            down_params.B = decoded_down;
+            down_params.C = npu_output.data();
+            down_params.M = 1;
+            down_params.N = hidden_size;
+            down_params.K = ffn_size;
+            down_params.lda = ffn_size;
+            down_params.ldb = hidden_size;
+            down_params.ldc = hidden_size;
+            down_params.n_batches = 1;
+            down_params.B_type = ffn_down_w->type;
+            if (ffn_down_w->type == GgmlType::Q4_K || ffn_down_w->type == GgmlType::Q6_K) {
+                const auto& scales = weight_cache.get_scales(ffn_down_w->name);
+                if (!scales.empty()) {
+                    down_params.scales = scales.data();
+                }
+            }
+
+            st = npu_backend->mul_mat_q(down_params);
+            npu_backend->sync();
+            if (st != Status::OK) {
+                std::cerr << "Error: NPU matmul failed: " << status_name(st) << "\n";
+                return 1;
+            }
+
+            // CPU reference for FFN down
+            std::vector<float> cpu_output(static_cast<size_t>(hidden_size), 0.0f);
+            MulMatParams cpu_down_params;
+            cpu_down_params.A = swiglu.data();
+            cpu_down_params.B = ffn_down_w->data;
+            cpu_down_params.C = cpu_output.data();
+            cpu_down_params.M = 1;
+            cpu_down_params.N = hidden_size;
+            cpu_down_params.K = ffn_size;
+            cpu_down_params.lda = ffn_size;
+            cpu_down_params.ldb = hidden_size;
+            cpu_down_params.ldc = hidden_size;
+            cpu_down_params.n_batches = 1;
+            cpu_down_params.B_type = ffn_down_w->type;
+            cpu_backend->mul_mat_q(cpu_down_params);
+
+            float max_diff = 0.0f;
+            float max_cpu = 0.0f;
+            int mismatches = 0;
+            for (int i = 0; i < hidden_size; i++) {
+                float diff = std::fabs(cpu_output[i] - npu_output[i]);
+                if (diff > max_diff) max_diff = diff;
+                if (std::fabs(cpu_output[i]) > max_cpu) max_cpu = std::fabs(cpu_output[i]);
+                if (diff > 2.0f) mismatches++;
+            }
+
+            float rel_error = max_cpu > 0.0f ? max_diff / max_cpu : max_diff;
+            std::cout << "  FFN down matmul (SwiGLU, 1 x " << ffn_size << " x " << hidden_size << "):\n";
+            std::cout << "    Type: " << ggml_type_name(ffn_down_w->type) << "\n";
+            std::cout << "    Max absolute diff: " << max_diff << "\n";
+            std::cout << "    Relative error: " << rel_error << "\n";
+            std::cout << "    Mismatches (>2.0): " << mismatches << " / " << hidden_size << "\n";
+
+            if (rel_error < 0.1f && mismatches < hidden_size / 10) {
+                std::cout << "    Result: PASS\n\n";
+            } else {
+                std::cout << "    Result: FAIL\n\n";
+                return 1;
+            }
+        }
+
+        std::cout << "All layer tests PASSED.\n";
+        model.unload();
+        return 0;
+    }
 
     // Dequantize token embeddings once before the generation loop
     const TensorView* tok_embd = find_tensor(model, "token_embd.weight");
