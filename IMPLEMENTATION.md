@@ -427,8 +427,9 @@ Work through these in order. Do not skip ahead.
 ### Phase 5 — Inference MVP
 
 - [x] Prefill + decode loops (per-token buffers; not validated E2E)
-- [x] Tokenizer + greedy sampling
-- [ ] Target: Llama 3.2 1B Q4_K_M, ctx 2048 — needs NPU xclbins + E2E test
+- [x] Tokenizer + greedy sampling — **fixed 2026-06-10:** GGUF loader now stores `tokenizer.ggml.tokens` / `merges` STRING arrays; llama-bpe pretokenize + BPE (vendored `unicode.cpp` from llama.cpp); `test_tokenizer` verifies `Hello` → `[128000, 9906]`
+- [ ] Coherent text generation — inference runs but logits/sampling not yet validated E2E
+- [ ] Target: Llama 3.2 1B Q4_K_M, ctx 2048 — needs E2E quality pass
 - [x] Fix KV cache to respect `-c` / cap default ctx to 2048
 - [x] Dequant `token_embd.weight` for Q4_K models
 
@@ -500,6 +501,8 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 
 | Fix | File |
 |-----|------|
+| GGUF STRING arrays (`tokenizer.ggml.tokens`, `merges`) were skipped during load → 0 vocab; now serialized into `GgufKV::data` | `src/gguf/gguf.cpp` |
+| Llama-bpe tokenizer: unicode pretokenize + ranked BPE merges + GPT-2 byte decode | `src/cli/tokenizer.cpp`, `src/cli/unicode*.cpp` |
 | `register_xclbin` + `xrt::hw_context` instead of unsupported `load_xclbin` | `src/backends/amd_xdna/amd_xdna.cpp` |
 | `xrt::run::wait()` after kernel launch (runs were fire-and-forget, output stayed zero) | `src/backends/amd_xdna/amd_xdna.cpp` |
 | Matmul: f32↔int8 conversion + host tiling onto fixed 256³ INT8 kernel | `src/backends/amd_xdna/amd_xdna.cpp` |

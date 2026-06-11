@@ -46,6 +46,36 @@ double read_f64_le(const uint8_t* p) {
     return d;
 }
 
+void write_u32_le(std::vector<uint8_t>& buf, uint32_t v) {
+    buf.push_back(static_cast<uint8_t>(v & 0xff));
+    buf.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
+    buf.push_back(static_cast<uint8_t>((v >> 16) & 0xff));
+    buf.push_back(static_cast<uint8_t>((v >> 24) & 0xff));
+}
+
+void write_u64_le(std::vector<uint8_t>& buf, uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+        buf.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xff));
+    }
+}
+
+bool read_gguf_string(int fd, std::string& out) {
+    uint8_t len_buf[8];
+    if (::read(fd, len_buf, 8) != 8) return false;
+    uint64_t str_len = read_u64_le(len_buf);
+    if (str_len > 64 * 1024 * 1024) return false;
+    out.resize(str_len);
+    if (str_len > 0) {
+        if (::read(fd, &out[0], str_len) != static_cast<ssize_t>(str_len)) return false;
+    }
+    return true;
+}
+
+void append_gguf_string(std::vector<uint8_t>& buf, const std::string& s) {
+    write_u64_le(buf, s.size());
+    buf.insert(buf.end(), s.begin(), s.end());
+}
+
 } // namespace
 
 GgufLoader::GgufLoader() : fd_(-1) {
@@ -172,19 +202,12 @@ bool GgufLoader::parse_kv() {
                 }
 
                 if (arr_type == GgufType::STRING) {
-                    // Skip STRING array elements efficiently
-                    char skip_buf[4096];
+                    write_u32_le(kv.data, static_cast<uint32_t>(arr_type));
+                    write_u64_le(kv.data, arr_count);
                     for (uint64_t j = 0; j < arr_count; j++) {
-                        uint8_t s_key_len_buf[8];
-                        if (::read(fd_, s_key_len_buf, 8) != 8) return false;
-                        uint64_t s_len = read_u64_le(s_key_len_buf);
-                        if (s_len > 64 * 1024 * 1024) return false;
-                        uint64_t remaining = s_len;
-                        while (remaining > 0) {
-                            size_t to_read = std::min(remaining, sizeof(skip_buf));
-                            if (::read(fd_, skip_buf, to_read) != static_cast<ssize_t>(to_read)) return false;
-                            remaining -= to_read;
-                        }
+                        std::string elem;
+                        if (!read_gguf_string(fd_, elem)) return false;
+                        append_gguf_string(kv.data, elem);
                     }
                 } else {
                     uint64_t total_bytes = arr_count * elem_size;

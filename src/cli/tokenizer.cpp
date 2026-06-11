@@ -1,29 +1,57 @@
 #include "tokenizer.h"
-#include <sstream>
+#include "unicode.h"
+
 #include <algorithm>
-#include <set>
-#include <cmath>
+#include <cassert>
 #include <cstring>
+#include <queue>
+#include <utility>
 
 namespace ggnpu {
 
 namespace {
 
-std::string bytes_to_unicode() {
-    std::string result;
-    std::set<uint8_t> bytes_set;
-    for (uint8_t b = 0; b < 256; b++) {
-        if ((b >= 33 && b <= 126) || b > 161) {
-            bytes_set.insert(b);
-        }
-    }
-    for (uint8_t b = 0; b < 256; b++) {
-        if (bytes_set.find(b) == bytes_set.end()) {
-            result += static_cast<char>(b);
-        }
-    }
-    return result;
+uint64_t read_u64_le(const uint8_t* p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
 }
+
+std::vector<std::string> parse_string_array(const std::vector<uint8_t>& data) {
+    std::vector<std::string> out;
+    if (data.size() < 12) return out;
+
+    uint64_t arr_len = read_u64_le(data.data() + 4);
+    size_t offset = 12;
+    for (uint64_t i = 0; i < arr_len && offset + 8 <= data.size(); i++) {
+        uint64_t str_len = read_u64_le(data.data() + offset);
+        offset += 8;
+        if (offset + str_len > data.size()) break;
+        out.emplace_back(reinterpret_cast<const char*>(data.data() + offset), str_len);
+        offset += str_len;
+    }
+    return out;
+}
+
+struct BpeSymbol {
+    int prev = -1;
+    int next = -1;
+    const char* text = nullptr;
+    size_t n = 0;
+};
+
+struct BpeBigram {
+    int left = -1;
+    int right = -1;
+    std::string text;
+    int rank = -1;
+    size_t size = 0;
+
+    bool operator>(const BpeBigram& other) const {
+        return rank > other.rank || (rank == other.rank && left > other.left);
+    }
+};
 
 } // namespace
 
@@ -31,13 +59,9 @@ Tokenizer::Tokenizer() {}
 
 bool Tokenizer::load_from_gguf(const std::map<std::string, GgufKV>& kv_pairs) {
     vocab_.clear();
-    bpe_merge_rules_.clear();
-
-    auto get_string = [&](const std::string& key, const std::string& def = "") -> std::string {
-        auto it = kv_pairs.find(key);
-        if (it != kv_pairs.end()) return it->second.string_value;
-        return def;
-    };
+    reverse_vocab_.clear();
+    bpe_ranks_.clear();
+    pre_type_ = PreType::Default;
 
     auto get_int = [&](const std::string& key, int64_t def = 0) -> int64_t {
         auto it = kv_pairs.find(key);
@@ -50,24 +74,19 @@ bool Tokenizer::load_from_gguf(const std::map<std::string, GgufKV>& kv_pairs) {
     add_bos_ = get_int("tokenizer.ggml.add_bos_token", 1) != 0;
     add_eos_ = get_int("tokenizer.ggml.add_eos_token", 1) != 0;
 
+    auto pre_it = kv_pairs.find("tokenizer.ggml.pre");
+    if (pre_it != kv_pairs.end()) {
+        const std::string& pre = pre_it->second.string_value;
+        if (pre == "llama-bpe" || pre == "llama3" || pre == "llama-v3") {
+            pre_type_ = PreType::Llama3;
+        } else if (pre == "gpt-2" || pre == "default") {
+            pre_type_ = PreType::Gpt2;
+        }
+    }
+
     auto tokens_it = kv_pairs.find("tokenizer.ggml.tokens");
-    if (tokens_it != kv_pairs.end() && tokens_it->second.data.size() >= 8) {
-        uint32_t arr_type;
-        std::memcpy(&arr_type, tokens_it->second.data.data(), 4);
-        uint64_t arr_len;
-        std::memcpy(&arr_len, tokens_it->second.data.data() + 4, 8);
-
-        size_t offset = 12;
-        for (uint64_t i = 0; i < arr_len && offset + 8 <= tokens_it->second.data.size(); i++) {
-            uint64_t str_len;
-            std::memcpy(&str_len, tokens_it->second.data.data() + offset, 8);
-            offset += 8;
-
-            if (offset + str_len > tokens_it->second.data.size()) break;
-
-            std::string token(reinterpret_cast<const char*>(tokens_it->second.data.data() + offset), str_len);
-            offset += str_len;
-
+    if (tokens_it != kv_pairs.end()) {
+        for (const auto& token : parse_string_array(tokens_it->second.data)) {
             int tid = static_cast<int>(vocab_.size());
             vocab_[token] = tid;
             reverse_vocab_[tid] = token;
@@ -75,98 +94,129 @@ bool Tokenizer::load_from_gguf(const std::map<std::string, GgufKV>& kv_pairs) {
     }
 
     auto merges_it = kv_pairs.find("tokenizer.ggml.merges");
-    if (merges_it != kv_pairs.end() && !merges_it->second.data.empty()) {
-        bpe_merge_rules_ = parse_merges(merges_it->second.data, merges_it->second.data.size());
+    if (merges_it != kv_pairs.end()) {
+        auto merges = parse_string_array(merges_it->second.data);
+        for (size_t i = 0; i < merges.size(); i++) {
+            const std::string& merge = merges[i];
+            size_t space = merge.find(' ');
+            if (space == std::string::npos) continue;
+            std::string left = merge.substr(0, space);
+            std::string right = merge.substr(space + 1);
+            bpe_ranks_[{left, right}] = static_cast<int>(i);
+        }
     }
 
     return !vocab_.empty();
 }
 
-std::vector<std::pair<std::string, std::string>> Tokenizer::parse_merges(
-    const std::vector<uint8_t>& data, size_t data_len) const {
-
-    std::vector<std::pair<std::string, std::string>> rules;
-    if (data_len < 8) return rules;
-
-    uint64_t arr_len;
-    std::memcpy(&arr_len, data.data(), 8);
-
-    size_t offset = 12;
-    for (uint64_t i = 0; i < arr_len && offset + 8 <= data_len; i++) {
-        uint64_t str_len;
-        std::memcpy(&str_len, data.data() + offset, 8);
-        offset += 8;
-
-        if (offset + str_len > data_len) break;
-        std::string s1(reinterpret_cast<const char*>(data.data() + offset), str_len);
-        offset += str_len;
-
-        if (offset + 8 > data_len) break;
-        std::memcpy(&str_len, data.data() + offset, 8);
-        offset += 8;
-
-        if (offset + str_len > data_len) break;
-        std::string s2(reinterpret_cast<const char*>(data.data() + offset), str_len);
-        offset += str_len;
-
-        rules.emplace_back(s1, s2);
-    }
-
-    return rules;
+int Tokenizer::find_bpe_rank(const std::string& left, const std::string& right) const {
+    auto it = bpe_ranks_.find({left, right});
+    if (it == bpe_ranks_.end()) return -1;
+    return it->second;
 }
 
-std::vector<std::string> Tokenizer::split_to_bytes(const std::string& text) const {
-    std::vector<std::string> tokens;
-    tokens.reserve(text.size());
-    for (unsigned char c : text) {
-        tokens.push_back(std::string(1, static_cast<char>(c)));
+std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
+    std::vector<std::string> regex_exprs;
+    switch (pre_type_) {
+        case PreType::Llama3:
+            regex_exprs = {
+                "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+            };
+            break;
+        case PreType::Gpt2:
+            regex_exprs = {
+                "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+            };
+            break;
+        default:
+            return {text};
     }
-    return tokens;
+    return unicode_regex_split(text, regex_exprs, true);
+}
+
+std::vector<int> Tokenizer::bpe_tokenize_word(const std::string& word) const {
+    std::vector<int> output;
+    if (word.empty()) return output;
+
+    std::vector<BpeSymbol> symbols;
+    std::priority_queue<BpeBigram, std::vector<BpeBigram>, std::greater<BpeBigram>> work_queue;
+
+    auto add_new_bigram = [&](int left, int right) {
+        if (left < 0 || right < 0) return;
+        std::string left_token(symbols[left].text, symbols[left].n);
+        std::string right_token(symbols[right].text, symbols[right].n);
+        int rank = find_bpe_rank(left_token, right_token);
+        if (rank < 0) return;
+        work_queue.push({left, right, left_token + right_token, rank,
+                         left_token.size() + right_token.size()});
+    };
+
+    int index = 0;
+    size_t offset = 0;
+    while (offset < word.size()) {
+        BpeSymbol sym;
+        size_t char_len = std::min(word.size() - offset, unicode_len_utf8(word[offset]));
+        sym.text = word.c_str() + offset;
+        sym.n = char_len;
+        offset += sym.n;
+        sym.prev = index - 1;
+        sym.next = (offset == word.size()) ? -1 : index + 1;
+        index++;
+        symbols.push_back(sym);
+    }
+
+    for (int i = 1; i < static_cast<int>(symbols.size()); ++i) {
+        add_new_bigram(i - 1, i);
+    }
+
+    while (!work_queue.empty()) {
+        BpeBigram bigram = work_queue.top();
+        work_queue.pop();
+
+        auto& left_symbol = symbols[bigram.left];
+        auto& right_symbol = symbols[bigram.right];
+        if (left_symbol.n == 0 || right_symbol.n == 0) continue;
+
+        std::string left_token(left_symbol.text, left_symbol.n);
+        std::string right_token(right_symbol.text, right_symbol.n);
+        if (left_token + right_token != bigram.text) continue;
+
+        left_symbol.n += right_symbol.n;
+        right_symbol.n = 0;
+        left_symbol.next = right_symbol.next;
+        if (right_symbol.next >= 0) {
+            symbols[right_symbol.next].prev = bigram.left;
+        }
+
+        add_new_bigram(left_symbol.prev, bigram.left);
+        add_new_bigram(bigram.left, left_symbol.next);
+    }
+
+    for (int i = 0; i != -1; i = symbols[i].next) {
+        if (symbols[i].n == 0) continue;
+        std::string str(symbols[i].text, symbols[i].n);
+        auto it = vocab_.find(str);
+        if (it != vocab_.end()) {
+            output.push_back(it->second);
+        } else {
+            for (char c : str) {
+                auto bit = vocab_.find(std::string(1, c));
+                if (bit != vocab_.end()) output.push_back(bit->second);
+            }
+        }
+    }
+
+    return output;
 }
 
 std::vector<int> Tokenizer::bpe_tokenize(const std::string& text) const {
-    if (text.empty()) return {};
-
-    std::vector<std::string> tokens = split_to_bytes(text);
-
-    if (bpe_merge_rules_.empty()) {
-        std::vector<int> result;
-        result.reserve(tokens.size());
-        for (auto& t : tokens) {
-            auto it = vocab_.find(t);
-            if (it != vocab_.end()) {
-                result.push_back(it->second);
-            }
-        }
-        return result;
-    }
-
-    for (auto& [w1, w2] : bpe_merge_rules_) {
-        bool changed = true;
-        while (changed) {
-            changed = false;
-            for (size_t i = 0; i + 1 < tokens.size(); i++) {
-                if (tokens[i] == w1 && tokens[i + 1] == w2) {
-                    std::string merged = w1 + w2;
-                    if (vocab_.find(merged) != vocab_.end()) {
-                        tokens[i] = merged;
-                        tokens.erase(tokens.begin() + static_cast<int>(i + 1));
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-
     std::vector<int> result;
-    result.reserve(tokens.size());
-    for (auto& t : tokens) {
-        auto it = vocab_.find(t);
-        if (it != vocab_.end()) {
-            result.push_back(it->second);
-        }
-    }
+    if (text.empty()) return result;
 
+    for (const auto& word : pretokenize(text)) {
+        auto word_tokens = bpe_tokenize_word(word);
+        result.insert(result.end(), word_tokens.begin(), word_tokens.end());
+    }
     return result;
 }
 
@@ -183,9 +233,32 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool add_bos, bool a
     return tokens;
 }
 
+std::string Tokenizer::decode_piece(const std::string& piece) const {
+    std::string result;
+    size_t offset = 0;
+    while (offset < piece.size()) {
+        bool matched = false;
+        for (size_t len = std::min<size_t>(4, piece.size() - offset); len > 0; len--) {
+            std::string sub = piece.substr(offset, len);
+            try {
+                result += static_cast<char>(unicode_utf8_to_byte(sub));
+                offset += len;
+                matched = true;
+                break;
+            } catch (const std::exception&) {
+                continue;
+            }
+        }
+        if (!matched) {
+            result += piece[offset++];
+        }
+    }
+    return result;
+}
+
 std::string Tokenizer::decode(int token_id) const {
     auto it = reverse_vocab_.find(token_id);
-    if (it != reverse_vocab_.end()) return it->second;
+    if (it != reverse_vocab_.end()) return decode_piece(it->second);
     return "[UNK:" + std::to_string(token_id) + "]";
 }
 

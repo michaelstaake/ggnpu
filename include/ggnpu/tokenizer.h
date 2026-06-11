@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 #include <map>
-#include <set>
+#include <utility>
 #include <cstdint>
 #include "gguf.h"
 
@@ -26,18 +26,24 @@ public:
     int vocab_size() const { return static_cast<int>(vocab_.size()); }
 
 private:
-    std::vector<std::pair<std::string, std::string>> bpe_merge_rules_;
+    enum class PreType { Default, Gpt2, Llama3 };
+
+    using BpePair = std::pair<std::string, std::string>;
+
+    std::map<BpePair, int> bpe_ranks_;
     std::map<std::string, int> vocab_;
     std::map<int, std::string> reverse_vocab_;
+    PreType pre_type_ = PreType::Default;
     int bos_token_id_ = -1;
     int eos_token_id_ = -1;
     bool add_bos_ = true;
     bool add_eos_ = true;
 
+    int find_bpe_rank(const std::string& left, const std::string& right) const;
+    std::vector<std::string> pretokenize(const std::string& text) const;
     std::vector<int> bpe_tokenize(const std::string& text) const;
-    std::vector<std::string> split_to_bytes(const std::string& text) const;
-    std::vector<std::pair<std::string, std::string>> parse_merges(const std::vector<uint8_t>& data, size_t data_len) const;
-    std::string bytes_to_unicode_str() const;
+    std::vector<int> bpe_tokenize_word(const std::string& word) const;
+    std::string decode_piece(const std::string& piece) const;
 };
 
 } // namespace ggnpu

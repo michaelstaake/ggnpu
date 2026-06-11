@@ -74,6 +74,8 @@ set(LIB_SOURCES
     src/cache/cache.cpp
     src/backends/cpu_ref/cpu_ref.cpp
     src/cli/tokenizer.cpp
+    src/cli/unicode.cpp
+    src/cli/unicode-data.cpp
 )
 
 if(GGNPU_NPU_BACKEND)
@@ -118,13 +120,19 @@ if(GGNPU_BUILD_TESTS)
         test_quant
         test_graph
         test_arch
+        test_tokenizer
     )
 
     foreach(TEST_NAME ${TEST_FILES})
         add_executable(${TEST_NAME} tests/${TEST_NAME}.cpp)
         target_link_libraries(${TEST_NAME} PRIVATE ggnpu_lib Threads::Threads)
         target_compile_definitions(${TEST_NAME} PRIVATE GGNPU_TEST_CPU=1)
-        add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+        if(TEST_NAME STREQUAL "test_tokenizer")
+            add_test(NAME ${TEST_NAME}
+                COMMAND ${TEST_NAME} ${CMAKE_SOURCE_DIR}/models/llama-3.2-1b-q4_k_m.gguf)
+        else()
+            add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+        endif()
     endforeach()
 endif()
 
