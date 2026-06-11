@@ -520,13 +520,19 @@ public:
     }
 
     Status rms_norm(const RmsNormParams& params) override {
+        // RMSNorm can run on NPU at any shape (256, 2048, etc.) via prebuilt or JIT-compiled kernels.
+        // Prebuilt kernel: M=32, N=256 (bf16). Larger sizes are JIT-compiled on first use and cached.
+        // Weighted RMSNorm (with learnable per-element weights) falls back to CPU ref for now.
+        
         if (!params.input || !params.output || params.size <= 0) {
             last_status_ = Status::INVALID_PARAM;
             return last_status_;
         }
 
         int N = params.size;
-        if (N != kRmsnormKernelCols || params.weight) {
+        
+        // Weighted RMSNorm is not yet supported on NPU; fall back to CPU ref
+        if (params.weight) {
             rms_norm_cpu_ref(params);
             return Status::OK;
         }
@@ -1146,7 +1152,8 @@ private:
 
             CachedRmsNormKernel cached{run, krnl, {}, 0, N};
             // Load instruction sequence for BF16 kernel (opcode-3 convention)
-            std::string seq_path = detail::find_prebuilt_sequence("rmsnorm_" + profile_str_ + ".xclbin", cache_dir_);
+            // Use the xclbin filename from the path to find matching shape-specific sequence file
+            std::string seq_path = detail::find_prebuilt_sequence(fs::path(path).filename().string(), cache_dir_);
             if (!seq_path.empty()) {
                 auto words = detail::load_sequence_file(seq_path);
                 if (!words.empty()) {
