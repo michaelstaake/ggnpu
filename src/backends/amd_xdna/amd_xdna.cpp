@@ -1396,8 +1396,15 @@ private:
             if (!seq_path.empty()) {
                 auto words = detail::load_sequence_file(seq_path);
                 if (!words.empty()) {
-                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    // Try group_id(0) first - SiLU kernel may only have one argument group
+                    try {
+                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(0));
+                    } catch (...) {
+                        // Fall back to group_id(1) if group_id(0) fails
+                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    }
                     void* mapped = cached.bo_instr.map<void*>();
                     std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
                     cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -1423,8 +1430,15 @@ private:
             if (!seq_path.empty()) {
                 auto words = detail::load_sequence_file(seq_path);
                 if (!words.empty()) {
-                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    // Try group_id(0) first - SiLU kernel may only have one argument group
+                    try {
+                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(0));
+                    } catch (...) {
+                        // Fall back to group_id(1) if group_id(0) fails
+                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    }
                     void* mapped = cached.bo_instr.map<void*>();
                     std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
                     cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
