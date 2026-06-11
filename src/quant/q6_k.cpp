@@ -73,16 +73,15 @@ static void dequantize_q6_k_block(const uint8_t* block, float* out) {
 }
 
 // Decode Q6_K weights for NPU
-// Output: 256 INT8 values per block + 12 pre-computed scales per block
-// Scales[0-5] = decoded_scale * d (for first 128 values, Q4 part)
-// Scales[6-11] = decoded_scale * d2 (for last 128 values, Q6 part)
+// Output: 256 INT8 values per block (scales pre-applied, clamped to int8)
+// The NPU kernel does raw INT8 dot product — scales must be baked in on host.
 // Uses direct byte offsets to avoid reading beyond 64-byte GGUF block
 void decode_q6_k_for_npu(const uint8_t* gguf_data, size_t data_size,
                          std::vector<int8_t>& int8_output,
                          std::vector<float>& scales_output) {
     int num_blocks = data_size / Q6_K_BLOCK_SIZE;
     int8_output.resize(num_blocks * 256);
-    scales_output.resize(num_blocks * 12);
+    scales_output.clear(); // not needed — scales are pre-applied
 
     for (int i = 0; i < num_blocks; i++) {
         const uint8_t* block = gguf_data + i * Q6_K_BLOCK_SIZE;
@@ -99,27 +98,33 @@ void decode_q6_k_for_npu(const uint8_t* gguf_data, size_t data_size,
             base_scales[j * 2 + 1] = static_cast<float>((s >> 4) & 0x0F);
         }
 
-        // Pre-compute scales: first 6 * d, last 6 * d2
-        for (int j = 0; j < 6; j++) {
-            scales_output[i * 12 + j] = base_scales[j] * d_signed;
-        }
-        for (int j = 0; j < 6; j++) {
-            scales_output[i * 12 + 6 + j] = base_scales[6 + j] * d2_signed;
+        // Q4 part (first 128): apply scale, clamp to int8
+        // qs starts at offset 16, groups of 32 use scales[0..5]
+        for (int g = 0; g < 4; g++) {
+            float scale = base_scales[(g * 2) % 12] * d_signed;
+            const uint8_t* qblock = block + 16 + g * 16;
+            int out_off = i * 256 + g * 32;
+            for (int j = 0; j < 32; j++) {
+                uint8_t nibble = (j % 2 == 0) ? (qblock[j / 2] & 0x0F) : (qblock[j / 2] >> 4);
+                int val = static_cast<int>(nibble) - 8;
+                float scaled = static_cast<float>(val) * scale;
+                int8_output[out_off + j] = static_cast<int8_t>(std::clamp(scaled, -128.0f, 127.0f));
+            }
         }
 
-        // Q4 part (first 128) - qs starts at offset 16
-        for (int j = 0; j < 32; j++) {
-            uint8_t nibble = (j % 2 == 0) ? (block[16 + j / 2] & 0x0F) : (block[16 + j / 2] >> 4);
-            int8_output[i * 256 + j] = static_cast<int8_t>(nibble - 8);
-        }
-
-        // Q6 part (last 128) - high_bits at offset 32, qs_large at offset 48
-        for (int j = 0; j < 96; j++) {
-            int8_t q_val = static_cast<int8_t>(block[48 + j]);
-            uint8_t h_val = block[32 + j];
-            int val = q_val | ((h_val & 0x03) << 7);
-            if (val >= 64) val -= 128;
-            int8_output[i * 256 + 128 + j] = static_cast<int8_t>(val);
+        // Q6 part (last 128): apply scale, clamp to int8
+        // high_bits at offset 32, qs_large at offset 48, groups of 32 use scales[6..11]
+        for (int g = 0; g < 4; g++) {
+            float scale = base_scales[6 + g] * d2_signed;
+            const int8_t* qblock = reinterpret_cast<const int8_t*>(block + 48) + g * 32;
+            const uint8_t* hblock = block + 32 + g * 32;
+            int out_off = i * 256 + 128 + g * 32;
+            for (int j = 0; j < 32; j++) {
+                int val = static_cast<int>(qblock[j]) | (static_cast<int>(hblock[j] & 0x03) << 7);
+                if (val >= 64) val -= 128;
+                float scaled = static_cast<float>(val) * scale;
+                int8_output[out_off + j] = static_cast<int8_t>(std::clamp(scaled, -128.0f, 127.0f));
+            }
         }
     }
 }

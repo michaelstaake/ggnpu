@@ -78,16 +78,15 @@ static void dequantize_q4_k_block(const uint8_t* block, float* out) {
 }
 
 // Decode Q4_K weights for NPU
-// Output: 256 INT8 values per block + 8 pre-computed scales per block
-// Scales[0-3] = decoded_scale * d (for first 128 values, Q4_0 part)
-// Scales[4-7] = decoded_scale * c (for last 128 values, Q8_0 part)
+// Output: 256 INT8 values per block (scales pre-applied, clamped to int8)
+// The NPU kernel does raw INT8 dot product — scales must be baked in on host.
 // Uses direct byte offsets to avoid reading beyond 48-byte GGUF block
 void decode_q4_k_for_npu(const uint8_t* gguf_data, size_t data_size,
                          std::vector<int8_t>& int8_output,
                          std::vector<float>& scales_output) {
     int num_blocks = data_size / Q4_K_BLOCK_SIZE;
     int8_output.resize(num_blocks * 256);
-    scales_output.resize(num_blocks * 8);
+    scales_output.clear(); // not needed — scales are pre-applied
 
     for (int i = 0; i < num_blocks; i++) {
         const uint8_t* block = gguf_data + i * Q4_K_BLOCK_SIZE;
@@ -106,22 +105,37 @@ void decode_q4_k_for_npu(const uint8_t* gguf_data, size_t data_size,
 
         // Pre-compute scales: first 4 * d, last 4 * c
         for (int j = 0; j < 4; j++) {
-            scales_output[i * 8 + j] = base_scales[j] * d_signed;
+            scales_output.push_back(base_scales[j] * d_signed);
         }
         for (int j = 0; j < 4; j++) {
-            scales_output[i * 8 + 4 + j] = base_scales[4 + j] * c_signed;
+            scales_output.push_back(base_scales[4 + j] * c_signed);
         }
 
-        // Extract INT8 values (Q4_0 part, first 128 values)
-        // qs starts at offset 10
-        for (int j = 0; j < 32; j++) {
-            uint8_t nibble = (j % 2 == 0) ? (block[10 + j / 2] & 0x0F) : (block[10 + j / 2] >> 4);
-            int8_output[i * 256 + j] = static_cast<int8_t>(nibble - 8);
+        // Q4_0 part (first 128 values): apply scale, clamp to int8
+        // qs starts at offset 10, groups of 32 use scales[0..3]
+        for (int g = 0; g < 4; g++) {
+            float scale = base_scales[g] * d_signed;
+            const uint8_t* qblock = block + 10 + g * 16;
+            int out_off = i * 256 + g * 32;
+            for (int j = 0; j < 32; j++) {
+                uint8_t nibble = (j % 2 == 0) ? (qblock[j / 2] & 0x0F) : (qblock[j / 2] >> 4);
+                int val = static_cast<int>(nibble) - 8;
+                float scaled = static_cast<float>(val) * scale;
+                int8_output[out_off + j] = static_cast<int8_t>(std::clamp(scaled, -128.0f, 127.0f));
+            }
         }
 
-        // Q8_0 part (last 128 values)
-        // qs_large starts at offset 42, copy first 6 bytes from 48-byte block
-        std::memcpy(int8_output.data() + i * 256 + 128, block + 42, std::min(static_cast<size_t>(6), data_size - i * Q4_K_BLOCK_SIZE - 42));
+        // Q8_0 part (last 128 values): apply scale, clamp to int8
+        // qs_large starts at offset 42, groups of 32 use scales[4..7]
+        for (int g = 0; g < 4; g++) {
+            float scale = base_scales[g + 4] * c_signed;
+            const int8_t* qblock = reinterpret_cast<const int8_t*>(block + 42) + g * 32;
+            int out_off = i * 256 + 128 + g * 32;
+            for (int j = 0; j < 32; j++) {
+                float scaled = static_cast<float>(qblock[j]) * scale;
+                int8_output[out_off + j] = static_cast<int8_t>(std::clamp(scaled, -128.0f, 127.0f));
+            }
+        }
     }
 }
 
