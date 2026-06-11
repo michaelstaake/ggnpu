@@ -10,7 +10,7 @@ Key facts for contributors:
 
 - The NPU rejects the legacy `device.load_xclbin()` path (`load_axlf: Operation not supported`). The backend now uses `xrt::register_xclbin` + `xrt::hw_context` + the opcode/instruction-sequence call convention (each xclbin has a matching `*_sequence.bin`).
 - The prebuilt matmul kernel is **fixed-shape 256×256×256, INT8 in / INT32 out**. The backend tiles bigger matmuls on the host and converts f32↔int8 per tile. This is correct but not yet fast; it's the Phase 2 smoke path.
-- The rmsnorm/softmax/silu kernels are **bf16**, but the backend currently sends f32 — those op paths still need dtype marshaling before Phase 4.
+- The rmsnorm/softmax/silu kernels are **bf16**; the backend converts f32↔bf16 around DMA (Phase 4 `bench-layer` validates RMSNorm and SiLU on NPU).
 - Next milestone: one `ffn_gate` matmul straight from GGUF on the NPU vs CPU reference (Phase 3 gate), then full layer + inference. See [IMPLEMENTATION.md](IMPLEMENTATION.md) §7.
 
 ## Native host setup

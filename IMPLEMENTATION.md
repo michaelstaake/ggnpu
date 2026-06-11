@@ -367,7 +367,7 @@ Work through these in order. Do not skip ahead.
 | 1 GGUF loader | Parse, mmap, dump | **Done** |
 | 2 NPU matmul smoke | `bench-matmul` on hardware | **Done (2026-06-10)** — validated output, host-tiled INT8 256³ kernel |
 | 3 Q4_K weight path | Decode + one E2E matmul | **Done (2026-06-10)** — `bench-layer` FFN gate/up/down PASS vs CPU ref |
-| 4 Full decoder layer | All ops on NPU | **Not done** — rmsnorm/softmax/silu xclbins exist but need bf16 marshaling |
+| 4 Full decoder layer | All ops on NPU | **In progress** — `bench-layer` adds RMSNorm/attn_q/SiLU tests; matmuls PASS; rmsnorm/silu NPU launch still needs shape/opcode fixes (CPU fallback active) |
 | 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — KV `-c`/cap fix done, attention dims fixed, not validated E2E |
 | 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; xclbins not validated E2E |
 | 7 Intel stub | Interface research | **Not started** |
@@ -410,11 +410,16 @@ Work through these in order. Do not skip ahead.
 
 **Note:** decoded-weight cache entries are not versioned. After decoder changes, clear `~/.cache/ggnpu/weights/` or stale int8 weights will be reused.
 
-### Phase 4 — Full decoder layer
+### Phase 4 — Full decoder layer (in progress)
 
-- [ ] All matmuls in one layer on NPU
-- [ ] RMSNorm, RoPE, attention (decomposed), SiLU on NPU (RoPE currently CPU fallback in NPU backend)
-- [ ] KV cache write
+- [x] `bench-layer` validates attn_q matmul on NPU vs CPU ref
+- [x] bf16 f32↔bf16 marshaling for rmsnorm/softmax/silu DMA paths
+- [x] CPU fallback when NPU elementwise kernels unavailable or wrong shape
+- [x] Load all prebuilt xclbins at backend init (matmul, rmsnorm, softmax, silu)
+- [ ] All matmuls in one layer on NPU (gate/up/down done; attn_k/v/o still to bench)
+- [ ] RMSNorm + SiLU on NPU at Llama hidden/ffn sizes (prebuilt rmsnorm is 32×256; silu opcode-3 launch fails)
+- [ ] RoPE on NPU (CPU path today)
+- [ ] KV cache write + attention E2E
 
 **Done when:** one-layer forward matches CPU reference.
 

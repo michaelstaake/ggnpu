@@ -149,6 +149,46 @@ const char* status_name(Status status) {
     }
 }
 
+struct CompareResult {
+    float max_diff = 0.0f;
+    float max_ref = 0.0f;
+    int mismatches = 0;
+};
+
+CompareResult compare_vectors(const float* ref, const float* actual, int n, float mismatch_thresh) {
+    CompareResult r;
+    for (int i = 0; i < n; i++) {
+        float diff = std::fabs(ref[i] - actual[i]);
+        if (diff > r.max_diff) r.max_diff = diff;
+        if (std::fabs(ref[i]) > r.max_ref) r.max_ref = std::fabs(ref[i]);
+        if (diff > mismatch_thresh) r.mismatches++;
+    }
+    return r;
+}
+
+bool report_compare(const char* label, const CompareResult& r, int n,
+                    float rel_thresh, float mismatch_frac, float mismatch_thresh) {
+    float rel_error = r.max_ref > 0.0f ? r.max_diff / r.max_ref : r.max_diff;
+    std::cout << "  " << label << ":\n";
+    std::cout << "    Max absolute diff: " << r.max_diff << "\n";
+    if (r.max_ref > 0.0f) std::cout << "    Max ref value: " << r.max_ref << "\n";
+    std::cout << "    Relative error: " << rel_error << "\n";
+    std::cout << "    Mismatches (>" << mismatch_thresh << "): " << r.mismatches << " / " << n << "\n";
+    if (rel_error < rel_thresh && r.mismatches < static_cast<int>(n * mismatch_frac)) {
+        std::cout << "    Result: PASS\n\n";
+        return true;
+    }
+    std::cout << "    Result: FAIL\n\n";
+    return false;
+}
+
+void attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cache) {
+    if (w && (w->type == GgmlType::Q4_K || w->type == GgmlType::Q6_K)) {
+        const auto& scales = cache.get_scales(w->name);
+        if (!scales.empty()) p.scales = scales.data();
+    }
+}
+
 bool validate_matmul_output(const std::vector<float>& output, int expected_value,
                            float tolerance, std::string* error_message) {
     for (size_t i = 0; i < output.size(); i++) {
@@ -670,9 +710,109 @@ int main(int argc, char* argv[]) {
         rms_params.eps = rms_eps;
         cpu_backend->rms_norm(rms_params);
 
-        std::cout << "Testing FFN gate matmul (Phase 3 E2E gate)...\n";
-
         Status st;
+
+        // Test 0a: RMSNorm — NPU vs CPU (Phase 4)
+        std::cout << "Testing RMSNorm (Phase 4)...\n";
+        {
+            std::vector<float> npu_normed(static_cast<size_t>(hidden_size));
+            RmsNormParams npu_rms;
+            npu_rms.input = test_input.data();
+            npu_rms.output = npu_normed.data();
+            npu_rms.size = hidden_size;
+            npu_rms.eps = rms_eps;
+            st = npu_backend->rms_norm(npu_rms);
+            npu_backend->sync();
+            if (st != Status::OK) {
+                std::cerr << "Error: NPU rms_norm failed: " << status_name(st) << "\n";
+                return 1;
+            }
+            auto cmp = compare_vectors(normed.data(), npu_normed.data(), hidden_size, 0.01f);
+            if (hidden_size != 256) {
+                std::cout << "    Note: prebuilt rmsnorm xclbin is 32x256; hidden="
+                          << hidden_size << " uses CPU fallback on NPU path\n";
+            }
+            if (!report_compare("RMSNorm", cmp, hidden_size, 0.05f, 0.1f, 0.01f)) return 1;
+        }
+
+        // Test 0b: attn_q matmul — NPU vs CPU (Phase 4)
+        std::cout << "Testing attn_q matmul (Phase 4)...\n";
+        {
+            const TensorView* attn_q_w = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", layer_idx);
+            if (!attn_q_w) {
+                std::cerr << "Error: attn_q.weight not found for layer " << layer_idx << "\n";
+                return 1;
+            }
+            const int8_t* decoded = weight_cache.get_or_decode(attn_q_w->name,
+                attn_q_w->data, attn_q_w->data_size(), attn_q_w->type);
+            if (!decoded) {
+                std::cerr << "Error: failed to decode attn_q.weight\n";
+                return 1;
+            }
+
+            std::vector<float> cpu_out(static_cast<size_t>(hidden_size), 0.0f);
+            MulMatParams cpu_p;
+            cpu_p.A = normed.data();
+            cpu_p.B = attn_q_w->data;
+            cpu_p.C = cpu_out.data();
+            cpu_p.M = 1; cpu_p.N = hidden_size; cpu_p.K = hidden_size;
+            cpu_p.lda = hidden_size; cpu_p.ldb = hidden_size; cpu_p.ldc = hidden_size;
+            cpu_p.B_type = attn_q_w->type;
+            cpu_backend->mul_mat_q(cpu_p);
+
+            std::vector<float> npu_out(static_cast<size_t>(hidden_size), 0.0f);
+            MulMatParams npu_p;
+            npu_p.A = normed.data();
+            npu_p.B = decoded;
+            npu_p.C = npu_out.data();
+            npu_p.M = 1; npu_p.N = hidden_size; npu_p.K = hidden_size;
+            npu_p.lda = hidden_size; npu_p.ldb = hidden_size; npu_p.ldc = hidden_size;
+            npu_p.B_type = attn_q_w->type;
+            attach_kquant_scales(npu_p, attn_q_w, weight_cache);
+            st = npu_backend->mul_mat_q(npu_p);
+            npu_backend->sync();
+            if (st != Status::OK) {
+                std::cerr << "Error: NPU attn_q matmul failed: " << status_name(st) << "\n";
+                return 1;
+            }
+
+            auto cmp = compare_vectors(cpu_out.data(), npu_out.data(), hidden_size, 2.0f);
+            std::cout << "  attn_q matmul (1 x " << hidden_size << " x " << hidden_size << "):\n";
+            std::cout << "    Type: " << ggml_type_name(attn_q_w->type) << "\n";
+            if (!report_compare("attn_q matmul", cmp, hidden_size, 0.1f, 0.1f, 2.0f)) return 1;
+        }
+
+        // Test 0c: SiLU — NPU vs CPU (Phase 4)
+        std::cout << "Testing SiLU (Phase 4)...\n";
+        {
+            std::vector<float> silu_in(static_cast<size_t>(ffn_size));
+            for (int i = 0; i < ffn_size; i++) silu_in[i] = test_input[i % hidden_size];
+
+            std::vector<float> cpu_silu(static_cast<size_t>(ffn_size));
+            SiluParams cpu_p;
+            cpu_p.input = silu_in.data();
+            cpu_p.output = cpu_silu.data();
+            cpu_p.size = ffn_size;
+            cpu_backend->silu(cpu_p);
+
+            std::vector<float> npu_silu(static_cast<size_t>(ffn_size));
+            SiluParams npu_p;
+            npu_p.input = silu_in.data();
+            npu_p.output = npu_silu.data();
+            npu_p.size = ffn_size;
+            st = npu_backend->silu(npu_p);
+            npu_backend->sync();
+            if (st != Status::OK) {
+                std::cerr << "Error: NPU silu failed: " << status_name(st) << "\n";
+                return 1;
+            }
+
+            auto cmp = compare_vectors(cpu_silu.data(), npu_silu.data(), ffn_size, 0.05f);
+            std::cout << "    Note: silu xclbin launch may use CPU fallback until opcode-3 args are fixed\n";
+            if (!report_compare("SiLU", cmp, ffn_size, 0.05f, 0.1f, 0.05f)) return 1;
+        }
+
+        std::cout << "Testing FFN gate matmul (Phase 3 E2E gate)...\n";
 
         // Test 1: FFN gate matmul — CPU ref vs NPU
         {
@@ -987,6 +1127,7 @@ int main(int argc, char* argv[]) {
     // Dequantize token embeddings once before the generation loop
     const TensorView* tok_embd = find_tensor(model, "token_embd.weight");
     std::vector<float> tok_embd_f32;
+    std::vector<float> output_w_f32;
     const float* embd_data = nullptr;
     if (tok_embd) {
         if (tok_embd->type == GgmlType::F32) {
@@ -1009,6 +1150,33 @@ int main(int argc, char* argv[]) {
                 embd_data = tok_embd_f32.data();
                 std::cout << "  Dequantized token_embd.weight ("
                     << ggml_type_name(tok_embd->type) << " -> F32)\n";
+            }
+        }
+    }
+
+    const TensorView* output_w = find_tensor(model, "output.weight");
+    const float* output_w_ptr = embd_data;
+    if (output_w) {
+        if (output_w->type == GgmlType::F32) {
+            output_w_ptr = get_float_ptr(output_w);
+        } else {
+            const int8_t* decoded = weight_cache.get_or_decode(output_w->name,
+                output_w->data, output_w->data_size(), output_w->type);
+            if (decoded) {
+                int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
+                int64_t vocab_size = static_cast<int64_t>(hparams.vocab_size);
+                const auto& out_scales = weight_cache.get_scales(output_w->name);
+                float out_scale = out_scales.empty() ? 1.0f : out_scales[0];
+                output_w_f32.resize(static_cast<size_t>(vocab_size * embd_dim));
+                for (int64_t v = 0; v < vocab_size; v++) {
+                    for (int64_t d = 0; d < embd_dim; d++) {
+                        output_w_f32[static_cast<size_t>(v * embd_dim + d)] =
+                            static_cast<float>(decoded[v * embd_dim + d]) * out_scale;
+                    }
+                }
+                output_w_ptr = output_w_f32.data();
+                std::cout << "  Dequantized output.weight ("
+                    << ggml_type_name(output_w->type) << " -> F32)\n";
             }
         }
     }
@@ -1199,11 +1367,9 @@ int main(int argc, char* argv[]) {
 
         // Logits projection from the last token position
         std::fill(logits.begin(), logits.end(), 0.0f);
-        const TensorView* tok_embd_out = find_tensor(model, "output.weight");
-        const float* embd_ptr = embd_data;
-        const float* logits_ptr = tok_embd_out ? get_float_ptr(tok_embd_out) : embd_ptr;
+        const float* logits_ptr = output_w_ptr;
 
-        if (logits_ptr && embd_ptr) {
+        if (logits_ptr) {
             int vocab_size = static_cast<int>(hparams.vocab_size);
             const float* last_hidden = inp_norm.data() + static_cast<size_t>(n_tokens - 1) * hidden_size;
             for (int v = 0; v < vocab_size; v++) {

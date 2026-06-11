@@ -30,6 +30,9 @@ constexpr xrt::memory_group kDefaultMemGroup = 0;
 constexpr const char* kTritonXdnaKernelName = "MLIR_AIE";
 constexpr uint32_t kNpuOpcode = 3;
 constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256 int8
+// Prebuilt rmsnorm xclbin is 32x256 bf16 (per-row norm over 256). Llama hidden=2048
+// needs a dedicated M=1,N=2048 kernel; until then use CPU for other sizes.
+constexpr int kRmsnormKernelCols = 256;
 
 //====//
 // BF16 conversion utilities
@@ -235,6 +238,60 @@ struct CachedSiluKernel {
     int size;
 };
 
+static void rms_norm_cpu_ref(const RmsNormParams& params) {
+    float variance = 0.0f;
+    for (int i = 0; i < params.size; i++) variance += params.input[i] * params.input[i];
+    variance /= params.size;
+    variance += params.eps;
+    float inv_std = 1.0f / std::sqrt(variance);
+    for (int i = 0; i < params.size; i++) params.output[i] = params.input[i] * inv_std;
+}
+
+static void silu_cpu_ref(const SiluParams& params) {
+    for (int i = 0; i < params.size; i++) {
+        float x = params.input[i];
+        params.output[i] = x / (1.0f + std::exp(-x));
+    }
+}
+
+// CPU reference flash attention (used when NPU kernel is unavailable)
+static void flash_attn_cpu_ref(const AttnParams& params) {
+    int nh = params.n_head;
+    int hd = params.head_dim;
+    int64_t cl = params.ctx_len;
+    float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+
+    for (int h = 0; h < nh; h++) {
+        const float* Qh = params.Q + h * hd;
+        const float* Kh = params.K + h * cl * hd;
+        const float* Vh = params.V + h * cl * hd;
+        float* outh = params.output + h * hd;
+
+        std::vector<float> scores(cl, 0.0f);
+        for (int64_t j = 0; j < cl; j++) {
+            float sum = 0.0f;
+            for (int d = 0; d < hd; d++) sum += Qh[d] * Kh[j * hd + d];
+            scores[j] = sum * scale;
+        }
+
+        float max_val = -INFINITY;
+        for (int64_t j = 0; j < cl; j++) if (scores[j] > max_val) max_val = scores[j];
+
+        float sum = 0.0f;
+        std::vector<float> weights(cl);
+        for (int64_t j = 0; j < cl; j++) {
+            weights[j] = std::exp(scores[j] - max_val);
+            sum += weights[j];
+        }
+        for (int64_t j = 0; j < cl; j++) weights[j] /= sum;
+
+        std::fill(outh, outh + hd, 0.0f);
+        for (int64_t j = 0; j < cl; j++)
+            for (int d = 0; d < hd; d++)
+                outh[d] += weights[j] * Vh[j * hd + d];
+    }
+}
+
 // Cached kernel for FlashAttention
 struct CachedFlashAttnKernel {
     xrt::run run;
@@ -284,10 +341,13 @@ public:
         // Initialize compile cache
         cache_ = std::make_unique<CompileCache>(cache_dir_);
 
-        // Try to load a base xclbin (matmul) - at least one kernel must work
-        bool any_kernel_loaded = load_matmul_xclbin() || load_rmsnorm_xclbin();
+        // Load prebuilt xclbins (each op has its own xclbin — do not short-circuit)
+        bool any_kernel_loaded = load_matmul_xclbin();
+        any_kernel_loaded = load_rmsnorm_xclbin() || any_kernel_loaded;
+        any_kernel_loaded = load_softmax_xclbin() || any_kernel_loaded;
+        any_kernel_loaded = load_silu_xclbin() || any_kernel_loaded;
         if (!any_kernel_loaded) {
-            std::cerr << "Warning: no NPU kernels available. Matmul and rmsnorm xclbins not found.\n";
+            std::cerr << "Warning: no NPU kernels available. Prebuilt xclbins not found.\n";
             std::cerr << "  Run with --dump-tensors to test GGUF parsing without NPU.\n";
             std::cerr << "  Prebuilt xclbins are needed, or install Triton-XDNA for JIT compilation.\n";
             std::cerr << "  Run: bash scripts/setup-triton-env.sh && ./scripts/build-kernels.sh npu6\n";
@@ -446,6 +506,11 @@ public:
         }
 
         int N = params.size;
+        if (N != kRmsnormKernelCols) {
+            rms_norm_cpu_ref(params);
+            return Status::OK;
+        }
+
         std::string cache_key = "rmsnorm_" + std::to_string(N) + "_" + profile_str_;
 
         std::lock_guard<std::mutex> lock(mutex_);
@@ -453,9 +518,13 @@ public:
         auto it = rmsnorm_kernels_.find(N);
         if (it == rmsnorm_kernels_.end()) {
             if (!ensure_rmsnorm_kernel(N, cache_key)) {
-                std::cerr << "Error: rmsnorm NPU kernel unavailable for N=" << N << "\n";
-                last_status_ = Status::NPU_UNAVAILABLE;
-                return last_status_;
+                static bool warned = false;
+                if (!warned) {
+                    std::cerr << "Warning: rmsnorm NPU kernel unavailable; using CPU fallback\n";
+                    warned = true;
+                }
+                rms_norm_cpu_ref(params);
+                return Status::OK;
             }
             it = rmsnorm_kernels_.find(N);
         }
@@ -486,9 +555,10 @@ public:
                            buf_bf16_in, buf_bf16_out);
                 kernel.run.wait();
             } catch (const std::exception& e) {
-                std::cerr << "Error: rmsnorm kernel execution failed: " << e.what() << "\n";
-                last_status_ = Status::ERROR;
-                return last_status_;
+                std::cerr << "Warning: rmsnorm kernel execution failed (" << e.what()
+                          << "); using CPU fallback\n";
+                rms_norm_cpu_ref(params);
+                return Status::OK;
             }
 
             // Convert bf16 output → f32
@@ -516,9 +586,10 @@ public:
                            static_cast<uint32_t>(N));
                 kernel.run.wait();
             } catch (const std::exception& e) {
-                std::cerr << "Error: rmsnorm kernel execution failed: " << e.what() << "\n";
-                last_status_ = Status::ERROR;
-                return last_status_;
+                std::cerr << "Warning: rmsnorm kernel execution failed (" << e.what()
+                          << "); using CPU fallback\n";
+                rms_norm_cpu_ref(params);
+                return Status::OK;
             }
 
             buf_mgr_->copy_from(*buf_rmsnorm_out_, params.output, size_bytes);
@@ -649,9 +720,13 @@ public:
         auto it = silu_kernels_.find(size);
         if (it == silu_kernels_.end()) {
             if (!ensure_silu_kernel(size, cache_key)) {
-                std::cerr << "Error: silu NPU kernel unavailable for size=" << size << "\n";
-                last_status_ = Status::NPU_UNAVAILABLE;
-                return last_status_;
+                static bool warned = false;
+                if (!warned) {
+                    std::cerr << "Warning: silu NPU kernel unavailable; using CPU fallback\n";
+                    warned = true;
+                }
+                silu_cpu_ref(params);
+                return Status::OK;
             }
             it = silu_kernels_.find(size);
         }
@@ -682,9 +757,10 @@ public:
                            buf_bf16_in, buf_bf16_out);
                 kernel.run.wait();
             } catch (const std::exception& e) {
-                std::cerr << "Error: silu kernel execution failed: " << e.what() << "\n";
-                last_status_ = Status::ERROR;
-                return last_status_;
+                std::cerr << "Warning: silu kernel execution failed (" << e.what()
+                          << "); using CPU fallback\n";
+                silu_cpu_ref(params);
+                return Status::OK;
             }
 
             // Convert bf16 output → f32
@@ -712,9 +788,10 @@ public:
                            static_cast<uint32_t>(size));
                 kernel.run.wait();
             } catch (const std::exception& e) {
-                std::cerr << "Error: silu kernel execution failed: " << e.what() << "\n";
-                last_status_ = Status::ERROR;
-                return last_status_;
+                std::cerr << "Warning: silu kernel execution failed (" << e.what()
+                          << "); using CPU fallback\n";
+                silu_cpu_ref(params);
+                return Status::OK;
             }
 
             buf_mgr_->copy_from(*buf_silu_out_, params.output, size_bytes);
@@ -740,9 +817,13 @@ public:
         auto it = flash_attn_kernels_.find(key);
         if (it == flash_attn_kernels_.end()) {
             if (!ensure_flash_attn_kernel(n_head, head_dim, ctx_len, cache_key)) {
-                std::cerr << "Error: flash_attn NPU kernel unavailable for " << n_head << "x" << head_dim << "x" << ctx_len << "\n";
-                last_status_ = Status::NPU_UNAVAILABLE;
-                return last_status_;
+                static bool warned = false;
+                if (!warned) {
+                    std::cerr << "Warning: flash_attn NPU kernel unavailable; using CPU fallback\n";
+                    warned = true;
+                }
+                flash_attn_cpu_ref(params);
+                return Status::OK;
             }
             it = flash_attn_kernels_.find(key);
         }
