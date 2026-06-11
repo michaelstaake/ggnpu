@@ -46,36 +46,22 @@ constexpr int64_t kFlashAttnCtxLen = 2048;
 // These functions convert between f32 (host) and bf16 (device).
 //====//
 
-// Convert a single f32 value to bf16 (round to nearest, ties to even)
+// Convert a single f32 value to bf16 (round to nearest)
 static inline uint16_t f32_to_bf16(float f) {
-    uint32_t* bits = reinterpret_cast<uint32_t*>(&f);
-    uint32_t sign = (*bits >> 16) & 0x8000;
-    uint32_t exp = (*bits >> 16) & 0x7f80;
-    uint32_t frac = (*bits >> 16) & 0x7fff;
-
-    // Handle NaNs
-    if (exp == 0x7f80) {
-        return sign | 0x7e00 | (frac ? 0x0200 : 0);
-    }
-
-    // Handle overflow/underflow to inf/zeros
-    if (exp < 0x3880) {  // subnormal or zero -> 0.0
-        return sign;
-    }
-    if (exp > 0x5080) {  // overflow -> inf
-        return sign | 0x7f80;
-    }
-
-    // Round: take the top 16 bits and round the 17th bit
-    uint32_t rounded = (frac & 0x4000) ? ((frac >> 16) + 1) : (frac >> 16);
-    return sign | (exp - 0x3800) | rounded;
+    uint32_t bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    uint32_t lsb = (bits >> 16) & 1;
+    uint32_t rounding_bias = 0x7fff + lsb;
+    bits += rounding_bias;
+    return static_cast<uint16_t>(bits >> 16);
 }
 
 // Convert a single bf16 value to f32
 static inline float bf16_to_f32(uint16_t b) {
     uint32_t bits = static_cast<uint32_t>(b) << 16;
-    float* result = reinterpret_cast<float*>(&bits);
-    return *result;
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
 }
 
 // Convert f32 vector to bf16 vector (in-place, writes to separate buffer)
@@ -140,6 +126,27 @@ namespace detail {
     std::string make_cache_key(const std::string& op, int M, int N, int K, const std::string& profile);
     bool jit_compilation_available();
 }
+
+namespace {
+
+xrt::bo make_data_bo(xrt::device& dev, size_t nbytes) {
+    return xrt::bo(dev, nbytes, XCL_BO_FLAGS_CACHEABLE, kDefaultMemGroup);
+}
+
+bool load_instr_bo(xrt::device& dev, xrt::kernel& krnl, xrt::bo& bo_instr,
+                   size_t& instr_words, const std::string& seq_path) {
+    auto words = detail::load_sequence_file(seq_path);
+    if (words.empty()) return false;
+    bo_instr = xrt::bo(dev, words.size() * sizeof(uint32_t),
+                       XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+    void* mapped = bo_instr.map<void*>();
+    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+    bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    instr_words = words.size();
+    return true;
+}
+
+} // namespace
 
 // Internal buffer wrapper for XRT buffer objects
 class XrtBuffer {
@@ -571,15 +578,12 @@ public:
             // BF16 kernel with instruction sequence: convert f32→bf16, pass opcode+instr
             bf16_input = convert_f32_to_bf16(params.input, N);
 
-            buf_bf16_in = xrt::bo(*device_, bf16_bytes,
-                                  XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
+            buf_bf16_in = make_data_bo(*device_, bf16_bytes);
             void* mapped = buf_bf16_in.map<void*>();
             std::memcpy(mapped, bf16_input.data(), bf16_bytes);
             buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-            // Output buffer (BF16)
-            xrt::bo buf_bf16_out(*device_, bf16_bytes,
-                                 XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
+            xrt::bo buf_bf16_out = make_data_bo(*device_, bf16_bytes);
 
             try {
                 kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
@@ -682,15 +686,12 @@ public:
             // BF16 kernel with instruction sequence: convert f32→bf16, pass opcode+instr
             bf16_input = convert_f32_to_bf16(params.input, total_elements);
 
-            buf_bf16_in = xrt::bo(*device_, bf16_bytes,
-                                  XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
+            buf_bf16_in = make_data_bo(*device_, bf16_bytes);
             void* mapped = buf_bf16_in.map<void*>();
             std::memcpy(mapped, bf16_input.data(), bf16_bytes);
             buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-            // Output buffer (BF16)
-            xrt::bo buf_bf16_out(*device_, bf16_bytes,
-                                 XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
+            xrt::bo buf_bf16_out = make_data_bo(*device_, bf16_bytes);
 
             try {
                 kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
@@ -746,53 +747,8 @@ public:
 
         int N = params.size;
         
-        // SiLU NPU kernel is fixed-size 8192 (FFN hidden dimension for Llama 3B).
-        // For other sizes, tile the computation or use CPU fallback.
+        // Prebuilt SiLU xclbin is fixed-size 8192 (Llama 1B/3B FFN).
         if (N != kSiluKernelSize) {
-            // Try to JIT-compile a kernel for this size
-            std::string cache_key = "silu_" + std::to_string(N) + "_" + profile_str_;
-            std::lock_guard<std::mutex> lock(mutex_);
-            
-            auto it = silu_kernels_.find(N);
-            if (it == silu_kernels_.end()) {
-                if (detail::jit_compilation_available()) {
-                    std::vector<uint8_t> xclbin_data = detail::jit_compile_silu(N, npu_profile_);
-                    if (!xclbin_data.empty()) {
-                        cache_->store_xclbin(cache_key, xclbin_data);
-                        if (load_silu_kernel_for_shape(cache_->get_xclbin_path(cache_key), N, cache_key)) {
-                            it = silu_kernels_.find(N);
-                        }
-                    }
-                }
-            }
-            
-            if (it != silu_kernels_.end()) {
-                auto& kernel = it->second;
-                size_t bf16_bytes = N * sizeof(uint16_t);
-                std::vector<uint8_t> bf16_input = convert_f32_to_bf16(params.input, N);
-                xrt::bo buf_bf16_in(*device_, bf16_bytes, XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
-                void* mapped = buf_bf16_in.map<void*>();
-                std::memcpy(mapped, bf16_input.data(), bf16_bytes);
-                buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                xrt::bo buf_bf16_out(*device_, bf16_bytes, XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
-                try {
-                    kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words, buf_bf16_in, buf_bf16_out);
-                    kernel.run.wait();
-                } catch (const std::exception& e) {
-                    std::cerr << "Warning: SiLU kernel execution failed (" << e.what() << "); using CPU fallback\n";
-                    silu_cpu_ref(params);
-                    return Status::OK;
-                }
-                std::vector<uint8_t> bf16_out_data(bf16_bytes);
-                buf_bf16_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-                void* mapped_out = buf_bf16_out.map<void*>();
-                std::memcpy(bf16_out_data.data(), mapped_out, bf16_bytes);
-                auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
-                std::memcpy(params.output, f32_result.data(), N * sizeof(float));
-                return Status::OK;
-            }
-            
-            // Fall back to CPU for unsupported sizes
             silu_cpu_ref(params);
             return Status::OK;
         }
@@ -817,28 +773,24 @@ public:
 
         auto& kernel = it->second;
 
-        // SiLU kernels are BF16 — convert f32 input → bf16 for DMA
         size_t bf16_bytes = N * sizeof(uint16_t);
         std::vector<uint8_t> bf16_input;
-        xrt::bo buf_bf16_in;
 
         if (kernel.bo_instr && kernel.instr_words > 0) {
-            // BF16 kernel with instruction sequence: convert f32→bf16, pass opcode+instr
             bf16_input = convert_f32_to_bf16(params.input, N);
 
-            buf_bf16_in = xrt::bo(*device_, bf16_bytes,
-                                  XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
-            void* mapped = buf_bf16_in.map<void*>();
-            std::memcpy(mapped, bf16_input.data(), bf16_bytes);
-            buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            if (!buf_silu_bf16_in_ || buf_silu_bf16_in_->size() < bf16_bytes) {
+                buf_silu_bf16_in_ = buf_mgr_->alloc(bf16_bytes, true);
+            }
+            if (!buf_silu_bf16_out_ || buf_silu_bf16_out_->size() < bf16_bytes) {
+                buf_silu_bf16_out_ = buf_mgr_->alloc(bf16_bytes, true);
+            }
 
-            // Output buffer (BF16)
-            xrt::bo buf_bf16_out(*device_, bf16_bytes,
-                                 XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
+            buf_mgr_->copy_to(*buf_silu_bf16_in_, bf16_input.data(), bf16_bytes);
 
             try {
                 kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
-                           buf_bf16_in, buf_bf16_out);
+                           buf_silu_bf16_in_->handle(), buf_silu_bf16_out_->handle());
                 kernel.run.wait();
             } catch (const std::exception& e) {
                 std::cerr << "Warning: SiLU kernel execution failed (" << e.what()
@@ -847,16 +799,12 @@ public:
                 return Status::OK;
             }
 
-            // Convert bf16 output → f32
             std::vector<uint8_t> bf16_out_data(bf16_bytes);
-            buf_bf16_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            void* mapped_out = buf_bf16_out.map<void*>();
-            std::memcpy(bf16_out_data.data(), mapped_out, bf16_bytes);
+            buf_mgr_->copy_from(*buf_silu_bf16_out_, bf16_out_data.data(), bf16_bytes);
             auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
             std::memcpy(params.output, f32_result.data(), N * sizeof(float));
 
         } else {
-            // Fallback: F32 kernel without instruction sequence (legacy path)
             size_t size_bytes = N * sizeof(float);
             if (!buf_silu_in_ || buf_silu_in_->size() < size_bytes) {
                 buf_silu_in_ = buf_mgr_->alloc(size_bytes, true);
@@ -1168,8 +1116,8 @@ private:
             return load_rmsnorm_kernel_for_shape(cached_path, N, cache_key);
         }
 
-        // Only reuse prebuilt kernel for matching shape (N=256 or N=2048 for Llama hidden)
-        if ((N == kRmsnormKernelCols || N == 2048) && hw_ctx_rmsnorm_) {
+        // Only reuse prebuilt kernel when N matches the compiled shape (32x256 -> N=256).
+        if (N == kRmsnormKernelCols && hw_ctx_rmsnorm_) {
             return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
         }
 
@@ -1203,15 +1151,7 @@ private:
             // Use the xclbin filename from the path to find matching shape-specific sequence file
             std::string seq_path = detail::find_prebuilt_sequence(fs::path(path).filename().string(), cache_dir_);
             if (!seq_path.empty()) {
-                auto words = detail::load_sequence_file(seq_path);
-                if (!words.empty()) {
-                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
-                    void* mapped = cached.bo_instr.map<void*>();
-                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
-                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                    cached.instr_words = words.size();
-                }
+                load_instr_bo(*device_, krnl, cached.bo_instr, cached.instr_words, seq_path);
             }
             rmsnorm_kernels_[N] = std::move(cached);
             return true;
@@ -1227,18 +1167,9 @@ private:
             xrt::run run(krnl);
 
             CachedRmsNormKernel cached{run, krnl, {}, 0, N};
-            // Load instruction sequence for BF16 kernel (opcode-3 convention)
             std::string seq_path = detail::find_prebuilt_sequence("rmsnorm_" + profile_str_ + ".xclbin", cache_dir_);
             if (!seq_path.empty()) {
-                auto words = detail::load_sequence_file(seq_path);
-                if (!words.empty()) {
-                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
-                    void* mapped = cached.bo_instr.map<void*>();
-                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
-                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                    cached.instr_words = words.size();
-                }
+                load_instr_bo(*device_, krnl, cached.bo_instr, cached.instr_words, seq_path);
             }
             rmsnorm_kernels_[N] = std::move(cached);
             return true;
@@ -1453,22 +1384,7 @@ private:
             // Load instruction sequence for BF16 kernel (opcode-3 convention)
             std::string seq_path = detail::find_prebuilt_sequence("silu_" + profile_str_ + ".xclbin", cache_dir_);
             if (!seq_path.empty()) {
-                auto words = detail::load_sequence_file(seq_path);
-                if (!words.empty()) {
-                    // Try group_id(0) first - SiLU kernel may only have one argument group
-                    try {
-                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(0));
-                    } catch (...) {
-                        // Fall back to group_id(1) if group_id(0) fails
-                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
-                    }
-                    void* mapped = cached.bo_instr.map<void*>();
-                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
-                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                    cached.instr_words = words.size();
-                }
+                load_instr_bo(*device_, krnl, cached.bo_instr, cached.instr_words, seq_path);
             }
             silu_kernels_[size] = std::move(cached);
             return true;
@@ -1484,25 +1400,9 @@ private:
             xrt::run run(krnl);
 
             CachedSiluKernel cached{run, krnl, {}, 0, size};
-            // Load instruction sequence for BF16 kernel (opcode-3 convention)
             std::string seq_path = detail::find_prebuilt_sequence("silu_" + profile_str_ + ".xclbin", cache_dir_);
             if (!seq_path.empty()) {
-                auto words = detail::load_sequence_file(seq_path);
-                if (!words.empty()) {
-                    // Try group_id(0) first - SiLU kernel may only have one argument group
-                    try {
-                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(0));
-                    } catch (...) {
-                        // Fall back to group_id(1) if group_id(0) fails
-                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
-                    }
-                    void* mapped = cached.bo_instr.map<void*>();
-                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
-                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                    cached.instr_words = words.size();
-                }
+                load_instr_bo(*device_, krnl, cached.bo_instr, cached.instr_words, seq_path);
             }
             silu_kernels_[size] = std::move(cached);
             return true;

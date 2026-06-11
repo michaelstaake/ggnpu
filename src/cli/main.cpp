@@ -865,172 +865,19 @@ int main(int argc, char* argv[]) {
         }
 
         std::cout << "Testing FFN gate matmul (Phase 3 E2E gate)...\n";
-
-        // Test 1: FFN gate matmul — CPU ref vs NPU
         {
             const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer_idx);
-            if (!ffn_gate_w) {
-                std::cerr << "Error: ffn_gate.weight not found for layer " << layer_idx << "\n";
-                return 1;
-            }
-
-            // Decode weights for NPU (INT8 cache)
-            const int8_t* decoded_npu = weight_cache.get_or_decode(*ffn_gate_w);
-            if (!decoded_npu) {
-                std::cerr << "Error: failed to decode ffn_gate.weight\n";
-                return 1;
-            }
-
-            // CPU reference: full float matmul (dequantize on the fly)
-            std::vector<float> cpu_output(static_cast<size_t>(ffn_size), 0.0f);
-            MulMatParams cpu_params;
-            cpu_params.A = normed.data();
-            cpu_params.B = ffn_gate_w->data;
-            cpu_params.C = cpu_output.data();
-            cpu_params.M = 1;
-            cpu_params.N = ffn_size;
-            cpu_params.K = hidden_size;
-            cpu_params.lda = hidden_size;
-            cpu_params.ldb = ffn_size;
-            cpu_params.ldc = ffn_size;
-            cpu_params.n_batches = 1;
-            cpu_params.B_type = ffn_gate_w->type;
-            cpu_backend->mul_mat_q(cpu_params);
-
-            // NPU path: mul_mat_q with decoded INT8 weights
-            std::vector<float> npu_output(static_cast<size_t>(ffn_size), 0.0f);
-            MulMatParams npu_params;
-            npu_params.A = normed.data();
-            npu_params.B = decoded_npu;
-            npu_params.C = npu_output.data();
-            npu_params.M = 1;
-            npu_params.N = ffn_size;
-            npu_params.K = hidden_size;
-            npu_params.lda = hidden_size;
-            npu_params.ldb = ffn_size;
-            npu_params.ldc = ffn_size;
-            npu_params.n_batches = 1;
-            npu_params.B_type = ffn_gate_w->type;
-            if (ffn_gate_w->type == GgmlType::Q4_K || ffn_gate_w->type == GgmlType::Q6_K) {
-                const auto& scales = weight_cache.get_scales(*ffn_gate_w);
-                if (!scales.empty()) {
-                    npu_params.scales = scales.data();
-                }
-            }
-
-            Status st = npu_backend->mul_mat_q(npu_params);
-            npu_backend->sync();
-            if (st != Status::OK) {
-                std::cerr << "Error: NPU matmul failed: " << status_name(st) << "\n";
-                return 1;
-            }
-
-            // Compare outputs
-            float max_diff = 0.0f;
-            float max_cpu = 0.0f;
-            int mismatches = 0;
-            for (int i = 0; i < ffn_size; i++) {
-                float diff = std::fabs(cpu_output[i] - npu_output[i]);
-                if (diff > max_diff) max_diff = diff;
-                if (std::fabs(cpu_output[i]) > max_cpu) max_cpu = std::fabs(cpu_output[i]);
-                if (diff > 2.0f) mismatches++;  // tolerance: 2.0 for INT8 quantization error
-            }
-
-            float rel_error = max_cpu > 0.0f ? max_diff / max_cpu : max_diff;
-            std::cout << "  FFN gate matmul (1 x " << hidden_size << " x " << ffn_size << "):\n";
-            std::cout << "    Type: " << ggml_type_name(ffn_gate_w->type) << "\n";
-            std::cout << "    Max absolute diff: " << max_diff << "\n";
-            std::cout << "    Max CPU value: " << max_cpu << "\n";
-            std::cout << "    Relative error: " << rel_error << "\n";
-            std::cout << "    Mismatches (>2.0): " << mismatches << " / " << ffn_size << "\n";
-
-            if (rel_error < 0.1f && mismatches < ffn_size / 10) {
-                std::cout << "    Result: PASS\n\n";
-            } else {
-                std::cout << "    Result: FAIL (tolerance exceeded)\n\n";
-                return 1;
-            }
+            if (!bench_quant_matmul("FFN gate matmul", *cpu_backend, *npu_backend, weight_cache,
+                    normed.data(), ffn_gate_w, 1, ffn_size, hidden_size,
+                    hidden_size, ffn_size, ffn_size)) return 1;
         }
 
         // Test 2: FFN up matmul
         {
             const TensorView* ffn_up_w = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", layer_idx);
-            if (!ffn_up_w) {
-                std::cerr << "Error: ffn_up.weight not found for layer " << layer_idx << "\n";
-                return 1;
-            }
-
-            const int8_t* decoded_npu = weight_cache.get_or_decode(*ffn_up_w);
-            if (!decoded_npu) {
-                std::cerr << "Error: failed to decode ffn_up.weight\n";
-                return 1;
-            }
-
-            std::vector<float> cpu_output(static_cast<size_t>(ffn_size), 0.0f);
-            MulMatParams cpu_params;
-            cpu_params.A = normed.data();
-            cpu_params.B = ffn_up_w->data;
-            cpu_params.C = cpu_output.data();
-            cpu_params.M = 1;
-            cpu_params.N = ffn_size;
-            cpu_params.K = hidden_size;
-            cpu_params.lda = hidden_size;
-            cpu_params.ldb = ffn_size;
-            cpu_params.ldc = ffn_size;
-            cpu_params.n_batches = 1;
-            cpu_params.B_type = ffn_up_w->type;
-            cpu_backend->mul_mat_q(cpu_params);
-
-            std::vector<float> npu_output(static_cast<size_t>(ffn_size), 0.0f);
-            MulMatParams npu_params;
-            npu_params.A = normed.data();
-            npu_params.B = decoded_npu;
-            npu_params.C = npu_output.data();
-            npu_params.M = 1;
-            npu_params.N = ffn_size;
-            npu_params.K = hidden_size;
-            npu_params.lda = hidden_size;
-            npu_params.ldb = ffn_size;
-            npu_params.ldc = ffn_size;
-            npu_params.n_batches = 1;
-            npu_params.B_type = ffn_up_w->type;
-            if (ffn_up_w->type == GgmlType::Q4_K || ffn_up_w->type == GgmlType::Q6_K) {
-                const auto& scales = weight_cache.get_scales(*ffn_up_w);
-                if (!scales.empty()) {
-                    npu_params.scales = scales.data();
-                }
-            }
-
-            st = npu_backend->mul_mat_q(npu_params);
-            npu_backend->sync();
-            if (st != Status::OK) {
-                std::cerr << "Error: NPU matmul failed: " << status_name(st) << "\n";
-                return 1;
-            }
-
-            float max_diff = 0.0f;
-            float max_cpu = 0.0f;
-            int mismatches = 0;
-            for (int i = 0; i < ffn_size; i++) {
-                float diff = std::fabs(cpu_output[i] - npu_output[i]);
-                if (diff > max_diff) max_diff = diff;
-                if (std::fabs(cpu_output[i]) > max_cpu) max_cpu = std::fabs(cpu_output[i]);
-                if (diff > 2.0f) mismatches++;
-            }
-
-            float rel_error = max_cpu > 0.0f ? max_diff / max_cpu : max_diff;
-            std::cout << "  FFN up matmul (1 x " << hidden_size << " x " << ffn_size << "):\n";
-            std::cout << "    Type: " << ggml_type_name(ffn_up_w->type) << "\n";
-            std::cout << "    Max absolute diff: " << max_diff << "\n";
-            std::cout << "    Relative error: " << rel_error << "\n";
-            std::cout << "    Mismatches (>2.0): " << mismatches << " / " << ffn_size << "\n";
-
-            if (rel_error < 0.1f && mismatches < ffn_size / 10) {
-                std::cout << "    Result: PASS\n\n";
-            } else {
-                std::cout << "    Result: FAIL\n\n";
-                return 1;
-            }
+            if (!bench_quant_matmul("FFN up matmul", *cpu_backend, *npu_backend, weight_cache,
+                    normed.data(), ffn_up_w, 1, ffn_size, hidden_size,
+                    hidden_size, ffn_size, ffn_size)) return 1;
         }
 
         // Test 3: FFN down matmul (silu(gate) * up) -> hidden_size
@@ -1063,10 +910,7 @@ int main(int argc, char* argv[]) {
             gate_params.ldc = ffn_size;
             gate_params.n_batches = 1;
             gate_params.B_type = ffn_gate_w->type;
-            if (ffn_gate_w->type == GgmlType::Q4_K || ffn_gate_w->type == GgmlType::Q6_K) {
-                const auto& scales = weight_cache.get_scales(*ffn_gate_w);
-                if (!scales.empty()) gate_params.scales = scales.data();
-            }
+            attach_kquant_scales(gate_params, ffn_gate_w, weight_cache);
             npu_backend->mul_mat_q(gate_params);
 
             MulMatParams up_params;
@@ -1081,10 +925,7 @@ int main(int argc, char* argv[]) {
             up_params.ldc = ffn_size;
             up_params.n_batches = 1;
             up_params.B_type = ffn_up_w->type;
-            if (ffn_up_w->type == GgmlType::Q4_K || ffn_up_w->type == GgmlType::Q6_K) {
-                const auto& scales = weight_cache.get_scales(*ffn_up_w);
-                if (!scales.empty()) up_params.scales = scales.data();
-            }
+            attach_kquant_scales(up_params, ffn_up_w, weight_cache);
             npu_backend->mul_mat_q(up_params);
             npu_backend->sync();
 
@@ -1111,12 +952,7 @@ int main(int argc, char* argv[]) {
             down_params.ldc = hidden_size;
             down_params.n_batches = 1;
             down_params.B_type = ffn_down_w->type;
-            if (ffn_down_w->type == GgmlType::Q4_K || ffn_down_w->type == GgmlType::Q6_K) {
-                const auto& scales = weight_cache.get_scales(*ffn_down_w);
-                if (!scales.empty()) {
-                    down_params.scales = scales.data();
-                }
-            }
+            attach_kquant_scales(down_params, ffn_down_w, weight_cache);
 
             st = npu_backend->mul_mat_q(down_params);
             npu_backend->sync();
