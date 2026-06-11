@@ -503,6 +503,8 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 |-----|------|
 | Removed misleading "SiLU uses CPU fallback" comment from `bench-layer` test (NPU path is actually exercised) | `src/cli/main.cpp` |
 | Added clarifying comments for CPU fallbacks: logits projection, residual adds | `src/cli/main.cpp` |
+| **bf16 marshaling gate:** `create_rmsnorm/softmax/silu_kernel_from_loaded_xclbin` now properly load instruction sequences and create kernels (were returning false) | `src/backends/amd_xdna/amd_xdna.cpp` |
+| **RMSNorm shape:** prebuilt kernel now accepted for N=2048 (Llama hidden) in addition to N=256 | `src/backends/amd_xdna/amd_xdna.cpp` |
 
 #### Recently fixed (2026-06-10)
 

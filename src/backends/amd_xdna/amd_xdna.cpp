@@ -1128,8 +1128,8 @@ private:
             return load_rmsnorm_kernel_for_shape(cached_path, N, cache_key);
         }
 
-        // Only reuse prebuilt kernel for matching shape (N=256)
-        if (N == kRmsnormKernelCols && hw_ctx_rmsnorm_) {
+        // Only reuse prebuilt kernel for matching shape (N=256 or N=2048 for Llama hidden)
+        if ((N == kRmsnormKernelCols || N == 2048) && hw_ctx_rmsnorm_) {
             return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
         }
 
@@ -1181,10 +1181,30 @@ private:
     }
 
     bool create_rmsnorm_kernel_from_loaded_xclbin(int N, const std::string& cache_key) {
-        // Prebuilt RMSNorm xclbin was loaded during initialization but instruction sequence
-        // lookup fails. For now, skip prebuilt path and rely on JIT compilation or CPU fallback.
-        // TODO: Pre-load instruction sequence during xclbin initialization phase
-        return false;
+        try {
+            xrt::kernel krnl(hw_ctx_rmsnorm_, kTritonXdnaKernelName);
+            xrt::run run(krnl);
+
+            CachedRmsNormKernel cached{run, krnl, {}, 0, N};
+            // Load instruction sequence for BF16 kernel (opcode-3 convention)
+            std::string seq_path = detail::find_prebuilt_sequence("rmsnorm_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            rmsnorm_kernels_[N] = std::move(cached);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to create rmsnorm kernel from loaded xclbin: " << e.what() << "\n";
+            return false;
+        }
     }
 
     // Load or compile the softmax xclbin
@@ -1286,10 +1306,30 @@ private:
     }
 
     bool create_softmax_kernel_from_loaded_xclbin(int rows, int cols, const std::string& cache_key) {
-        // Prebuilt softmax xclbin was loaded during initialization but instruction sequence
-        // lookup fails. For now, skip prebuilt path and rely on JIT compilation or CPU fallback.
-        // TODO: Pre-load instruction sequence during xclbin initialization phase
-        return false;
+        try {
+            xrt::kernel krnl(hw_ctx_softmax_, kTritonXdnaKernelName);
+            xrt::run run(krnl);
+
+            CachedSoftmaxKernel cached{run, krnl, {}, 0, rows, cols};
+            // Load instruction sequence for BF16 kernel (opcode-3 convention)
+            std::string seq_path = detail::find_prebuilt_sequence("softmax_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            softmax_kernels_[std::make_pair(rows, cols)] = std::move(cached);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to create softmax kernel from loaded xclbin: " << e.what() << "\n";
+            return false;
+        }
     }
 
     // Load or compile the silu xclbin
@@ -1398,10 +1438,37 @@ private:
     }
 
     bool create_silu_kernel_from_loaded_xclbin(int size, const std::string& cache_key) {
-        // Prebuilt SiLU xclbin was loaded during initialization but instruction sequence
-        // lookup fails. For now, skip prebuilt path and rely on JIT compilation or CPU fallback.
-        // TODO: Pre-load instruction sequence during xclbin initialization phase
-        return false;
+        try {
+            xrt::kernel krnl(hw_ctx_silu_, kTritonXdnaKernelName);
+            xrt::run run(krnl);
+
+            CachedSiluKernel cached{run, krnl, {}, 0, size};
+            // Load instruction sequence for BF16 kernel (opcode-3 convention)
+            std::string seq_path = detail::find_prebuilt_sequence("silu_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                auto words = detail::load_sequence_file(seq_path);
+                if (!words.empty()) {
+                    // Try group_id(0) first - SiLU kernel may only have one argument group
+                    try {
+                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(0));
+                    } catch (...) {
+                        // Fall back to group_id(1) if group_id(0) fails
+                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
+                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
+                    }
+                    void* mapped = cached.bo_instr.map<void*>();
+                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
+                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                    cached.instr_words = words.size();
+                }
+            }
+            silu_kernels_[size] = std::move(cached);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to create silu kernel from loaded xclbin: " << e.what() << "\n";
+            return false;
+        }
     }
 
     // Load or compile the flash_attn xclbin
