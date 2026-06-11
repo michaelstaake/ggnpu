@@ -367,7 +367,13 @@ public:
                             a_tile[i * T + k] = to_i8(A[(m0 + i) * params.lda + (k0 + k)]);
 
                     std::fill(b_tile.begin(), b_tile.end(), 0);
-                    if (params.B_type == GgmlType::I8) {
+                    if (params.B_type == GgmlType::I8 ||
+                        params.B_type == GgmlType::Q4_0 ||
+                        params.B_type == GgmlType::Q4_K ||
+                        params.B_type == GgmlType::Q6_K ||
+                        params.B_type == GgmlType::Q8_0) {
+                        // Already-decoded INT8 weights (from weight cache or raw I8).
+                        // Quantized types here mean "decode already done on host".
                         const int8_t* B = static_cast<const int8_t*>(params.B);
                         for (int k = 0; k < kc; k++)
                             for (int j = 0; j < nc; j++)
