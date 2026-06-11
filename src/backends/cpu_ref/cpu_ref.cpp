@@ -148,7 +148,8 @@ public:
         float inv_std = 1.0f / std::sqrt(variance);
 
         for (int i = 0; i < params.size; i++) {
-            params.output[i] = params.input[i] * inv_std;
+            float w = params.weight ? params.weight[i] : 1.0f;
+            params.output[i] = params.input[i] * inv_std * w;
         }
 
         return Status::OK;
@@ -219,6 +220,7 @@ public:
         int nh = params.n_head;
         int hd = params.head_dim;
         int64_t cl = params.ctx_len;
+        int64_t qpos = params.query_pos >= 0 ? params.query_pos : cl - 1;
 
         float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
@@ -229,8 +231,8 @@ public:
             float* outh = params.output + h * hd;
 
             // Compute attention weights: scores[j] = Q @ K[j] * scale
-            std::vector<float> scores(cl, 0.0f);
-            for (int64_t j = 0; j < cl; j++) {
+            std::vector<float> scores(cl, -INFINITY);
+            for (int64_t j = 0; j <= qpos && j < cl; j++) {
                 float sum = 0.0f;
                 for (int d = 0; d < hd; d++) {
                     sum += Qh[d] * Kh[j * hd + d];
@@ -238,7 +240,7 @@ public:
                 scores[j] = sum * scale;
             }
 
-            // Softmax over scores
+            // Softmax over scores (causal: positions > qpos stay at -inf)
             float max_val = -INFINITY;
             for (int64_t j = 0; j < cl; j++) {
                 if (scores[j] > max_val) max_val = scores[j];

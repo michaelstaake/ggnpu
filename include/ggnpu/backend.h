@@ -38,6 +38,7 @@ struct RmsNormParams {
     float* output;
     int size;
     float eps;
+    const float* weight = nullptr;
 };
 
 struct RopeParams {
@@ -71,6 +72,7 @@ struct AttnParams {
     int n_head;
     int head_dim;
     int64_t ctx_len;
+    int64_t query_pos = -1;  // causal index; -1 => ctx_len - 1
     const float* freq_factors;
 };
 

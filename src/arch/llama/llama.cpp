@@ -61,6 +61,8 @@ bool Model::parse_hparams() {
     hparams_.rope_freq_scale = static_cast<float>(gguf_->rope_freq_scale());
     hparams_.rope_freq_base = gguf_->rope_freq_base();
     hparams_.tensor_data_offset = gguf_->tensor_data_offset();
+    hparams_.attention_layer_norm_rms_epsilon =
+        static_cast<float>(gguf_->attention_layer_norm_rms_epsilon());
 
     // Get vocab size from GGUF if available
     auto vocab_it = gguf_->kv_pairs().find("tokenizer.ggml.tokens.length");

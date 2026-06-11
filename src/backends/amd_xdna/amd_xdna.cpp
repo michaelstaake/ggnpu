@@ -245,7 +245,10 @@ static void rms_norm_cpu_ref(const RmsNormParams& params) {
     variance /= params.size;
     variance += params.eps;
     float inv_std = 1.0f / std::sqrt(variance);
-    for (int i = 0; i < params.size; i++) params.output[i] = params.input[i] * inv_std;
+    for (int i = 0; i < params.size; i++) {
+        float w = params.weight ? params.weight[i] : 1.0f;
+        params.output[i] = params.input[i] * inv_std * w;
+    }
 }
 
 static void silu_cpu_ref(const SiluParams& params) {
@@ -260,6 +263,7 @@ static void flash_attn_cpu_ref(const AttnParams& params) {
     int nh = params.n_head;
     int hd = params.head_dim;
     int64_t cl = params.ctx_len;
+    int64_t qpos = params.query_pos >= 0 ? params.query_pos : cl - 1;
     float scale = 1.0f / std::sqrt(static_cast<float>(hd));
 
     for (int h = 0; h < nh; h++) {
@@ -268,8 +272,8 @@ static void flash_attn_cpu_ref(const AttnParams& params) {
         const float* Vh = params.V + h * cl * hd;
         float* outh = params.output + h * hd;
 
-        std::vector<float> scores(cl, 0.0f);
-        for (int64_t j = 0; j < cl; j++) {
+        std::vector<float> scores(cl, -INFINITY);
+        for (int64_t j = 0; j <= qpos && j < cl; j++) {
             float sum = 0.0f;
             for (int d = 0; d < hd; d++) sum += Qh[d] * Kh[j * hd + d];
             scores[j] = sum * scale;
@@ -507,7 +511,7 @@ public:
         }
 
         int N = params.size;
-        if (N != kRmsnormKernelCols) {
+        if (N != kRmsnormKernelCols || params.weight) {
             rms_norm_cpu_ref(params);
             return Status::OK;
         }

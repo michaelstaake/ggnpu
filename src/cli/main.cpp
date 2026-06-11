@@ -666,13 +666,15 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    auto rms_norm = [&](float* out, const float* inp, int n_rows, int row_size, float eps) {
+    auto rms_norm = [&](float* out, const float* inp, int n_rows, int row_size, float eps,
+                        const float* weight) {
         for (int row = 0; row < n_rows; row++) {
             RmsNormParams rms_params;
             rms_params.input = inp + row * row_size;
             rms_params.output = out + row * row_size;
             rms_params.size = row_size;
             rms_params.eps = eps;
+            rms_params.weight = weight;
             backend->rms_norm(rms_params);
         }
     };
@@ -1034,7 +1036,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Test 3: FFN down matmul (gate * silu(up)) -> hidden_size
+        // Test 3: FFN down matmul (silu(gate) * up) -> hidden_size
         {
             const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer_idx);
             const TensorView* ffn_up_w = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", layer_idx);
@@ -1091,11 +1093,11 @@ int main(int argc, char* argv[]) {
             npu_backend->mul_mat_q(up_params);
             npu_backend->sync();
 
-            // SwiGLU: gate * silu(up)
+            // SwiGLU: silu(gate) * up
             std::vector<float> swiglu(static_cast<size_t>(ffn_size));
             for (int i = 0; i < ffn_size; i++) {
-                float up_silu = up_out[i] / (1.0f + std::exp(-up_out[i]));
-                swiglu[i] = gate_out[i] * up_silu;
+                float gate_silu = gate_out[i] / (1.0f + std::exp(-gate_out[i]));
+                swiglu[i] = gate_silu * up_out[i];
             }
 
             // FFN down matmul on NPU
@@ -1209,11 +1211,17 @@ int main(int argc, char* argv[]) {
                     return backend->mul_mat_q(mp) == Status::OK;
                 };
 
+                const TensorView* attn_norm_w =
+                    find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", layer_idx);
+                const TensorView* ffn_norm_w =
+                    find_tensor_pattern(model, "blk.{layer}.ffn_norm.weight", layer_idx);
+
                 // Attention branch
                 std::vector<float> norm(static_cast<size_t>(hidden_size));
                 RmsNormParams rp;
                 rp.input = hidden.data(); rp.output = norm.data();
                 rp.size = hidden_size; rp.eps = rms_eps;
+                rp.weight = get_float_ptr(attn_norm_w);
                 if (backend->rms_norm(rp) != Status::OK) return false;
 
                 std::vector<float> q(hidden_size), k(kv_dim), v(kv_dim);
@@ -1253,6 +1261,7 @@ int main(int argc, char* argv[]) {
                 // FFN branch
                 rp.input = hidden.data();
                 rp.output = norm.data();
+                rp.weight = get_float_ptr(ffn_norm_w);
                 if (backend->rms_norm(rp) != Status::OK) return false;
 
                 std::vector<float> gate(ffn_size), up(ffn_size), swiglu(ffn_size);
@@ -1263,9 +1272,9 @@ int main(int argc, char* argv[]) {
                 backend->sync();
 
                 SiluParams sp;
-                sp.input = up.data(); sp.output = swiglu.data(); sp.size = ffn_size;
+                sp.input = gate.data(); sp.output = swiglu.data(); sp.size = ffn_size;
                 if (backend->silu(sp) != Status::OK) return false;
-                for (int i = 0; i < ffn_size; i++) swiglu[i] *= gate[i];
+                for (int i = 0; i < ffn_size; i++) swiglu[i] *= up[i];
 
                 std::vector<float> ffn_out(hidden_size, 0.0f);
                 if (!do_matmul(swiglu.data(), ffn_down_w, ffn_out.data(),
@@ -1393,8 +1402,14 @@ int main(int argc, char* argv[]) {
 
         // Transformer layers
         for (int layer = 0; layer < num_layers; layer++) {
+            const TensorView* attn_norm_w =
+                find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", layer);
+            const TensorView* ffn_norm_w =
+                find_tensor_pattern(model, "blk.{layer}.ffn_norm.weight", layer);
+
             // RMSNorm for attention
-            rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps);
+            rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
+                     get_float_ptr(attn_norm_w));
 
             // Attention projections
             const TensorView* attn_q = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", layer);
@@ -1467,6 +1482,7 @@ int main(int argc, char* argv[]) {
                     fa_params.n_head = 1;
                     fa_params.head_dim = head_dim;
                     fa_params.ctx_len = ctx_len;
+                    fa_params.query_pos = pos + t;
                     fa_params.freq_factors = nullptr;
                     backend->flash_attn(fa_params);
                 }
@@ -1490,7 +1506,8 @@ int main(int argc, char* argv[]) {
             }
 
             // FFN path
-            rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps);
+            rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
+                     get_float_ptr(ffn_norm_w));
 
             const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer);
             const TensorView* ffn_up_w = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", layer);
@@ -1505,17 +1522,17 @@ int main(int argc, char* argv[]) {
 
             backend->sync();
 
-            // SwiGLU: gate * silu(up) per token row
+            // SwiGLU: silu(gate) * up per token row
             for (int t = 0; t < n_tokens; t++) {
                 SiluParams silu_params;
-                silu_params.input = ffn_up.data() + t * ffn_size;
+                silu_params.input = ffn_gate.data() + t * ffn_size;
                 silu_params.output = ffn_silu.data() + t * ffn_size;
                 silu_params.size = ffn_size;
                 backend->silu(silu_params);
 
                 for (int i = 0; i < ffn_size; i++) {
                     ffn_silu[static_cast<size_t>(t) * ffn_size + i] *=
-                        ffn_gate[static_cast<size_t>(t) * ffn_size + i];
+                        ffn_up[static_cast<size_t>(t) * ffn_size + i];
                 }
             }
 
@@ -1536,8 +1553,10 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Final normalization
-        rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps);
+        // Final normalization (output_norm before logits)
+        const TensorView* output_norm_w = find_tensor(model, "output_norm.weight");
+        rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
+                 get_float_ptr(output_norm_w));
 
         // Logits projection from the last token position
         std::fill(logits.begin(), logits.end(), 0.0f);
