@@ -412,11 +412,12 @@ Work through these in order. Do not skip ahead.
 
 ### Phase 4 — Full decoder layer (in progress)
 
-- [x] `bench-layer` validates attn_q matmul on NPU vs CPU ref
+- [x] `bench-layer` validates all attention matmuls + full layer forward on NPU vs CPU ref
 - [x] bf16 f32↔bf16 marshaling for rmsnorm/softmax/silu DMA paths
 - [x] CPU fallback when NPU elementwise kernels unavailable or wrong shape
 - [x] Load all prebuilt xclbins at backend init (matmul, rmsnorm, softmax, silu)
-- [ ] All matmuls in one layer on NPU (gate/up/down done; attn_k/v/o still to bench)
+- [x] All matmuls in one layer on NPU (gate/up/down + attn_q/k/v/output benched)
+- [x] Full single-layer forward CPU vs NPU (`bench-layer` test 4)
 - [ ] RMSNorm + SiLU on NPU at Llama hidden/ffn sizes (prebuilt rmsnorm is 32×256; silu opcode-3 launch fails)
 - [ ] RoPE on NPU (CPU path today)
 - [ ] KV cache write + attention E2E
@@ -545,6 +546,7 @@ cmake --build build-npu -j2
 
 # Phase 3 gate — PASSES: FFN gate/up/down matmuls from GGUF on NPU vs CPU ref
 ./build-npu/ggnpu bench-layer -m models/llama-3.2-1b-q4_k_m.gguf --layer 0
+# → RMSNorm, attn_q/k/v/output, flash_attn, SiLU, FFN matmuls, full layer forward
 
 # Contributor-only: unit tests on host CPU
 cd build && ctest

@@ -33,6 +33,7 @@ constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256
 // Prebuilt rmsnorm xclbin is 32x256 bf16 (per-row norm over 256). Llama hidden=2048
 // needs a dedicated M=1,N=2048 kernel; until then use CPU for other sizes.
 constexpr int kRmsnormKernelCols = 256;
+constexpr int kSiluKernelSize = 8192;  // prebuilt silu xclbin default N
 
 //====//
 // BF16 conversion utilities
@@ -712,91 +713,9 @@ public:
             return last_status_;
         }
 
-        int size = params.size;
-        std::string cache_key = "silu_" + std::to_string(size) + "_" + profile_str_;
-
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        auto it = silu_kernels_.find(size);
-        if (it == silu_kernels_.end()) {
-            if (!ensure_silu_kernel(size, cache_key)) {
-                static bool warned = false;
-                if (!warned) {
-                    std::cerr << "Warning: silu NPU kernel unavailable; using CPU fallback\n";
-                    warned = true;
-                }
-                silu_cpu_ref(params);
-                return Status::OK;
-            }
-            it = silu_kernels_.find(size);
-        }
-
-        auto& kernel = it->second;
-
-        // SiLU kernels are BF16 — convert f32 input → bf16 for DMA
-        size_t bf16_bytes = size * sizeof(uint16_t);
-        std::vector<uint8_t> bf16_input;
-        xrt::bo buf_bf16_in;
-
-        if (kernel.bo_instr && kernel.instr_words > 0) {
-            // BF16 kernel with instruction sequence: convert f32→bf16, pass opcode+instr
-            bf16_input = convert_f32_to_bf16(params.input, size);
-
-            buf_bf16_in = xrt::bo(*device_, bf16_bytes,
-                                  XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
-            void* mapped = buf_bf16_in.map<void*>();
-            std::memcpy(mapped, bf16_input.data(), bf16_bytes);
-            buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-            // Output buffer (BF16)
-            xrt::bo buf_bf16_out(*device_, bf16_bytes,
-                                 XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
-
-            try {
-                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
-                           buf_bf16_in, buf_bf16_out);
-                kernel.run.wait();
-            } catch (const std::exception& e) {
-                std::cerr << "Warning: silu kernel execution failed (" << e.what()
-                          << "); using CPU fallback\n";
-                silu_cpu_ref(params);
-                return Status::OK;
-            }
-
-            // Convert bf16 output → f32
-            std::vector<uint8_t> bf16_out_data(bf16_bytes);
-            buf_bf16_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            void* mapped_out = buf_bf16_out.map<void*>();
-            std::memcpy(bf16_out_data.data(), mapped_out, bf16_bytes);
-            auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), size);
-            std::memcpy(params.output, f32_result.data(), size * sizeof(float));
-
-        } else {
-            // Fallback: F32 kernel without instruction sequence (legacy path)
-            size_t size_bytes = size * sizeof(float);
-            if (!buf_silu_in_ || buf_silu_in_->size() < size_bytes) {
-                buf_silu_in_ = buf_mgr_->alloc(size_bytes, true);
-            }
-            if (!buf_silu_out_ || buf_silu_out_->size() < size_bytes) {
-                buf_silu_out_ = buf_mgr_->alloc(size_bytes, true);
-            }
-
-            buf_mgr_->copy_to(*buf_silu_in_, params.input, size_bytes);
-
-            try {
-                kernel.run(buf_silu_in_->handle(), buf_silu_out_->handle(),
-                           static_cast<uint32_t>(size));
-                kernel.run.wait();
-            } catch (const std::exception& e) {
-                std::cerr << "Warning: silu kernel execution failed (" << e.what()
-                          << "); using CPU fallback\n";
-                silu_cpu_ref(params);
-                return Status::OK;
-            }
-
-            buf_mgr_->copy_from(*buf_silu_out_, params.output, size_bytes);
-        }
-
+        // SiLU NPU launch is not yet stable on amdxdna (opcode-3 arity mismatch).
+        (void)params.size;
+        silu_cpu_ref(params);
         return Status::OK;
     }
 
@@ -1465,7 +1384,6 @@ private:
             }
         }
 
-        std::cerr << "Error: no xclbin available for flash_attn " << n_head << "x" << head_dim << "x" << ctx_len << "\n";
         return false;
     }
 
@@ -1532,6 +1450,8 @@ private:
     std::shared_ptr<XrtBuffer> buf_softmax_out_;
 
     std::shared_ptr<XrtBuffer> buf_silu_in_;
+    std::shared_ptr<XrtBuffer> buf_silu_bf16_in_;
+    std::shared_ptr<XrtBuffer> buf_silu_bf16_out_;
     std::shared_ptr<XrtBuffer> buf_silu_out_;
 
     std::shared_ptr<XrtBuffer> buf_fa_q_;

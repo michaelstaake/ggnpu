@@ -189,6 +189,51 @@ void attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cac
     }
 }
 
+// Compare NPU decoded matmul vs CPU on-the-fly dequant matmul.
+bool bench_quant_matmul(const char* label, Backend& cpu, Backend& npu, WeightCache& cache,
+                        const float* A, const TensorView* weight,
+                        int M, int N, int K, int lda, int ldb, int ldc,
+                        float rel_thresh = 0.1f, float mismatch_thresh = 2.0f) {
+    if (!weight) {
+        std::cerr << "Error: weight tensor missing for " << label << "\n";
+        return false;
+    }
+
+    const int8_t* decoded = cache.get_or_decode(weight->name, weight->data,
+        weight->data_size(), weight->type);
+    if (!decoded) {
+        std::cerr << "Error: failed to decode " << weight->name << "\n";
+        return false;
+    }
+
+    std::vector<float> cpu_out(static_cast<size_t>(M) * N, 0.0f);
+    MulMatParams cpu_p;
+    cpu_p.A = A; cpu_p.B = weight->data; cpu_p.C = cpu_out.data();
+    cpu_p.M = M; cpu_p.N = N; cpu_p.K = K;
+    cpu_p.lda = lda; cpu_p.ldb = ldb; cpu_p.ldc = ldc;
+    cpu_p.B_type = weight->type;
+    cpu.mul_mat_q(cpu_p);
+
+    std::vector<float> npu_out(static_cast<size_t>(M) * N, 0.0f);
+    MulMatParams npu_p;
+    npu_p.A = A; npu_p.B = decoded; npu_p.C = npu_out.data();
+    npu_p.M = M; npu_p.N = N; npu_p.K = K;
+    npu_p.lda = lda; npu_p.ldb = ldb; npu_p.ldc = ldc;
+    npu_p.B_type = weight->type;
+    attach_kquant_scales(npu_p, weight, cache);
+    Status st = npu.mul_mat_q(npu_p);
+    npu.sync();
+    if (st != Status::OK) {
+        std::cerr << "Error: NPU matmul failed for " << label << ": " << status_name(st) << "\n";
+        return false;
+    }
+
+    auto cmp = compare_vectors(cpu_out.data(), npu_out.data(), M * N, mismatch_thresh);
+    std::cout << "  " << label << " (" << M << " x " << K << " x " << N << "):\n";
+    std::cout << "    Type: " << ggml_type_name(weight->type) << "\n";
+    return report_compare(label, cmp, M * N, rel_thresh, 0.1f, mismatch_thresh);
+}
+
 bool validate_matmul_output(const std::vector<float>& output, int expected_value,
                            float tolerance, std::string* error_message) {
     for (size_t i = 0; i < output.size(); i++) {
@@ -735,51 +780,57 @@ int main(int argc, char* argv[]) {
             if (!report_compare("RMSNorm", cmp, hidden_size, 0.05f, 0.1f, 0.01f)) return 1;
         }
 
-        // Test 0b: attn_q matmul — NPU vs CPU (Phase 4)
-        std::cout << "Testing attn_q matmul (Phase 4)...\n";
+        // Test 0b–0e: attention matmuls — NPU vs CPU (Phase 4)
+        const int kv_dim = num_kv_heads * head_dim;
+        std::cout << "Testing attention matmuls (Phase 4)...\n";
         {
             const TensorView* attn_q_w = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", layer_idx);
-            if (!attn_q_w) {
-                std::cerr << "Error: attn_q.weight not found for layer " << layer_idx << "\n";
+            const TensorView* attn_k_w = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", layer_idx);
+            const TensorView* attn_v_w = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", layer_idx);
+            const TensorView* attn_o_w = find_tensor_pattern(model, "blk.{layer}.attn_output.weight", layer_idx);
+            if (!attn_q_w || !attn_k_w || !attn_v_w || !attn_o_w) {
+                std::cerr << "Error: attention weights not found for layer " << layer_idx << "\n";
                 return 1;
             }
-            const int8_t* decoded = weight_cache.get_or_decode(attn_q_w->name,
-                attn_q_w->data, attn_q_w->data_size(), attn_q_w->type);
-            if (!decoded) {
-                std::cerr << "Error: failed to decode attn_q.weight\n";
-                return 1;
-            }
+            if (!bench_quant_matmul("attn_q matmul", *cpu_backend, *npu_backend, weight_cache,
+                    normed.data(), attn_q_w, 1, hidden_size, hidden_size,
+                    hidden_size, hidden_size, hidden_size)) return 1;
+            if (!bench_quant_matmul("attn_k matmul", *cpu_backend, *npu_backend, weight_cache,
+                    normed.data(), attn_k_w, 1, kv_dim, hidden_size,
+                    hidden_size, kv_dim, kv_dim)) return 1;
+            if (!bench_quant_matmul("attn_v matmul", *cpu_backend, *npu_backend, weight_cache,
+                    normed.data(), attn_v_w, 1, kv_dim, hidden_size,
+                    hidden_size, kv_dim, kv_dim)) return 1;
+            if (!bench_quant_matmul("attn_output matmul", *cpu_backend, *npu_backend, weight_cache,
+                    normed.data(), attn_o_w, 1, hidden_size, hidden_size,
+                    hidden_size, hidden_size, hidden_size)) return 1;
+        }
 
-            std::vector<float> cpu_out(static_cast<size_t>(hidden_size), 0.0f);
-            MulMatParams cpu_p;
-            cpu_p.A = normed.data();
-            cpu_p.B = attn_q_w->data;
-            cpu_p.C = cpu_out.data();
-            cpu_p.M = 1; cpu_p.N = hidden_size; cpu_p.K = hidden_size;
-            cpu_p.lda = hidden_size; cpu_p.ldb = hidden_size; cpu_p.ldc = hidden_size;
-            cpu_p.B_type = attn_q_w->type;
-            cpu_backend->mul_mat_q(cpu_p);
+        // Test 0f: flash attention — NPU vs CPU (Phase 4, single head, ctx=1)
+        std::cout << "Testing flash attention (Phase 4)...\n";
+        {
+            std::vector<float> Q(static_cast<size_t>(head_dim), 0.1f);
+            std::vector<float> K(static_cast<size_t>(head_dim), 0.2f);
+            std::vector<float> V(static_cast<size_t>(head_dim), 0.3f);
+            std::vector<float> cpu_fa(static_cast<size_t>(head_dim), 0.0f);
+            std::vector<float> npu_fa(static_cast<size_t>(head_dim), 0.0f);
 
-            std::vector<float> npu_out(static_cast<size_t>(hidden_size), 0.0f);
-            MulMatParams npu_p;
-            npu_p.A = normed.data();
-            npu_p.B = decoded;
-            npu_p.C = npu_out.data();
-            npu_p.M = 1; npu_p.N = hidden_size; npu_p.K = hidden_size;
-            npu_p.lda = hidden_size; npu_p.ldb = hidden_size; npu_p.ldc = hidden_size;
-            npu_p.B_type = attn_q_w->type;
-            attach_kquant_scales(npu_p, attn_q_w, weight_cache);
-            st = npu_backend->mul_mat_q(npu_p);
+            AttnParams ap;
+            ap.Q = Q.data(); ap.K = K.data(); ap.V = V.data();
+            ap.n_head = 1; ap.head_dim = head_dim; ap.ctx_len = 1;
+            ap.batch_size = 1; ap.freq_factors = nullptr;
+
+            ap.output = cpu_fa.data();
+            cpu_backend->flash_attn(ap);
+            ap.output = npu_fa.data();
+            st = npu_backend->flash_attn(ap);
             npu_backend->sync();
             if (st != Status::OK) {
-                std::cerr << "Error: NPU attn_q matmul failed: " << status_name(st) << "\n";
+                std::cerr << "Error: NPU flash_attn failed: " << status_name(st) << "\n";
                 return 1;
             }
-
-            auto cmp = compare_vectors(cpu_out.data(), npu_out.data(), hidden_size, 2.0f);
-            std::cout << "  attn_q matmul (1 x " << hidden_size << " x " << hidden_size << "):\n";
-            std::cout << "    Type: " << ggml_type_name(attn_q_w->type) << "\n";
-            if (!report_compare("attn_q matmul", cmp, hidden_size, 0.1f, 0.1f, 2.0f)) return 1;
+            auto cmp = compare_vectors(cpu_fa.data(), npu_fa.data(), head_dim, 0.05f);
+            if (!report_compare("flash_attn (1 head, ctx=1)", cmp, head_dim, 0.1f, 0.2f, 0.05f)) return 1;
         }
 
         // Test 0c: SiLU — NPU vs CPU (Phase 4)
@@ -808,7 +859,7 @@ int main(int argc, char* argv[]) {
             }
 
             auto cmp = compare_vectors(cpu_silu.data(), npu_silu.data(), ffn_size, 0.05f);
-            std::cout << "    Note: silu xclbin launch may use CPU fallback until opcode-3 args are fixed\n";
+            std::cout << "    Note: SiLU uses CPU fallback until NPU unary launch is fixed\n";
             if (!report_compare("SiLU", cmp, ffn_size, 0.05f, 0.1f, 0.05f)) return 1;
         }
 
@@ -1117,6 +1168,129 @@ int main(int argc, char* argv[]) {
                 std::cout << "    Result: FAIL\n\n";
                 return 1;
             }
+        }
+
+        // Test 4: full decoder layer forward — CPU vs NPU (Phase 4)
+        std::cout << "Testing full layer forward (Phase 4)...\n";
+        {
+            auto run_layer = [&](Backend* backend, bool use_npu_weights,
+                                 const float* in, float* out) -> bool {
+                const TensorView* attn_q_w = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", layer_idx);
+                const TensorView* attn_k_w = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", layer_idx);
+                const TensorView* attn_v_w = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", layer_idx);
+                const TensorView* attn_o_w = find_tensor_pattern(model, "blk.{layer}.attn_output.weight", layer_idx);
+                const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer_idx);
+                const TensorView* ffn_up_w = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", layer_idx);
+                const TensorView* ffn_down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", layer_idx);
+                if (!attn_q_w || !attn_k_w || !attn_v_w || !attn_o_w ||
+                    !ffn_gate_w || !ffn_up_w || !ffn_down_w) return false;
+
+                std::vector<float> hidden(static_cast<size_t>(hidden_size));
+                std::memcpy(hidden.data(), in, hidden_size * sizeof(float));
+
+                auto do_matmul = [&](const float* A, const TensorView* w, float* C,
+                                     int M, int N, int K, int lda, int ldb, int ldc) -> bool {
+                    MulMatParams mp;
+                    mp.A = A; mp.C = C;
+                    mp.M = M; mp.N = N; mp.K = K;
+                    mp.lda = lda; mp.ldb = ldb; mp.ldc = ldc;
+                    mp.n_batches = 1;
+                    if (use_npu_weights) {
+                        const int8_t* dec = weight_cache.get_or_decode(w->name,
+                            w->data, w->data_size(), w->type);
+                        if (!dec) return false;
+                        mp.B = dec;
+                        mp.B_type = w->type;
+                        attach_kquant_scales(mp, w, weight_cache);
+                    } else {
+                        mp.B = w->data;
+                        mp.B_type = w->type;
+                    }
+                    return backend->mul_mat_q(mp) == Status::OK;
+                };
+
+                // Attention branch
+                std::vector<float> norm(static_cast<size_t>(hidden_size));
+                RmsNormParams rp;
+                rp.input = hidden.data(); rp.output = norm.data();
+                rp.size = hidden_size; rp.eps = rms_eps;
+                if (backend->rms_norm(rp) != Status::OK) return false;
+
+                std::vector<float> q(hidden_size), k(kv_dim), v(kv_dim);
+                std::vector<float> q_r(hidden_size), k_r(kv_dim);
+                if (!do_matmul(norm.data(), attn_q_w, q.data(), 1, hidden_size, hidden_size,
+                               hidden_size, hidden_size, hidden_size)) return false;
+                if (!do_matmul(norm.data(), attn_k_w, k.data(), 1, kv_dim, hidden_size,
+                               hidden_size, kv_dim, kv_dim)) return false;
+                if (!do_matmul(norm.data(), attn_v_w, v.data(), 1, kv_dim, hidden_size,
+                               hidden_size, kv_dim, kv_dim)) return false;
+                backend->sync();
+
+                apply_rope(q_r.data(), q.data(), num_heads, 0, head_dim, rope_freqs);
+                apply_rope(k_r.data(), k.data(), num_kv_heads, 0, head_dim, rope_freqs);
+
+                std::vector<float> attn_out(hidden_size, 0.0f);
+                for (int h = 0; h < num_heads; h++) {
+                    int kv_h = h / (num_heads / num_kv_heads);
+                    AttnParams ap;
+                    ap.Q = q_r.data() + h * head_dim;
+                    ap.K = k_r.data() + kv_h * head_dim;
+                    ap.V = v.data() + kv_h * head_dim;
+                    ap.output = attn_out.data() + h * head_dim;
+                    ap.n_head = 1; ap.head_dim = head_dim; ap.ctx_len = 1;
+                    ap.batch_size = 1; ap.freq_factors = nullptr;
+                    if (backend->flash_attn(ap) != Status::OK) return false;
+                }
+                backend->sync();
+
+                std::vector<float> attn_proj(hidden_size, 0.0f);
+                if (!do_matmul(attn_out.data(), attn_o_w, attn_proj.data(),
+                               1, hidden_size, hidden_size,
+                               hidden_size, hidden_size, hidden_size)) return false;
+                backend->sync();
+                for (int i = 0; i < hidden_size; i++) hidden[i] += attn_proj[i];
+
+                // FFN branch
+                rp.input = hidden.data();
+                rp.output = norm.data();
+                if (backend->rms_norm(rp) != Status::OK) return false;
+
+                std::vector<float> gate(ffn_size), up(ffn_size), swiglu(ffn_size);
+                if (!do_matmul(norm.data(), ffn_gate_w, gate.data(), 1, ffn_size, hidden_size,
+                               hidden_size, ffn_size, ffn_size)) return false;
+                if (!do_matmul(norm.data(), ffn_up_w, up.data(), 1, ffn_size, hidden_size,
+                               hidden_size, ffn_size, ffn_size)) return false;
+                backend->sync();
+
+                SiluParams sp;
+                sp.input = up.data(); sp.output = swiglu.data(); sp.size = ffn_size;
+                if (backend->silu(sp) != Status::OK) return false;
+                for (int i = 0; i < ffn_size; i++) swiglu[i] *= gate[i];
+
+                std::vector<float> ffn_out(hidden_size, 0.0f);
+                if (!do_matmul(swiglu.data(), ffn_down_w, ffn_out.data(),
+                               1, hidden_size, ffn_size,
+                               ffn_size, hidden_size, hidden_size)) return false;
+                backend->sync();
+                for (int i = 0; i < hidden_size; i++) hidden[i] += ffn_out[i];
+
+                std::memcpy(out, hidden.data(), hidden_size * sizeof(float));
+                return true;
+            };
+
+            std::vector<float> cpu_layer(hidden_size), npu_layer(hidden_size);
+            if (!run_layer(cpu_backend.get(), false, test_input.data(), cpu_layer.data())) {
+                std::cerr << "Error: CPU layer forward failed\n";
+                return 1;
+            }
+            if (!run_layer(npu_backend.get(), true, test_input.data(), npu_layer.data())) {
+                std::cerr << "Error: NPU layer forward failed\n";
+                return 1;
+            }
+            npu_backend->sync();
+
+            auto cmp = compare_vectors(cpu_layer.data(), npu_layer.data(), hidden_size, 2.0f);
+            if (!report_compare("full layer forward", cmp, hidden_size, 0.15f, 0.2f, 2.0f)) return 1;
         }
 
         std::cout << "All layer tests PASSED.\n";
