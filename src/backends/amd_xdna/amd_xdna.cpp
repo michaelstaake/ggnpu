@@ -354,6 +354,23 @@ public:
             return static_cast<int8_t>(r);
         };
 
+        // K-quants are decoded host-side to int8 with one per-tensor weight
+        // scale. Activations get a per-call dynamic scale; the product of
+        // both scales converts the raw INT32 accumulators back to float.
+        const bool kq_path = (params.B_type == GgmlType::Q4_K ||
+                              params.B_type == GgmlType::Q6_K) && params.scales;
+        float a_scale = 1.0f;
+        if (kq_path) {
+            float a_max = 0.0f;
+            for (int i = 0; i < M; i++)
+                for (int k = 0; k < K; k++)
+                    a_max = std::max(a_max, std::fabs(A[i * params.lda + k]));
+            a_scale = a_max > 0.0f ? a_max / 127.0f : 1.0f;
+        }
+        const float inv_a = 1.0f / a_scale;
+        const float w_scale = kq_path ? static_cast<const float*>(params.scales)[0] : 1.0f;
+        const float out_scale = a_scale * w_scale;
+
         for (int m0 = 0; m0 < M; m0 += T) {
             int mc = std::min(T, M - m0);
             for (int n0 = 0; n0 < N; n0 += T) {
@@ -364,7 +381,7 @@ public:
                     std::fill(a_tile.begin(), a_tile.end(), 0);
                     for (int i = 0; i < mc; i++)
                         for (int k = 0; k < kc; k++)
-                            a_tile[i * T + k] = to_i8(A[(m0 + i) * params.lda + (k0 + k)]);
+                            a_tile[i * T + k] = to_i8(A[(m0 + i) * params.lda + (k0 + k)] * inv_a);
 
                     std::fill(b_tile.begin(), b_tile.end(), 0);
                     if (params.B_type == GgmlType::I8 ||
@@ -375,9 +392,17 @@ public:
                         // Already-decoded INT8 weights (from weight cache or raw I8).
                         // Quantized types here mean "decode already done on host".
                         const int8_t* B = static_cast<const int8_t*>(params.B);
-                        for (int k = 0; k < kc; k++)
-                            for (int j = 0; j < nc; j++)
-                                b_tile[k * T + j] = B[(k0 + k) * params.ldb + (n0 + j)];
+                        if (kq_path) {
+                            // Decoded buffer keeps GGUF row-major order:
+                            // N rows of K values -> B[n * K + k]
+                            for (int k = 0; k < kc; k++)
+                                for (int j = 0; j < nc; j++)
+                                    b_tile[k * T + j] = B[static_cast<size_t>(n0 + j) * K + (k0 + k)];
+                        } else {
+                            for (int k = 0; k < kc; k++)
+                                for (int j = 0; j < nc; j++)
+                                    b_tile[k * T + j] = B[(k0 + k) * params.ldb + (n0 + j)];
+                        }
                     } else if (params.B_type == GgmlType::F32) {
                         const float* B = static_cast<const float*>(params.B);
                         for (int k = 0; k < kc; k++)
@@ -406,7 +431,7 @@ public:
 
                     for (int i = 0; i < mc; i++)
                         for (int j = 0; j < nc; j++)
-                            C[(m0 + i) * params.ldc + (n0 + j)] += static_cast<float>(c_tile[i * T + j]);
+                            C[(m0 + i) * params.ldc + (n0 + j)] += static_cast<float>(c_tile[i * T + j]) * out_scale;
                 }
             }
         }

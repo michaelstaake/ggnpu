@@ -97,6 +97,7 @@ private:
     uint8_t* mapped_data_ = nullptr;
     int fd_ = -1;
     size_t file_size_ = 0;
+    size_t header_end_offset_ = 0; // file offset right after tensor metadata
     std::string path_;
 };
 

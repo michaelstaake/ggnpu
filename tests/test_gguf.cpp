@@ -46,15 +46,15 @@ void test_ggml_type_functions() {
     ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::F16), 2, "F16 size");
     ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q8_0), 34, "Q8_0 size");
     ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_0), 16, "Q4_0 size");
-    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_K), 48, "Q4_K size");
-    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q6_K), 64, "Q6_K size");
+    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_K), 144, "Q4_K size");
+    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q6_K), 210, "Q6_K size");
 
     ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::F32), 1, "F32 block size");
     ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::F16), 1, "F16 block size");
     ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q8_0), 32, "Q8_0 block size");
     ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), 32, "Q4_0 block size");
-    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_K), 32, "Q4_K block size");
-    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q6_K), 32, "Q6_K block size");
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_K), 256, "Q4_K block size");
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q6_K), 256, "Q6_K block size");
 
     const char* f32_name = ggnpu::ggml_type_name(ggnpu::GgmlType::F32);
     ASSERT_TRUE(std::string(f32_name) == "F32", "F32 name");
@@ -147,8 +147,8 @@ void test_ggml_type_enum_values() {
     ASSERT_EQ(static_cast<uint32_t>(ggnpu::GgmlType::F16), 1, "F16 enum value");
     ASSERT_EQ(static_cast<uint32_t>(ggnpu::GgmlType::Q4_0), 2, "Q4_0 enum value");
     ASSERT_EQ(static_cast<uint32_t>(ggnpu::GgmlType::Q8_0), 8, "Q8_0 enum value");
-    ASSERT_EQ(static_cast<uint32_t>(ggnpu::GgmlType::Q4_K), 10, "Q4_K enum value");
-    ASSERT_EQ(static_cast<uint32_t>(ggnpu::GgmlType::Q6_K), 12, "Q6_K enum value");
+    ASSERT_EQ(static_cast<uint32_t>(ggnpu::GgmlType::Q4_K), 12, "Q4_K enum value");
+    ASSERT_EQ(static_cast<uint32_t>(ggnpu::GgmlType::Q6_K), 14, "Q6_K enum value");
     ASSERT_EQ(static_cast<uint32_t>(ggnpu::GgmlType::I8), 24, "I8 enum value");
     ASSERT_EQ(static_cast<uint32_t>(ggnpu::GgmlType::BF16), 30, "BF16 enum value");
 }

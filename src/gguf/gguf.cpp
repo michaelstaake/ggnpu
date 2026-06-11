@@ -308,6 +308,9 @@ bool GgufLoader::parse_tensors() {
         tensors_.push_back(std::move(info));
     }
 
+    off_t pos = lseek(fd_, 0, SEEK_CUR);
+    header_end_offset_ = pos > 0 ? static_cast<size_t>(pos) : 0;
+
     return true;
 }
 
@@ -322,46 +325,17 @@ bool GgufLoader::map_tensor_data() {
     // Get tensor data offset from metadata
     uint64_t data_offset = tensor_data_offset();
     if (data_offset == 0 || data_offset >= file_size_) {
-        // Fallback: compute from tensor metadata
-        size_t offset = 28; // header
-        for (const auto& [key, kv] : kv_pairs_) {
-            offset += 8 + key.size() + 4 + 8; // key_len + key + type + data_len
-            if (kv.value_type == GgufType::STRING) {
-                offset += 8 + kv.string_value.size();
-            } else if (kv.value_type == GgufType::ARRAY) {
-                // ARRAY data was already read into kv.data
-                offset += kv.data.size();
-            } else {
-                // Fixed-size values
-                switch (kv.value_type) {
-                    case GgufType::UINT8: case GgufType::INT8: case GgufType::BOOL:
-                        offset += 1; break;
-                    case GgufType::UINT16: case GgufType::INT16:
-                        offset += 2; break;
-                    case GgufType::UINT32: case GgufType::INT32:
-                    case GgufType::FLOAT32:
-                        offset += 4; break;
-                    case GgufType::UINT64: case GgufType::INT64:
-                    case GgufType::FLOAT64:
-                        offset += 8; break;
-                    default:
-                        break;
-                }
-            }
-        }
-        // Add tensor metadata sizes
-        for (const auto& t : tensors_) {
-            offset += 8 + t.name.size() + 4 + t.n_dims * 8 + 4;
-        }
-        data_offset = offset;
+        // Data section starts right after the tensor metadata, padded to
+        // general.alignment (default 32)
+        uint64_t align = 32;
+        auto it = kv_pairs_.find("general.alignment");
+        if (it != kv_pairs_.end() && it->second.int_value > 0) align = static_cast<uint64_t>(it->second.int_value);
+        data_offset = (header_end_offset_ + align - 1) / align * align;
     }
 
-    // Update tensor info with data offsets
-    size_t current_offset = static_cast<size_t>(data_offset);
-    for (auto& t : tensors_) {
-        t.data_offset = current_offset;
-        current_offset += t.data_size;
-    }
+    // Tensor offsets in the header are relative to the data section start
+    // (already alignment-padded by the writer) — keep them relative, since
+    // consumers index from tensor_data().data().
 
     tensor_data_.assign(mapped_data_ + static_cast<size_t>(data_offset),
                         mapped_data_ + file_size_);

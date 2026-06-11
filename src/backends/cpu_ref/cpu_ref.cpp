@@ -2,6 +2,7 @@
 #include "tensor.h"
 #include "quant/q4_0.h"
 #include "quant/q8_0.h"
+#include "quant/kquant.h"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -83,142 +84,33 @@ public:
             break;
         }
 
-        case GgmlType::Q4_K: {
-            // Q4_K: 48 bytes per block, 256 values per block
-            // Mixed quantization: first 128 values Q4_0, last 128 values Q8_0
-            const float* A_f32 = static_cast<const float*>(params.A);
-            const uint8_t* B_q = static_cast<const uint8_t*>(params.B);
-            constexpr size_t Q4_K_BLOCK_SIZE = 48;
-            constexpr int Q4_K_VALUES_PER_BLOCK = 256;
-            size_t num_blocks = K / Q4_K_VALUES_PER_BLOCK;
-
-            for (int m = 0; m < M; m++) {
-                for (int n = 0; n < N; n++) {
-                    float sum = 0.0f;
-                    for (size_t b = 0; b < num_blocks; b++) {
-                        const uint8_t* block = B_q + b * Q4_K_BLOCK_SIZE;
-
-                        // Read d and c (16-bit little-endian, multiplied by 4)
-                        int16_t d_raw = static_cast<int16_t>(block[0] | (block[1] << 8));
-                        int16_t c_raw = static_cast<int16_t>(block[2] | (block[3] << 8));
-                        float d = static_cast<float>(d_raw) * 0.25f;
-                        float c = static_cast<float>(c_raw) * 0.25f;
-
-                        // Decode 6-byte scale array into 8 scale values
-                        float scales[8];
-                        scales[0] = d;
-                        scales[1] = c;
-                        for (int i = 0; i < 6; i++) {
-                            int8_t s = static_cast<int8_t>(block[4 + i]);
-                            scales[i * 2 + 2] = static_cast<float>(s & 0x0F) * d;
-                            scales[i * 2 + 3] = static_cast<float>((s >> 4) & 0x0F) * c;
-                        }
-
-                        // First 128 values: Q4_0 with per-group scales (groups of 32)
-                        for (int i = 0; i < 128; i += 32) {
-                            int scale_idx = (i / 32) % 4;
-                            float scale = scales[scale_idx];
-                            const uint8_t* qblock = block + 10 + (i / 32) * 16;
-
-                            for (int j = 0; j < 32; j++) {
-                                uint8_t nibble = (j % 2 == 0) ? (qblock[j / 2] & 0x0F) : (qblock[j / 2] >> 4);
-                                int8_t val = static_cast<int8_t>(nibble - 8);
-                                int k = static_cast<int>(b * Q4_K_VALUES_PER_BLOCK + i + j);
-                                if (k < K) {
-                                    sum += A_f32[m * K + k] * static_cast<float>(val) * scale;
-                                }
-                            }
-                        }
-
-                        // Last 128 values: Q8_0 with per-group scales (groups of 32)
-                        for (int i = 128; i < 256; i += 32) {
-                            int scale_idx = ((i - 128) / 32) + 4;
-                            float scale = scales[scale_idx];
-                            const uint8_t* qblock = block + 42 + (i - 128);
-
-                            for (int j = 0; j < 32; j++) {
-                                int k = static_cast<int>(b * Q4_K_VALUES_PER_BLOCK + i + j);
-                                if (k < K) {
-                                    sum += A_f32[m * K + k] * static_cast<float>(static_cast<int8_t>(qblock[j])) * scale;
-                                }
-                            }
-                        }
-                    }
-                    C[m * N + n] = sum;
-                }
-            }
-            break;
-        }
-
+        case GgmlType::Q4_K:
         case GgmlType::Q6_K: {
-            // Q6_K: 64 bytes per block, 256 values per block
-            // Mixed quantization: first 128 values Q4, last 128 values Q6
+            // K-quants: 256 values per super-block (Q4_K = 144 B, Q6_K = 210 B).
+            // B is raw GGUF data, row-major: N rows of K values each.
             const float* A_f32 = static_cast<const float*>(params.A);
             const uint8_t* B_q = static_cast<const uint8_t*>(params.B);
-            constexpr size_t Q6_K_BLOCK_SIZE = 64;
-            constexpr int Q6_K_VALUES_PER_BLOCK = 256;
-            size_t num_blocks = K / Q6_K_VALUES_PER_BLOCK;
+            const bool is_q4 = params.B_type == GgmlType::Q4_K;
+            const size_t block_bytes = is_q4 ? Q4_K_BLOCK_BYTES : Q6_K_BLOCK_BYTES;
+            const size_t blocks_per_row = (static_cast<size_t>(K) + QK_K - 1) / QK_K;
+            const size_t row_bytes = blocks_per_row * block_bytes;
 
-            for (int m = 0; m < M; m++) {
-                for (int n = 0; n < N; n++) {
-                    float sum = 0.0f;
-                    for (size_t b = 0; b < num_blocks; b++) {
-                        const uint8_t* block = B_q + b * Q6_K_BLOCK_SIZE;
+            std::vector<float> w(QK_K);
+            for (int n = 0; n < N; n++) {
+                const uint8_t* row = B_q + static_cast<size_t>(n) * row_bytes;
+                for (size_t b = 0; b < blocks_per_row; b++) {
+                    if (is_q4) dequant_q4_k_block(row + b * block_bytes, w.data());
+                    else       dequant_q6_k_block(row + b * block_bytes, w.data());
 
-                        // Read d and d2 (16-bit little-endian, multiplied by 4)
-                        int16_t d_raw = static_cast<int16_t>(block[0] | (block[1] << 8));
-                        int16_t d2_raw = static_cast<int16_t>(block[2] | (block[3] << 8));
-                        float d = static_cast<float>(d_raw) * 0.25f;
-                        float d2 = static_cast<float>(d2_raw) * 0.25f;
-
-                        // Decode 6-byte scale array into 12 scale values (each byte → 2 scales)
-                        float scales[12];
-                        for (int i = 0; i < 6; i++) {
-                            int8_t s = static_cast<int8_t>(block[4 + i]);
-                            scales[i * 2] = static_cast<float>(s & 0x0F);
-                            scales[i * 2 + 1] = static_cast<float>((s >> 4) & 0x0F);
+                    for (int m = 0; m < M; m++) {
+                        float sum = 0.0f;
+                        for (size_t j = 0; j < QK_K; j++) {
+                            size_t k = b * QK_K + j;
+                            if (k < static_cast<size_t>(K))
+                                sum += A_f32[m * K + k] * w[j];
                         }
-                        // First 6 scales * d, last 6 scales * d2
-                        for (int i = 0; i < 6; i++) {
-                            scales[i] *= d;
-                            scales[i + 6] *= d2;
-                        }
-
-                        // First 128 values: Q4 with per-group scales (groups of 32, 6 groups)
-                        for (int i = 0; i < 128; i += 32) {
-                            int scale_idx = (i / 32) % 6;
-                            float scale = scales[scale_idx];
-                            const uint8_t* qblock = block + 16 + (i / 32) * 16;
-
-                            for (int j = 0; j < 32; j++) {
-                                uint8_t nibble = (j % 2 == 0) ? (qblock[j / 2] & 0x0F) : (qblock[j / 2] >> 4);
-                                int8_t val = static_cast<int8_t>(nibble - 8);
-                                int k = static_cast<int>(b * Q6_K_VALUES_PER_BLOCK + i + j);
-                                if (k < K) {
-                                    sum += A_f32[m * K + k] * static_cast<float>(val) * scale;
-                                }
-                            }
-                        }
-
-                        // Last 128 values: Q6 with per-group scales (groups of 32, 4 groups)
-                        for (int i = 128; i < 256; i += 32) {
-                            int block_idx = (i - 128) / 32;
-                            float scale = scales[block_idx + 6];
-                            const uint8_t* qblock = block + 48 + (i - 128);
-                            const uint8_t* hblock = block + 32 + (i - 128);
-
-                            for (int j = 0; j < 32; j++) {
-                                int val = static_cast<int>(static_cast<int8_t>(qblock[j])) |
-                                          ((hblock[j] & 0x03) << 7);
-                                if (val >= 64) val -= 128; // Convert to signed
-                                int k = static_cast<int>(b * Q6_K_VALUES_PER_BLOCK + i + j);
-                                if (k < K) {
-                                    sum += A_f32[m * K + k] * static_cast<float>(val) * scale;
-                                }
-                            }
-                        }
+                        C[m * N + n] += sum;
                     }
-                    C[m * N + n] = sum;
                 }
             }
             break;

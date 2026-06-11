@@ -5,28 +5,29 @@ namespace ggnpu {
 
 namespace {
 
+// Indexed by the ggml type id (matches llama.cpp's ggml_type enum)
 constexpr const char* type_names[] = {
     "F32", "F16", "Q4_0", "Q4_1", "UNKNOWN", "UNKNOWN",
-    "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q4_K", "Q5_K",
-    "Q6_K", "IQ2_XXS", "IQ2_XS", "Q2_K", "IQ3_XXS", "UNKNOWN",
-    "IQ1_S", "UNKNOWN", "UNKNOWN", "IQ3_S", "IQ2_S", "Q4_1_S",
-    "IQ4_XS", "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16",
+    "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K", "Q3_K",
+    "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS",
+    "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S", "IQ2_S", "IQ4_XS",
+    "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16",
 };
 
 constexpr size_t block_sizes[] = {
     1, 1, 32, 32, 1, 1,
-    32, 32, 32, 32, 32, 32,
-    32, 256, 256, 256, 256, 1,
-    256, 1, 1, 256, 256, 32,
-    256, 1, 1, 1, 1, 1, 256, 1,
+    32, 32, 32, 32, 256, 256,
+    256, 256, 256, 256, 256, 256,
+    256, 256, 32, 256, 256, 256,
+    1, 1, 1, 1, 1, 256, 1,
 };
 
 constexpr size_t type_sizes[] = {
     4, 2, 16, 18, 1, 1,
-    20, 22, 34, 34, 48, 48,
-    64, 16, 16, 20, 20, 1,
-    12, 1, 20, 16, 18, 22,
-    1, 2, 4, 8, 8, 12, 2
+    20, 22, 34, 34, 84, 110,
+    144, 176, 210, 292, 66, 74,
+    98, 50, 18, 110, 82, 136,
+    1, 2, 4, 8, 8, 56, 2
 };
 
 } // namespace

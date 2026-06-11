@@ -875,6 +875,10 @@ int main(int argc, char* argv[]) {
             gate_params.ldc = ffn_size;
             gate_params.n_batches = 1;
             gate_params.B_type = ffn_gate_w->type;
+            if (ffn_gate_w->type == GgmlType::Q4_K || ffn_gate_w->type == GgmlType::Q6_K) {
+                const auto& scales = weight_cache.get_scales(ffn_gate_w->name);
+                if (!scales.empty()) gate_params.scales = scales.data();
+            }
             npu_backend->mul_mat_q(gate_params);
 
             MulMatParams up_params;
@@ -889,6 +893,10 @@ int main(int argc, char* argv[]) {
             up_params.ldc = ffn_size;
             up_params.n_batches = 1;
             up_params.B_type = ffn_up_w->type;
+            if (ffn_up_w->type == GgmlType::Q4_K || ffn_up_w->type == GgmlType::Q6_K) {
+                const auto& scales = weight_cache.get_scales(ffn_up_w->name);
+                if (!scales.empty()) up_params.scales = scales.data();
+            }
             npu_backend->mul_mat_q(up_params);
             npu_backend->sync();
 
@@ -989,11 +997,13 @@ int main(int argc, char* argv[]) {
             if (decoded) {
                 int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
                 int64_t vocab_size = static_cast<int64_t>(hparams.vocab_size);
+                const auto& embd_scales = weight_cache.get_scales(tok_embd->name);
+                float embd_scale = embd_scales.empty() ? 1.0f : embd_scales[0];
                 tok_embd_f32.resize(static_cast<size_t>(vocab_size * embd_dim));
                 for (int64_t i = 0; i < vocab_size; i++) {
                     for (int64_t d = 0; d < embd_dim; d++) {
                         tok_embd_f32[static_cast<size_t>(i * embd_dim + d)] =
-                            static_cast<float>(decoded[i * embd_dim + d]);
+                            static_cast<float>(decoded[i * embd_dim + d]) * embd_scale;
                     }
                 }
                 embd_data = tok_embd_f32.data();

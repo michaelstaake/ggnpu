@@ -9,81 +9,18 @@
 #include "ggnpu/quant/q4_0.h"
 #include "ggnpu/quant/q8_0.h"
 #include "ggnpu/quant/quant.h"
+#include "ggnpu/quant/kquant.h"
 
-// Helper: dequantize Q4_K block to float (reference implementation)
-// Uses direct byte offsets to avoid struct padding issues
-static void dequantize_q4_k_block_ref(const uint8_t* block, float* out) {
-    // GGUF Q4_K layout: d(2) + c(2) + scales(6) + qs(32) + qs_large(96)
-    // But we only read what's needed from a 48-byte buffer
-    int16_t d_signed = static_cast<int16_t>(block[0] | (block[1] << 8));
-    int16_t c_signed = static_cast<int16_t>(block[2] | (block[3] << 8));
-
-    float scales[16] = {1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    for (int i = 0; i < 6; i++) {
-        int8_t s = static_cast<int8_t>(block[4 + i]);
-        scales[i * 2 + 2] = static_cast<float>(s & 0x0F);
-        scales[i * 2 + 3] = static_cast<float>((s >> 4) & 0x0F);
-    }
-
-    // First 128 values: Q4_0 with scales[0-3] * d
-    for (int i = 0; i < 128; i += 32) {
-        int scale_idx = (i / 32) % 4;
-        float scale = scales[scale_idx] * d_signed;
-        const uint8_t* qblock = block + 10 + (i / 32) * 16;
-        for (int j = 0; j < 32; j++) {
-            uint8_t nibble = (j % 2 == 0) ? (qblock[j / 2] & 0x0F) : (qblock[j / 2] >> 4);
-            int val = static_cast<int>(nibble) - 8;
-            out[i + j] = val * scale;
-        }
-    }
-    // Last 128 values: Q8_0 with scales[4-7] * c
-    for (int i = 128; i < 256; i += 32) {
-        int scale_idx = ((i - 128) / 32) + 4;
-        float scale = scales[scale_idx] * c_signed;
-        const int8_t* qblock = reinterpret_cast<const int8_t*>(block + 42) + (i - 128);
-        for (int j = 0; j < 32; j++) {
-            out[i + j] = static_cast<float>(qblock[j]) * scale;
-        }
-    }
-}
-
-// Helper: dequantize Q6_K block to float (reference implementation)
-// Uses direct byte offsets to avoid struct padding issues
-static void dequantize_q6_k_block_ref(const uint8_t* block, float* out) {
-    // GGUF Q6_K layout: d(2) + d2(2) + scales(12) + qs(32) + high_bits(32) + qs_large(96)
-    int16_t d_signed = static_cast<int16_t>(block[0] | (block[1] << 8));
-    int16_t d2_signed = static_cast<int16_t>(block[2] | (block[3] << 8));
-
-    float scales[12];
-    for (int i = 0; i < 6; i++) {
-        int8_t s = static_cast<int8_t>(block[4 + i]);
-        scales[i * 2] = static_cast<float>(s & 0x0F);
-        scales[i * 2 + 1] = static_cast<float>((s >> 4) & 0x0F);
-    }
-
-    // First 128 values: Q4 with scales[0-5] * d
-    for (int i = 0; i < 128; i += 32) {
-        int scale_idx = (i / 32) % 6;
-        float scale = scales[scale_idx] * d_signed;
-        const uint8_t* qblock = block + 16 + (i / 32) * 16;
-        for (int j = 0; j < 32; j++) {
-            uint8_t nibble = (j % 2 == 0) ? (qblock[j / 2] & 0x0F) : (qblock[j / 2] >> 4);
-            int val = static_cast<int>(nibble) - 8;
-            out[i + j] = val * scale;
-        }
-    }
-    // Last 128 values: Q6 with scales[6-11] * d2
-    for (int i = 128; i < 256; i += 32) {
-        int block_idx = (i - 128) / 32;
-        float scale = scales[block_idx + 6] * d2_signed;
-        const int8_t* qblock = reinterpret_cast<const int8_t*>(block + 48) + (i - 128);
-        const uint8_t* hblock = block + 32 + (i - 128);
-        for (int j = 0; j < 32; j++) {
-            int val = qblock[j] | ((hblock[j] & 0x03) << 7);
-            if (val >= 64) val -= 128;
-            out[i + j] = static_cast<float>(val) * scale;
-        }
-    }
+// fp32 -> fp16 (round to nearest), for building test blocks
+static uint16_t f32_to_fp16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t exp = static_cast<int32_t>((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = bits & 0x7FFFFF;
+    if (exp <= 0) return static_cast<uint16_t>(sign);
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00);
+    return static_cast<uint16_t>(sign | (exp << 10) | (mant >> 13));
 }
 
 int tests_passed = 0;
@@ -257,8 +194,10 @@ void test_block_size_consistency() {
     ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_1), "Q4_0 == Q4_1 block size");
     ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), ggnpu::ggml_blck_size(ggnpu::GgmlType::Q5_0), "Q4_0 == Q5_0 block size");
     ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), ggnpu::ggml_blck_size(ggnpu::GgmlType::Q8_0), "Q4_0 == Q8_0 block size");
-    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_K), "Q4_0 == Q4_K block size");
-    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), ggnpu::ggml_blck_size(ggnpu::GgmlType::Q6_K), "Q4_0 == Q6_K block size");
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_K), 256, "Q4_K block size is 256 elements");
+    ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q6_K), 256, "Q6_K block size is 256 elements");
+    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_K), 144, "Q4_K type size is 144 bytes");
+    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q6_K), 210, "Q6_K type size is 210 bytes");
 
     ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::F32), 1, "F32 block size is 1");
     ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::F16), 1, "F16 block size is 1");
@@ -267,164 +206,81 @@ void test_block_size_consistency() {
 void test_q4_k_decode_golden() {
     std::cout << "  test_q4_k_decode_golden\n";
 
-    // Create a Q4_K block with known values (48 bytes, GGUF layout)
-    // Layout: d(2) + c(2) + scales(6) + qs(32) + qs_large(96) = 138 bytes struct,
-    // but GGUF format is only 48 bytes: d(2) + c(2) + scales(6) + qs(16) + qs_large(96) = 122... 
-    // Actually GGUF Q4_K block is 48 bytes with different layout.
-    // For testing, we create a minimal valid block.
-    uint8_t block_data[48];
+    // Real ggml Q4_K block: 144 bytes, 256 values
+    uint8_t block_data[ggnpu::Q4_K_BLOCK_BYTES];
     memset(block_data, 0, sizeof(block_data));
 
-    // GGUF Q4_K layout (48 bytes):
-    // bytes 0-1: d (uint16_t LE)
-    // bytes 2-3: c (uint16_t LE)
-    // bytes 4-9: scales[6] (int8_t)
-    // bytes 10-41: qs[32] (uint8_t) - but only first 16 bytes contain real Q4_0 data
-    // bytes 42-47: qs_large[6] (int8_t) - first 6 bytes of Q8_0 data
+    // d = 0.5, dmin = 0.25
+    uint16_t d = f32_to_fp16(0.5f);
+    uint16_t dmin = f32_to_fp16(0.25f);
+    block_data[0] = d & 0xFF; block_data[1] = d >> 8;
+    block_data[2] = dmin & 0xFF; block_data[3] = dmin >> 8;
 
-    // Set d=4, c=2
-    block_data[0] = 4; block_data[1] = 0;
-    block_data[2] = 2; block_data[3] = 0;
+    // scales: groups 0..3 scale=2, mins 0..3 = 1; groups 4..7 zero
+    for (int j = 0; j < 4; j++) block_data[4 + j] = 2;
+    for (int j = 4; j < 8; j++) block_data[4 + j] = 1;
 
-    // Set scales: all 1s (0x11 = low=1, high=1)
-    for (int i = 0; i < 6; i++) {
-        block_data[4 + i] = 0x11;
-    }
+    // qs[0] = 0x31 -> low nibble 1 (group 0), high nibble 3 (group 1)
+    block_data[16] = 0x31;
 
-    // Set Q4_0 part: qs[0] = 0x10 (nibbles: 0, 1 -> vals: -8, -7)
-    block_data[10] = 0x10;
+    // Reference dequant: out[0] = 0.5*2*1 - 0.25*1 = 0.75
+    //                    out[32] = 0.5*2*3 - 0.25*1 = 2.75
+    float ref[256];
+    ggnpu::dequant_q4_k_block(block_data, ref);
+    ASSERT_NEAR(ref[0], 0.75f, 1e-4f, "Q4_K dequant value[0]");
+    ASSERT_NEAR(ref[1], -0.25f, 1e-4f, "Q4_K dequant value[1] (q=0)");
+    ASSERT_NEAR(ref[32], 2.75f, 1e-4f, "Q4_K dequant value[32]");
 
-    // Set Q8_0 part: qs_large[0] = 3
-    block_data[42] = 3;
-
-    // Decode via NPU decoder
+    // NPU decode round-trip: int8 * scale must match the float dequant
     std::vector<int8_t> int8_out;
     std::vector<float> scales_out;
-    ggnpu::decode_q4_k_for_npu(block_data, 48, int8_out, scales_out);
+    ggnpu::decode_q4_k_for_npu(block_data, sizeof(block_data), int8_out, scales_out);
 
-    // Verify scales: 8 scales per block
-    ASSERT_EQ(scales_out.size(), 8, "Q4_K NPU decoder produces 8 scales");
-
-    // Verify first scale = 1.0 * d = 4
-    ASSERT_NEAR(scales_out[0], 4.0f, 0.01f, "Q4_K scale[0] = 1*d = 4");
-    // Verify fourth scale = 1.0 * d = 4
-    ASSERT_NEAR(scales_out[3], 4.0f, 0.01f, "Q4_K scale[3] = 1*d = 4");
-    // Verify fifth scale = 1.0 * c = 2
-    ASSERT_NEAR(scales_out[4], 2.0f, 0.01f, "Q4_K scale[4] = 1*c = 2");
-    // Verify eighth scale = 1.0 * c = 2
-    ASSERT_NEAR(scales_out[7], 2.0f, 0.01f, "Q4_K scale[7] = 1*c = 2");
-
-    // Verify INT8 values
     ASSERT_EQ(int8_out.size(), 256, "Q4_K NPU decoder produces 256 INT8 values");
-    // First value: nibble 0 -> val = 0 - 8 = -8
-    ASSERT_EQ(int8_out[0], -8, "Q4_K INT8[0] = -8");
-    // Second value: nibble 1 -> val = 1 - 8 = -7
-    ASSERT_EQ(int8_out[1], -7, "Q4_K INT8[1] = -7");
-    // Q8_0 part: first value = 3
-    ASSERT_EQ(int8_out[128], 3, "Q4_K INT8[128] = 3 (Q8_0 part)");
-
-    // Golden test: compare dequantized output vs reference
-    std::vector<float> npu_float(256);
-    std::vector<float> ref_float(256);
-
-    // Reconstruct floats from NPU INT8 + scales
-    for (int i = 0; i < 128; i += 32) {
-        int scale_idx = (i / 32) % 4;
-        for (int j = 0; j < 32; j++) {
-            npu_float[i + j] = static_cast<float>(int8_out[i + j]) * scales_out[scale_idx];
-        }
-    }
-    for (int i = 128; i < 256; i += 32) {
-        int scale_idx = ((i - 128) / 32) + 4;
-        npu_float[i] = static_cast<float>(int8_out[i]) * scales_out[scale_idx];
-    }
-
-    // Reference dequantization
-    dequantize_q4_k_block_ref(block_data, ref_float.data());
-
-    // Compare (first few values)
-    for (int i = 0; i < 8; i++) {
-        ASSERT_NEAR(npu_float[i], ref_float[i], 0.01f, "Q4_K golden match value[" + std::to_string(i) + "]");
+    ASSERT_EQ(scales_out.size(), 1, "Q4_K NPU decoder produces 1 per-tensor scale");
+    float s = scales_out[0];
+    for (int i = 0; i < 256; i++) {
+        ASSERT_NEAR(static_cast<float>(int8_out[i]) * s, ref[i], s * 0.51f + 1e-6f,
+                    "Q4_K round-trip value[" + std::to_string(i) + "]");
     }
 }
 
 void test_q6_k_decode_golden() {
     std::cout << "  test_q6_k_decode_golden\n";
 
-    // Create a Q6_K block with known values (64 bytes, GGUF layout)
-    // GGUF Q6_K layout (64 bytes):
-    // bytes 0-1: d (uint16_t LE)
-    // bytes 2-3: d2 (uint16_t LE)
-    // bytes 4-15: scales[12] (int8_t)
-    // bytes 16-31: qs[16] (uint8_t) - Q4 data (first 16 bytes)
-    // bytes 32-47: high_bits[16] (uint8_t) - high 2 bits for Q6
-    // bytes 48-63: qs_large[16] (int8_t) - first 16 bytes of Q6 data
-
-    uint8_t block_data[64];
+    // Real ggml Q6_K block: 210 bytes, 256 values
+    uint8_t block_data[ggnpu::Q6_K_BLOCK_BYTES];
     memset(block_data, 0, sizeof(block_data));
 
-    // Set d=4, d2=2
-    block_data[0] = 4; block_data[1] = 0;
-    block_data[2] = 2; block_data[3] = 0;
+    // d = 0.25 (fp16, offset 208)
+    uint16_t d = f32_to_fp16(0.25f);
+    block_data[208] = d & 0xFF; block_data[209] = d >> 8;
 
-    // Set scales: all 1s (0x11 = low=1, high=1)
-    for (int i = 0; i < 6; i++) {
-        block_data[4 + i] = 0x11;
-    }
+    // scales[0] = 4, scales[4] = 2
+    block_data[192 + 0] = 4;
+    block_data[192 + 4] = 2;
 
-    // Set Q4 part: qs[0] = 0x10 (nibbles: 0, 1 -> vals: -8, -7)
-    block_data[16] = 0x10;
+    // ql[0] = 0x21 -> q1 low nibble 1, q3 high nibble 2; qh[0] = 0
+    block_data[0] = 0x21;
 
-    // Set Q6 part: qs_large[0] = 3, high_bits[0] = 0
-    block_data[48] = 3;
-    block_data[32] = 0;
+    // out[0]  = 0.25 * 4 * (1 - 32)  = -31.0
+    // out[64] = 0.25 * 2 * (2 - 32)  = -15.0
+    float ref[256];
+    ggnpu::dequant_q6_k_block(block_data, ref);
+    ASSERT_NEAR(ref[0], -31.0f, 1e-4f, "Q6_K dequant value[0]");
+    ASSERT_NEAR(ref[64], -15.0f, 1e-4f, "Q6_K dequant value[64]");
+    ASSERT_NEAR(ref[1], -32.0f, 1e-4f, "Q6_K dequant value[1] (q=0)");
 
-    // Decode via NPU decoder
     std::vector<int8_t> int8_out;
     std::vector<float> scales_out;
-    ggnpu::decode_q6_k_for_npu(block_data, 64, int8_out, scales_out);
+    ggnpu::decode_q6_k_for_npu(block_data, sizeof(block_data), int8_out, scales_out);
 
-    // Verify scales: 12 scales per block
-    ASSERT_EQ(scales_out.size(), 12, "Q6_K NPU decoder produces 12 scales");
-
-    // Verify first scale = 1.0 * d = 4
-    ASSERT_NEAR(scales_out[0], 4.0f, 0.01f, "Q6_K scale[0] = 1*d = 4");
-    // Verify sixth scale = 1.0 * d = 4
-    ASSERT_NEAR(scales_out[5], 4.0f, 0.01f, "Q6_K scale[5] = 1*d = 4");
-    // Verify seventh scale = 1.0 * d2 = 2
-    ASSERT_NEAR(scales_out[6], 2.0f, 0.01f, "Q6_K scale[6] = 1*d2 = 2");
-    // Verify twelfth scale = 1.0 * d2 = 2
-    ASSERT_NEAR(scales_out[11], 2.0f, 0.01f, "Q6_K scale[11] = 1*d2 = 2");
-
-    // Verify INT8 values
     ASSERT_EQ(int8_out.size(), 256, "Q6_K NPU decoder produces 256 INT8 values");
-    // First value: nibble 0 -> val = 0 - 8 = -8
-    ASSERT_EQ(int8_out[0], -8, "Q6_K INT8[0] = -8");
-    // Q6 part: first value = 3 | (0 << 7) = 3
-    ASSERT_EQ(int8_out[128], 3, "Q6_K INT8[128] = 3 (Q6 part)");
-
-    // Golden test: compare dequantized output vs reference
-    std::vector<float> npu_float(256);
-    std::vector<float> ref_float(256);
-
-    // Reconstruct floats from NPU INT8 + scales
-    for (int i = 0; i < 128; i += 32) {
-        int scale_idx = (i / 32) % 6;
-        for (int j = 0; j < 32; j++) {
-            npu_float[i + j] = static_cast<float>(int8_out[i + j]) * scales_out[scale_idx];
-        }
-    }
-    for (int i = 128; i < 256; i += 32) {
-        int scale_idx = ((i - 128) / 32) + 6;
-        npu_float[i] = static_cast<float>(int8_out[i]) * scales_out[scale_idx];
-    }
-
-    // Reference dequantization
-    dequantize_q6_k_block_ref(block_data, ref_float.data());
-
-    // Compare (first few values)
-    for (int i = 0; i < 8; i++) {
-        ASSERT_NEAR(npu_float[i], ref_float[i], 0.01f, "Q6_K golden match value[" + std::to_string(i) + "]");
+    ASSERT_EQ(scales_out.size(), 1, "Q6_K NPU decoder produces 1 per-tensor scale");
+    float s = scales_out[0];
+    for (int i = 0; i < 256; i++) {
+        ASSERT_NEAR(static_cast<float>(int8_out[i]) * s, ref[i], s * 0.51f + 1e-6f,
+                    "Q6_K round-trip value[" + std::to_string(i) + "]");
     }
 }
 
