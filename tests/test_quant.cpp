@@ -156,7 +156,8 @@ void test_decode_dispatch() {
     std::vector<float> scales_out;
 
     float f32_data[4] = {1.0f, 2.0f, 3.0f, 4.0f};
-    ggnpu::decode_for_npu(ggnpu::GgmlType::F32, reinterpret_cast<const uint8_t*>(f32_data), 16, int8_out, scales_out);
+    ggnpu::decode_for_npu(ggnpu::GgmlType::F32, reinterpret_cast<const uint8_t*>(f32_data), 16,
+                          0, 0, int8_out, scales_out);
     ASSERT_TRUE(int8_out.size() >= 4, "F32 decode produces output");
 
     uint8_t q8_block[34];
@@ -167,7 +168,7 @@ void test_decode_dispatch() {
 
     int8_out.clear();
     scales_out.clear();
-    ggnpu::decode_for_npu(ggnpu::GgmlType::Q8_0, q8_block, 34, int8_out, scales_out);
+    ggnpu::decode_for_npu(ggnpu::GgmlType::Q8_0, q8_block, 34, 0, 0, int8_out, scales_out);
     ASSERT_EQ(int8_out.size(), 32, "Q8_0 dispatch produces 32 values");
     ASSERT_EQ(int8_out[0], 5, "Q8_0 dispatch value[0]");
 
@@ -180,7 +181,7 @@ void test_decode_dispatch() {
 
     int8_out.clear();
     scales_out.clear();
-    ggnpu::decode_for_npu(ggnpu::GgmlType::Q4_0, q4_block, 16, int8_out, scales_out);
+    ggnpu::decode_for_npu(ggnpu::GgmlType::Q4_0, q4_block, 16, 0, 0, int8_out, scales_out);
     ASSERT_EQ(int8_out.size(), 32, "Q4_0 dispatch produces 32 values");
    // qs[0] = 0x12, so nibbles are 2 and 1
     // val = nibble - 8, so 2-8=-6, 1-8=-7
@@ -234,10 +235,10 @@ void test_q4_k_decode_golden() {
     // NPU decode round-trip: int8 * scale must match the float dequant
     std::vector<int8_t> int8_out;
     std::vector<float> scales_out;
-    ggnpu::decode_q4_k_for_npu(block_data, sizeof(block_data), int8_out, scales_out);
+    ggnpu::decode_q4_k_for_npu(block_data, sizeof(block_data), 1, 256, int8_out, scales_out);
 
     ASSERT_EQ(int8_out.size(), 256, "Q4_K NPU decoder produces 256 INT8 values");
-    ASSERT_EQ(scales_out.size(), 1, "Q4_K NPU decoder produces 1 per-tensor scale");
+    ASSERT_EQ(scales_out.size(), 1, "Q4_K NPU decoder produces 1 per-row scale");
     float s = scales_out[0];
     for (int i = 0; i < 256; i++) {
         ASSERT_NEAR(static_cast<float>(int8_out[i]) * s, ref[i], s * 0.51f + 1e-6f,
@@ -273,10 +274,10 @@ void test_q6_k_decode_golden() {
 
     std::vector<int8_t> int8_out;
     std::vector<float> scales_out;
-    ggnpu::decode_q6_k_for_npu(block_data, sizeof(block_data), int8_out, scales_out);
+    ggnpu::decode_q6_k_for_npu(block_data, sizeof(block_data), 1, 256, int8_out, scales_out);
 
     ASSERT_EQ(int8_out.size(), 256, "Q6_K NPU decoder produces 256 INT8 values");
-    ASSERT_EQ(scales_out.size(), 1, "Q6_K NPU decoder produces 1 per-tensor scale");
+    ASSERT_EQ(scales_out.size(), 1, "Q6_K NPU decoder produces 1 per-row scale");
     float s = scales_out[0];
     for (int i = 0; i < 256; i++) {
         ASSERT_NEAR(static_cast<float>(int8_out[i]) * s, ref[i], s * 0.51f + 1e-6f,

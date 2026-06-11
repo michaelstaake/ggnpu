@@ -30,6 +30,7 @@ struct MulMatParams {
     int ldc;
     int32_t n_batches;
     const void* scales = nullptr;
+    int n_weight_scales = 0;  // 1 = single scale; N = per output row (B row)
     GgmlType B_type = GgmlType::F32;
 };
 

@@ -9,6 +9,7 @@ namespace ggnpu {
 
 // Centralized dispatch: pick the right decoder based on GgmlType
 void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
+                    int64_t n_rows, int64_t n_cols,
                     std::vector<int8_t>& int8_output,
                     std::vector<float>& scales_output) {
     switch (type) {
@@ -21,11 +22,11 @@ void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
             break;
 
         case GgmlType::Q4_K:
-            decode_q4_k_for_npu(gguf_data, data_size, int8_output, scales_output);
+            decode_q4_k_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
             break;
 
         case GgmlType::Q6_K:
-            decode_q6_k_for_npu(gguf_data, data_size, int8_output, scales_output);
+            decode_q6_k_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
             break;
 
         case GgmlType::F32:
@@ -70,7 +71,8 @@ void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
             std::cerr << "Warning: unsupported quant type " << ggml_type_name(type)
                       << " for NPU, falling back to F32\n";
             // Fallback: treat as F32
-            decode_for_npu(GgmlType::F32, gguf_data, data_size, int8_output, scales_output);
+            decode_for_npu(GgmlType::F32, gguf_data, data_size, n_rows, n_cols,
+                           int8_output, scales_output);
             break;
     }
 }

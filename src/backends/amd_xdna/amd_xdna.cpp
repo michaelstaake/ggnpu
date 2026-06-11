@@ -424,17 +424,24 @@ public:
         // both scales converts the raw INT32 accumulators back to float.
         const bool kq_path = (params.B_type == GgmlType::Q4_K ||
                               params.B_type == GgmlType::Q6_K) && params.scales;
-        float a_scale = 1.0f;
+        const float* wscales = kq_path ? static_cast<const float*>(params.scales) : nullptr;
+        const bool per_row_w = kq_path && params.n_weight_scales > 1;
+
+        std::vector<float> a_scales(static_cast<size_t>(M), 1.0f);
         if (kq_path) {
-            float a_max = 0.0f;
-            for (int i = 0; i < M; i++)
+            for (int i = 0; i < M; i++) {
+                float a_max = 0.0f;
                 for (int k = 0; k < K; k++)
                     a_max = std::max(a_max, std::fabs(A[i * params.lda + k]));
-            a_scale = a_max > 0.0f ? a_max / 127.0f : 1.0f;
+                a_scales[static_cast<size_t>(i)] = a_max > 0.0f ? a_max / 127.0f : 1.0f;
+            }
         }
-        const float inv_a = 1.0f / a_scale;
-        const float w_scale = kq_path ? static_cast<const float*>(params.scales)[0] : 1.0f;
-        const float out_scale = a_scale * w_scale;
+
+        auto weight_scale = [&](int n_idx) -> float {
+            if (!kq_path || !wscales) return 1.0f;
+            if (per_row_w && n_idx < params.n_weight_scales) return wscales[n_idx];
+            return wscales[0];
+        };
 
         for (int m0 = 0; m0 < M; m0 += T) {
             int mc = std::min(T, M - m0);
@@ -444,9 +451,12 @@ public:
                     int kc = std::min(T, K - k0);
 
                     std::fill(a_tile.begin(), a_tile.end(), 0);
-                    for (int i = 0; i < mc; i++)
+                    for (int i = 0; i < mc; i++) {
+                        const float inv_a = 1.0f / a_scales[static_cast<size_t>(m0 + i)];
                         for (int k = 0; k < kc; k++)
-                            a_tile[i * T + k] = to_i8(A[(m0 + i) * params.lda + (k0 + k)] * inv_a);
+                            a_tile[i * T + k] =
+                                to_i8(A[(m0 + i) * params.lda + (k0 + k)] * inv_a);
+                    }
 
                     std::fill(b_tile.begin(), b_tile.end(), 0);
                     if (params.B_type == GgmlType::I8 ||
@@ -494,9 +504,14 @@ public:
 
                     buf_mgr_->copy_from(*buf_c_, c_tile.data(), tile_bytes_out);
 
-                    for (int i = 0; i < mc; i++)
-                        for (int j = 0; j < nc; j++)
-                            C[(m0 + i) * params.ldc + (n0 + j)] += static_cast<float>(c_tile[i * T + j]) * out_scale;
+                    for (int i = 0; i < mc; i++) {
+                        const float a_scale = a_scales[static_cast<size_t>(m0 + i)];
+                        for (int j = 0; j < nc; j++) {
+                            const float out_scale = a_scale * weight_scale(n0 + j);
+                            C[(m0 + i) * params.ldc + (n0 + j)] +=
+                                static_cast<float>(c_tile[i * T + j]) * out_scale;
+                        }
+                    }
                 }
             }
         }

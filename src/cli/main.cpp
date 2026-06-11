@@ -184,8 +184,11 @@ bool report_compare(const char* label, const CompareResult& r, int n,
 
 void attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cache) {
     if (w && (w->type == GgmlType::Q4_K || w->type == GgmlType::Q6_K)) {
-        const auto& scales = cache.get_scales(w->name);
-        if (!scales.empty()) p.scales = scales.data();
+        const auto& scales = cache.get_scales(*w);
+        if (!scales.empty()) {
+            p.scales = scales.data();
+            p.n_weight_scales = static_cast<int>(scales.size());
+        }
     }
 }
 
@@ -199,8 +202,7 @@ bool bench_quant_matmul(const char* label, Backend& cpu, Backend& npu, WeightCac
         return false;
     }
 
-    const int8_t* decoded = cache.get_or_decode(weight->name, weight->data,
-        weight->data_size(), weight->type);
+    const int8_t* decoded = cache.get_or_decode(*weight);
     if (!decoded) {
         std::cerr << "Error: failed to decode " << weight->name << "\n";
         return false;
@@ -682,8 +684,7 @@ int main(int argc, char* argv[]) {
     auto mul_mat_weight = [&](const float* A, const TensorView* weight, float* C,
                               int M, int N, int K, int lda, int ldb, int ldc) {
         if (!weight) return;
-        const int8_t* decoded = weight_cache.get_or_decode(weight->name,
-            weight->data, weight->data_size(), weight->type);
+        const int8_t* decoded = weight_cache.get_or_decode(*weight);
         if (!decoded) return;
 
         MulMatParams mat_params;
@@ -698,12 +699,7 @@ int main(int argc, char* argv[]) {
         mat_params.ldc = ldc;
         mat_params.n_batches = 1;
         mat_params.B_type = weight->type;
-        if (weight->type == GgmlType::Q4_K || weight->type == GgmlType::Q6_K) {
-            const auto& scales = weight_cache.get_scales(weight->name);
-            if (!scales.empty()) {
-                mat_params.scales = scales.data();
-            }
-        }
+        attach_kquant_scales(mat_params, weight, weight_cache);
         backend->mul_mat_q(mat_params);
     };
 
@@ -876,8 +872,7 @@ int main(int argc, char* argv[]) {
             }
 
             // Decode weights for NPU (INT8 cache)
-            const int8_t* decoded_npu = weight_cache.get_or_decode(ffn_gate_w->name,
-                ffn_gate_w->data, ffn_gate_w->data_size(), ffn_gate_w->type);
+            const int8_t* decoded_npu = weight_cache.get_or_decode(*ffn_gate_w);
             if (!decoded_npu) {
                 std::cerr << "Error: failed to decode ffn_gate.weight\n";
                 return 1;
@@ -914,7 +909,7 @@ int main(int argc, char* argv[]) {
             npu_params.n_batches = 1;
             npu_params.B_type = ffn_gate_w->type;
             if (ffn_gate_w->type == GgmlType::Q4_K || ffn_gate_w->type == GgmlType::Q6_K) {
-                const auto& scales = weight_cache.get_scales(ffn_gate_w->name);
+                const auto& scales = weight_cache.get_scales(*ffn_gate_w);
                 if (!scales.empty()) {
                     npu_params.scales = scales.data();
                 }
@@ -962,8 +957,7 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            const int8_t* decoded_npu = weight_cache.get_or_decode(ffn_up_w->name,
-                ffn_up_w->data, ffn_up_w->data_size(), ffn_up_w->type);
+            const int8_t* decoded_npu = weight_cache.get_or_decode(*ffn_up_w);
             if (!decoded_npu) {
                 std::cerr << "Error: failed to decode ffn_up.weight\n";
                 return 1;
@@ -998,7 +992,7 @@ int main(int argc, char* argv[]) {
             npu_params.n_batches = 1;
             npu_params.B_type = ffn_up_w->type;
             if (ffn_up_w->type == GgmlType::Q4_K || ffn_up_w->type == GgmlType::Q6_K) {
-                const auto& scales = weight_cache.get_scales(ffn_up_w->name);
+                const auto& scales = weight_cache.get_scales(*ffn_up_w);
                 if (!scales.empty()) {
                     npu_params.scales = scales.data();
                 }
@@ -1048,10 +1042,8 @@ int main(int argc, char* argv[]) {
             }
 
             // Compute gate and up on NPU
-            const int8_t* decoded_gate = weight_cache.get_or_decode(ffn_gate_w->name,
-                ffn_gate_w->data, ffn_gate_w->data_size(), ffn_gate_w->type);
-            const int8_t* decoded_up = weight_cache.get_or_decode(ffn_up_w->name,
-                ffn_up_w->data, ffn_up_w->data_size(), ffn_up_w->type);
+            const int8_t* decoded_gate = weight_cache.get_or_decode(*ffn_gate_w);
+            const int8_t* decoded_up = weight_cache.get_or_decode(*ffn_up_w);
 
             std::vector<float> gate_out(static_cast<size_t>(ffn_size), 0.0f);
             std::vector<float> up_out(static_cast<size_t>(ffn_size), 0.0f);
@@ -1069,7 +1061,7 @@ int main(int argc, char* argv[]) {
             gate_params.n_batches = 1;
             gate_params.B_type = ffn_gate_w->type;
             if (ffn_gate_w->type == GgmlType::Q4_K || ffn_gate_w->type == GgmlType::Q6_K) {
-                const auto& scales = weight_cache.get_scales(ffn_gate_w->name);
+                const auto& scales = weight_cache.get_scales(*ffn_gate_w);
                 if (!scales.empty()) gate_params.scales = scales.data();
             }
             npu_backend->mul_mat_q(gate_params);
@@ -1087,7 +1079,7 @@ int main(int argc, char* argv[]) {
             up_params.n_batches = 1;
             up_params.B_type = ffn_up_w->type;
             if (ffn_up_w->type == GgmlType::Q4_K || ffn_up_w->type == GgmlType::Q6_K) {
-                const auto& scales = weight_cache.get_scales(ffn_up_w->name);
+                const auto& scales = weight_cache.get_scales(*ffn_up_w);
                 if (!scales.empty()) up_params.scales = scales.data();
             }
             npu_backend->mul_mat_q(up_params);
@@ -1101,8 +1093,7 @@ int main(int argc, char* argv[]) {
             }
 
             // FFN down matmul on NPU
-            const int8_t* decoded_down = weight_cache.get_or_decode(ffn_down_w->name,
-                ffn_down_w->data, ffn_down_w->data_size(), ffn_down_w->type);
+            const int8_t* decoded_down = weight_cache.get_or_decode(*ffn_down_w);
 
             std::vector<float> npu_output(static_cast<size_t>(hidden_size), 0.0f);
             MulMatParams down_params;
@@ -1118,7 +1109,7 @@ int main(int argc, char* argv[]) {
             down_params.n_batches = 1;
             down_params.B_type = ffn_down_w->type;
             if (ffn_down_w->type == GgmlType::Q4_K || ffn_down_w->type == GgmlType::Q6_K) {
-                const auto& scales = weight_cache.get_scales(ffn_down_w->name);
+                const auto& scales = weight_cache.get_scales(*ffn_down_w);
                 if (!scales.empty()) {
                     down_params.scales = scales.data();
                 }
@@ -1198,8 +1189,7 @@ int main(int argc, char* argv[]) {
                     mp.lda = lda; mp.ldb = ldb; mp.ldc = ldc;
                     mp.n_batches = 1;
                     if (use_npu_weights) {
-                        const int8_t* dec = weight_cache.get_or_decode(w->name,
-                            w->data, w->data_size(), w->type);
+                        const int8_t* dec = weight_cache.get_or_decode(*w);
                         if (!dec) return false;
                         mp.B = dec;
                         mp.B_type = w->type;
@@ -1316,18 +1306,20 @@ int main(int argc, char* argv[]) {
         if (tok_embd->type == GgmlType::F32) {
             embd_data = get_float_ptr(tok_embd);
         } else {
-            const int8_t* decoded = weight_cache.get_or_decode(tok_embd->name,
-                tok_embd->data, tok_embd->data_size(), tok_embd->type);
+            const int8_t* decoded = weight_cache.get_or_decode(*tok_embd);
             if (decoded) {
                 int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
                 int64_t vocab_size = static_cast<int64_t>(hparams.vocab_size);
-                const auto& embd_scales = weight_cache.get_scales(tok_embd->name);
-                float embd_scale = embd_scales.empty() ? 1.0f : embd_scales[0];
+                const auto& embd_scales = weight_cache.get_scales(*tok_embd);
+                const bool per_row = embd_scales.size() > 1;
                 tok_embd_f32.resize(static_cast<size_t>(vocab_size * embd_dim));
                 for (int64_t i = 0; i < vocab_size; i++) {
+                    float row_scale = embd_scales.empty() ? 1.0f
+                        : (per_row ? embd_scales[static_cast<size_t>(i)] : embd_scales[0]);
                     for (int64_t d = 0; d < embd_dim; d++) {
                         tok_embd_f32[static_cast<size_t>(i * embd_dim + d)] =
-                            static_cast<float>(decoded[i * embd_dim + d]) * embd_scale;
+                            static_cast<float>(decoded[static_cast<size_t>(i * embd_dim + d)]) *
+                            row_scale;
                     }
                 }
                 embd_data = tok_embd_f32.data();
@@ -1343,18 +1335,20 @@ int main(int argc, char* argv[]) {
         if (output_w->type == GgmlType::F32) {
             output_w_ptr = get_float_ptr(output_w);
         } else {
-            const int8_t* decoded = weight_cache.get_or_decode(output_w->name,
-                output_w->data, output_w->data_size(), output_w->type);
+            const int8_t* decoded = weight_cache.get_or_decode(*output_w);
             if (decoded) {
                 int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
                 int64_t vocab_size = static_cast<int64_t>(hparams.vocab_size);
-                const auto& out_scales = weight_cache.get_scales(output_w->name);
-                float out_scale = out_scales.empty() ? 1.0f : out_scales[0];
+                const auto& out_scales = weight_cache.get_scales(*output_w);
+                const bool per_row = out_scales.size() > 1;
                 output_w_f32.resize(static_cast<size_t>(vocab_size * embd_dim));
                 for (int64_t v = 0; v < vocab_size; v++) {
+                    float row_scale = out_scales.empty() ? 1.0f
+                        : (per_row ? out_scales[static_cast<size_t>(v)] : out_scales[0]);
                     for (int64_t d = 0; d < embd_dim; d++) {
                         output_w_f32[static_cast<size_t>(v * embd_dim + d)] =
-                            static_cast<float>(decoded[v * embd_dim + d]) * out_scale;
+                            static_cast<float>(decoded[static_cast<size_t>(v * embd_dim + d)]) *
+                            row_scale;
                     }
                 }
                 output_w_ptr = output_w_f32.data();

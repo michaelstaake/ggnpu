@@ -42,8 +42,10 @@ public:
     const int8_t* get_or_decode(const std::string& tensor_name,
                                 const uint8_t* gguf_data,
                                 size_t data_size,
-                                GgmlType type) {
-        std::string key = make_key(tensor_name);
+                                GgmlType type,
+                                int64_t n_rows = 0,
+                                int64_t n_cols = 0) {
+        std::string key = make_key(tensor_name, type);
 
         std::lock_guard<std::mutex> lock(mutex_);
 
@@ -67,7 +69,8 @@ public:
         std::vector<float> scales_output;
 
         try {
-            decode_for_npu(type, gguf_data, data_size, int8_output, scales_output);
+            decode_for_npu(type, gguf_data, data_size, n_rows, n_cols,
+                           int8_output, scales_output);
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to decode tensor " << tensor_name
                       << " (" << ggml_type_name(type) << "): " << e.what() << "\n";
@@ -89,14 +92,31 @@ public:
     }
 
     // Get the scales for a tensor (needed for some NPU kernels)
-    const std::vector<float>& get_scales(const std::string& tensor_name) {
-        std::string key = make_key(tensor_name);
+    const int8_t* get_or_decode(const TensorView& tv) {
+        int64_t n_rows = 0;
+        int64_t n_cols = 0;
+        if (tv.n_dims >= 2) {
+            n_cols = static_cast<int64_t>(tv.dims[0]);
+            n_rows = static_cast<int64_t>(tv.dims[1]);
+        } else if (tv.n_dims == 1) {
+            n_cols = static_cast<int64_t>(tv.dims[0]);
+            n_rows = 1;
+        }
+        return get_or_decode(tv.name, tv.data, tv.data_size(), tv.type, n_rows, n_cols);
+    }
+
+    const std::vector<float>& get_scales(const std::string& tensor_name, GgmlType type) {
+        std::string key = make_key(tensor_name, type);
         auto it = memory_cache_.find(key);
         if (it != memory_cache_.end()) {
             return it->second.scales;
         }
         static std::vector<float> empty;
         return empty;
+    }
+
+    const std::vector<float>& get_scales(const TensorView& tv) {
+        return get_scales(tv.name, tv.type);
     }
 
     // Clear all cached weights
@@ -111,11 +131,12 @@ public:
     }
 
 private:
-    std::string make_key(const std::string& tensor_name) {
-        // Simple hash of tensor name for cache key
+    std::string make_key(const std::string& tensor_name, GgmlType type) {
         std::hash<std::string> hasher;
         size_t hash = hasher(tensor_name);
-        return "w_" + std::to_string(hash);
+        // v2: per-row K-quant scales (invalidate stale per-tensor cache)
+        const char* ver = (type == GgmlType::Q4_K || type == GgmlType::Q6_K) ? "w2_" : "w_";
+        return std::string(ver) + std::to_string(hash);
     }
 
     CompileCache& cache_;
