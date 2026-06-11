@@ -572,6 +572,10 @@ int main(int argc, char* argv[]) {
     if (params.ctx_size > 0) {
         model.set_context_length(static_cast<uint64_t>(params.ctx_size));
         std::cout << "  Context size overridden to: " << params.ctx_size << "\n";
+        // Reinitialize KV cache to respect overridden context size
+        if (!model.init_kv_cache(params.ctx_size)) {
+            std::cerr << "  Warning: failed to reinitialize KV cache with overridden context size\n";
+        }
     } else if (hparams.context_length > 2048) {
         model.set_context_length(2048);
         std::cout << "  Context capped to 2048 (model reports "
