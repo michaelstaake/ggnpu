@@ -857,7 +857,6 @@ int main(int argc, char* argv[]) {
             }
 
             auto cmp = compare_vectors(cpu_silu.data(), npu_silu.data(), ffn_size, 0.05f);
-            std::cout << "    Note: SiLU uses CPU fallback until NPU unary launch is fixed\n";
             if (!report_compare("SiLU", cmp, ffn_size, 0.05f, 0.1f, 0.05f)) return 1;
         }
 
@@ -1498,6 +1497,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
+            // NOTE: residual add on CPU — acceptable for MVP (see IMPLEMENTATION.md §7.1)
 
             // FFN path
             rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
@@ -1553,6 +1553,7 @@ int main(int argc, char* argv[]) {
                  get_float_ptr(output_norm_w));
 
         // Logits projection from the last token position
+        // NOTE: CPU fallback — not yet routed through mul_mat_q (see IMPLEMENTATION.md §7.1)
         std::fill(logits.begin(), logits.end(), 0.0f);
         const float* logits_ptr = output_w_ptr;
 

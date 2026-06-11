@@ -497,6 +497,13 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 | Residual adds on CPU | `src/cli/main.cpp` | Cheap; acceptable for MVP |
 | `execute_layer_graph()` unused | `src/cli/main.cpp` | Dead code; main calls backend directly |
 
+#### Recently fixed (2026-06-11)
+
+| Fix | File |
+|-----|------|
+| Removed misleading "SiLU uses CPU fallback" comment from `bench-layer` test (NPU path is actually exercised) | `src/cli/main.cpp` |
+| Added clarifying comments for CPU fallbacks: logits projection, residual adds | `src/cli/main.cpp` |
+
 #### Recently fixed (2026-06-10)
 
 | Fix | File |
