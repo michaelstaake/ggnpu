@@ -4,7 +4,7 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state (2026-06-10):** **Phase 2 passed on hardware.** Phase 1 (GGUF load/dump) complete. Prebuilt kernels (`matmul`, `rmsnorm`, `softmax`, `silu` for `npu6`, each with a `*_sequence.bin`) are installed in `~/.cache/ggnpu/xclbin/` and `./build-npu/ggnpu bench-matmul` validates correct output on the NPU at all bench sizes. Inference is not yet validated; the next gate is Phase 3 (one `ffn_gate` matmul from GGUF on NPU vs CPU reference). See **§7.1**.
+**Current state:** **Phase 2 passed on hardware.** Phase 1 (GGUF load/dump) complete. Prebuilt kernels (`matmul`, `rmsnorm`, `softmax`, `silu` for `npu6`, each with a `*_sequence.bin`) are installed in `~/.cache/ggnpu/xclbin/` and `./build-npu/ggnpu bench-matmul` validates correct output on the NPU at all bench sizes. Inference is not yet validated; the next gate is Phase 3 (one `ffn_gate` matmul from GGUF on NPU vs CPU reference). See **§7.1**.
 
 **Verdict:** The supported path is host-native: install host prerequisites, build `ggnpu` locally, and provide local `.xclbin` + `*_sequence.bin` kernels under `~/.cache/ggnpu/xclbin/`.
 
@@ -271,7 +271,7 @@ The NPU backend consists of two code paths that must never mix:
 1. `xrt::device` on `/dev/accel/accel0`
 2. Detect `npu6` (Krackan) → `aie2p` kernel profile
 3. HW context; unlimited memlock; `xrt::bo` for weights/activations
-4. Load `.xclbin` from `~/.cache/ggnpu/xclbin/` or JIT-compile (cache empty on dev machine as of 2025-06-09)
+- [x] Load `.xclbin` from `~/.cache/ggnpu/xclbin/` or JIT-compile
 
 **Known gap:** `mul_mat_q()` must `copy_from` output buffer after kernel run (other ops already do). Without this, NPU matmul results are never read back to host.
 
@@ -365,8 +365,8 @@ Work through these in order. Do not skip ahead.
 |-------|------|--------|
 | 0 Scaffold | CMake, scripts, docs | Mostly done (native host flow documented; no CI) |
 | 1 GGUF loader | Parse, mmap, dump | **Done** |
-| 2 NPU matmul smoke | `bench-matmul` on hardware | **Done (2026-06-10)** — validated output, host-tiled INT8 256³ kernel |
-| 3 Q4_K weight path | Decode + one E2E matmul | **Done (2026-06-10)** — `bench-layer` FFN gate/up/down PASS vs CPU ref |
+| 2 NPU matmul smoke | `bench-matmul` on hardware | **Done** — validated output, host-tiled INT8 256³ kernel |
+| 3 Q4_K weight path | Decode + one E2E matmul | **Done** — `bench-layer` FFN gate/up/down PASS vs CPU ref |
 | 4 Full decoder layer | All ops on NPU | **In progress** — `bench-layer` adds RMSNorm/attn_q/SiLU tests; matmuls PASS; rmsnorm/silu NPU launch still needs shape/opcode fixes (CPU fallback active) |
 | 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — KV `-c`/cap fix done, attention dims fixed, not validated E2E |
 | 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; xclbins not validated E2E |
@@ -391,7 +391,7 @@ Work through these in order. Do not skip ahead.
 
 **Done when:** `ggnpu -m model.gguf --dump-tensors` prints correct inventory. **Gate passed** on `models/llama-3.2-1b-q4_k_m.gguf`.
 
-### Phase 2 — NPU matmul smoke — **DONE (2026-06-10)**
+### Phase 2 — NPU matmul smoke — **DONE**
 
 - [x] XRT device init on Krackan (`xrt::register_xclbin` + `xrt::hw_context`; `load_xclbin` is unsupported on amdxdna)
 - [x] INT8 matmul xclbin (fixed 256×256×256, INT8→INT32) + instruction sequence, host-tiled to any shape
@@ -400,7 +400,7 @@ Work through these in order. Do not skip ahead.
 - [x] `xrt::run::wait()` after each launch (runs are async)
 - [x] `ggnpu bench-matmul` validates and benches on hardware (~1 ms per 256³ tile)
 
-### Phase 3 — Q4_K weight path — **DONE (2026-06-10)**
+### Phase 3 — Q4_K weight path — **DONE**
 
 - [x] Q4_K + Q6_K block decoders (real ggml layouts: 144 B / 210 B super-blocks, fp16 super-scales)
 - [x] Transparent INT8 NPU weight cache (disk under `~/.cache/ggnpu/weights/`)
@@ -427,7 +427,7 @@ Work through these in order. Do not skip ahead.
 ### Phase 5 — Inference MVP
 
 - [x] Prefill + decode loops (per-token buffers; not validated E2E)
-- [x] Tokenizer + greedy sampling — **fixed 2026-06-10:** GGUF loader now stores `tokenizer.ggml.tokens` / `merges` STRING arrays; llama-bpe pretokenize + BPE (vendored `unicode.cpp` from llama.cpp); `test_tokenizer` verifies `Hello` → `[128000, 9906]`
+- [x] Tokenizer + greedy sampling — GGUF loader now stores `tokenizer.ggml.tokens` / `merges` STRING arrays; llama-bpe pretokenize + BPE (vendored `unicode.cpp` from llama.cpp); `test_tokenizer` verifies `Hello` → `[128000, 9906]`
 - [~] Coherent text generation — E2E runs and emits words (fixed RMSNorm weights, SwiGLU order, causal attn); quality still below reference due to INT8 matmul drift across 16 layers
 - [ ] Target: Llama 3.2 1B Q4_K_M, ctx 2048 — needs E2E quality pass
 - [x] Fix KV cache to respect `-c` / cap default ctx to 2048
@@ -455,7 +455,7 @@ produces coherent text with all math on NPU.
 - [ ] `IntelNpuBackend` interface stub in `docs/intel-roadmap.md`
 - [ ] Panther Lake / Linux 7.0 NPU path research
 
-### 7.1 Readiness snapshot (dev laptop, 2025-06-09)
+### 7.1 Readiness snapshot
 
 Assessment of whether the project can run a model on the NPU **today**.
 
@@ -473,7 +473,7 @@ Assessment of whether the project can run a model on the NPU **today**.
 
 **Host still needs:** XRT, `libxrt-dev`, and a native `ggnpu` build. `pip install triton-xdna` is only needed to build kernels locally.
 
-#### Kernel status (2026-06-10)
+#### Kernel status
 
 | Check | Status | Notes |
 |-------|--------|-------|
@@ -497,7 +497,7 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 | Residual adds on CPU | `src/cli/main.cpp` | Cheap; acceptable for MVP |
 | `execute_layer_graph()` unused | `src/cli/main.cpp` | Dead code; main calls backend directly |
 
-#### Recently fixed (2026-06-11)
+#### Recently fixed
 
 | Fix | File |
 |-----|------|
@@ -506,7 +506,7 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 | **bf16 marshaling gate:** `create_rmsnorm/softmax/silu_kernel_from_loaded_xclbin` now properly load instruction sequences and create kernels (were returning false) | `src/backends/amd_xdna/amd_xdna.cpp` |
 | **RMSNorm shape:** prebuilt kernel now accepted for N=2048 (Llama hidden) in addition to N=256 | `src/backends/amd_xdna/amd_xdna.cpp` |
 
-#### Recently fixed (2026-06-10)
+#### Recently fixed
 
 | Fix | File |
 |-----|------|
@@ -520,7 +520,7 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 | Matmul: f32↔int8 conversion + host tiling onto fixed 256³ INT8 kernel | `src/backends/amd_xdna/amd_xdna.cpp` |
 | Instruction sequence (`*_sequence.bin`) loaded into cacheable BO, passed via opcode-3 convention | `src/backends/amd_xdna/{amd_xdna,kernels}.cpp` |
 
-#### Fixed (2026-06-10) — Phase 3 gate
+#### Fixed — Phase 3 gate
 
 | Fix | File |
 |-----|------|
@@ -531,7 +531,7 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 | CPU reference Q4_K/Q6_K matmul uses real dequant with per-row block offsets | `src/backends/cpu_ref/cpu_ref.cpp` |
 | `bench-layer` passes scales for gate/up in SwiGLU test; `token_embd` dequant applies per-tensor scale | `src/cli/main.cpp` |
 
-#### Previously fixed (2025-06-09)
+#### Previously fixed
 
 | Fix | File |
 |-----|------|
@@ -577,9 +577,9 @@ cd build && ctest
 
 #### Path to first inference (next work, in order)
 
-1. ~~**Phase 3 gate**~~ — done 2026-06-10; `bench-layer` FFN gate/up/down all PASS.
+1. **Phase 3 gate** — `bench-layer` FFN gate/up/down all PASS.
 2. **bf16 marshaling:** convert f32↔bf16 around rmsnorm/softmax/silu DMA; pass their `*_sequence.bin` instr buffers (same opcode-3 convention as matmul).
-3. ~~**Quantization scaling**~~ — done 2026-06-10 (per-call activation scale × per-tensor weight scale; per-tile scales remain a precision improvement).
+3. **Quantization scaling** — per-call activation scale × per-tensor weight scale; per-tile scales remain a precision improvement.
 4. **Phases 4–5:** full layer, then `./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "..." -c 2048 -n 32`.
 5. **Perf:** batch tile runs, persist converted weight tiles, build larger fixed-shape xclbins.
 
@@ -825,7 +825,7 @@ When generating NPU kernel code (`kernels/triton/`), **always** apply the four g
 - **No branches:** Zero `if/else`/`switch`/`while` in hot loops. Predication or lookup tables only.
 - **Two layers:** Control code (IRON API, DMA setup) never contains tensor math. Kernel code (Triton-XDNA compiled) never handles DMA or launch.
 
-**Start here (2026-06-10):** Phases 1 and 2 gates passed — `bench-matmul` validates on hardware using the prebuilt npu6 kernels. Next work, in order:
+**Start here:** Phases 1 and 2 gates passed — `bench-matmul` validates on hardware using the prebuilt npu6 kernels. Next work, in order:
 
 1. **Phase 3 E2E:** one `ffn_gate` matmul from GGUF on NPU vs CPU ref (decoders and weight cache already exist).
 2. **bf16 marshaling** for rmsnorm/softmax/silu (kernels are bf16 fixed-shape; backend currently sends f32 and no instr sequence).
@@ -855,7 +855,7 @@ Put GGUF files in `models/` for development and E2E tests. This directory is **n
 models/
 ```
 
-### Models on dev machine (2025-06-09)
+### Models on dev machine
 
 | File | Approx. size | Notes |
 |------|--------------|-------|
