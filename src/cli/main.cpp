@@ -497,7 +497,8 @@ int main(int argc, char* argv[]) {
     std::cout << "  Heads: " << hparams.attention_head_count << " (KV: " << hparams.attention_head_count_kv << ")\n";
     std::cout << "  FFN: " << hparams.feed_forward_length << "\n\n";
 
-    if (params.prompt.empty()) {
+    // bench-layer generates its own test input — skip the prompt requirement
+    if (params.prompt.empty() && !params.bench_layer) {
         std::cout << "No prompt provided. Use --prompt or -p to specify input.\n";
         model.unload();
         return 0;
