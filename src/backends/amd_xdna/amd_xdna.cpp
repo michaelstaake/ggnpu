@@ -34,6 +34,11 @@ constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256
 // needs a dedicated M=1,N=2048 kernel; until then use CPU for other sizes.
 constexpr int kRmsnormKernelCols = 256;
 constexpr int kSiluKernelSize = 8192;  // prebuilt silu xclbin default N
+constexpr int kSoftmaxKernelRows = 256;  // prebuilt softmax xclbin is 256x256 bf16
+constexpr int kSoftmaxKernelCols = 256;
+constexpr int kFlashAttnHeads = 8;      // prebuilt flash_attn: 8 heads, 128 head_dim, 2048 ctx
+constexpr int kFlashAttnHeadDim = 128;
+constexpr int64_t kFlashAttnCtxLen = 2048;
 
 //====//
 // BF16 conversion utilities
@@ -1123,10 +1128,12 @@ private:
             return load_rmsnorm_kernel_for_shape(cached_path, N, cache_key);
         }
 
-        if (hw_ctx_rmsnorm_) {
+        // Only reuse prebuilt kernel for matching shape (N=256)
+        if (N == kRmsnormKernelCols && hw_ctx_rmsnorm_) {
             return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
         }
 
+        // For other shapes, try JIT compilation (required for N != 256)
         if (detail::jit_compilation_available()) {
             std::vector<uint8_t> xclbin_data = detail::jit_compile_rmsnorm(N, npu_profile_);
             if (!xclbin_data.empty()) {
@@ -1135,7 +1142,7 @@ private:
             }
         }
 
-        std::cerr << "Error: no xclbin available for rmsnorm N=" << N << "\n";
+        std::cerr << "Warning: no rmsnorm xclbin available for N=" << N << "; using CPU fallback\n";
         return false;
     }
 
@@ -1174,30 +1181,10 @@ private:
     }
 
     bool create_rmsnorm_kernel_from_loaded_xclbin(int N, const std::string& cache_key) {
-        try {
-            xrt::kernel krnl(hw_ctx_rmsnorm_, kTritonXdnaKernelName);
-            xrt::run run(krnl);
-
-            CachedRmsNormKernel cached{run, krnl, {}, 0, N};
-            // Load instruction sequence for BF16 kernel (opcode-3 convention)
-            std::string seq_path = detail::find_prebuilt_sequence("rmsnorm_" + profile_str_ + ".xclbin", cache_dir_);
-            if (!seq_path.empty()) {
-                auto words = detail::load_sequence_file(seq_path);
-                if (!words.empty()) {
-                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
-                    void* mapped = cached.bo_instr.map<void*>();
-                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
-                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                    cached.instr_words = words.size();
-                }
-            }
-            rmsnorm_kernels_[N] = std::move(cached);
-            return true;
-        } catch (const std::exception& e) {
-            std::cerr << "Error: failed to create rmsnorm kernel: " << e.what() << "\n";
-            return false;
-        }
+        // Prebuilt RMSNorm xclbin was loaded during initialization but instruction sequence
+        // lookup fails. For now, skip prebuilt path and rely on JIT compilation or CPU fallback.
+        // TODO: Pre-load instruction sequence during xclbin initialization phase
+        return false;
     }
 
     // Load or compile the softmax xclbin
@@ -1247,10 +1234,12 @@ private:
             return load_softmax_kernel_for_shape(cached_path, rows, cols, cache_key);
         }
 
-        if (hw_ctx_softmax_) {
+        // Only reuse prebuilt kernel for matching shape (256x256)
+        if (rows == kSoftmaxKernelRows && cols == kSoftmaxKernelCols && hw_ctx_softmax_) {
             return create_softmax_kernel_from_loaded_xclbin(rows, cols, cache_key);
         }
 
+        // For other shapes, try JIT compilation (required for size != 256x256)
         if (detail::jit_compilation_available()) {
             std::vector<uint8_t> xclbin_data = detail::jit_compile_softmax(cols, rows, npu_profile_);
             if (!xclbin_data.empty()) {
@@ -1259,7 +1248,7 @@ private:
             }
         }
 
-        std::cerr << "Error: no xclbin available for softmax " << rows << "x" << cols << "\n";
+        std::cerr << "Warning: no softmax xclbin available for " << rows << "x" << cols << "; using CPU fallback\n";
         return false;
     }
 
@@ -1297,30 +1286,10 @@ private:
     }
 
     bool create_softmax_kernel_from_loaded_xclbin(int rows, int cols, const std::string& cache_key) {
-        try {
-            xrt::kernel krnl(hw_ctx_softmax_, kTritonXdnaKernelName);
-            xrt::run run(krnl);
-
-            CachedSoftmaxKernel cached{run, krnl, {}, 0, rows, cols};
-            // Load instruction sequence for BF16 kernel (opcode-3 convention)
-            std::string seq_path = detail::find_prebuilt_sequence("softmax_" + profile_str_ + ".xclbin", cache_dir_);
-            if (!seq_path.empty()) {
-                auto words = detail::load_sequence_file(seq_path);
-                if (!words.empty()) {
-                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
-                    void* mapped = cached.bo_instr.map<void*>();
-                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
-                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                    cached.instr_words = words.size();
-                }
-            }
-            softmax_kernels_[std::make_pair(rows, cols)] = std::move(cached);
-            return true;
-        } catch (const std::exception& e) {
-            std::cerr << "Error: failed to create softmax kernel: " << e.what() << "\n";
-            return false;
-        }
+        // Prebuilt softmax xclbin was loaded during initialization but instruction sequence
+        // lookup fails. For now, skip prebuilt path and rely on JIT compilation or CPU fallback.
+        // TODO: Pre-load instruction sequence during xclbin initialization phase
+        return false;
     }
 
     // Load or compile the silu xclbin
@@ -1370,10 +1339,12 @@ private:
             return load_silu_kernel_for_shape(cached_path, size, cache_key);
         }
 
-        if (hw_ctx_silu_) {
+        // Only reuse prebuilt kernel for matching shape (size=8192)
+        if (size == kSiluKernelSize && hw_ctx_silu_) {
             return create_silu_kernel_from_loaded_xclbin(size, cache_key);
         }
 
+        // For other sizes, try JIT compilation (required for size != 8192)
         if (detail::jit_compilation_available()) {
             std::vector<uint8_t> xclbin_data = detail::jit_compile_silu(size, npu_profile_);
             if (!xclbin_data.empty()) {
@@ -1382,7 +1353,7 @@ private:
             }
         }
 
-        std::cerr << "Error: no xclbin available for silu size=" << size << "\n";
+        std::cerr << "Warning: no silu xclbin available for size=" << size << "; using CPU fallback\n";
         return false;
     }
 
@@ -1427,37 +1398,10 @@ private:
     }
 
     bool create_silu_kernel_from_loaded_xclbin(int size, const std::string& cache_key) {
-        try {
-            xrt::kernel krnl(hw_ctx_silu_, kTritonXdnaKernelName);
-            xrt::run run(krnl);
-
-            CachedSiluKernel cached{run, krnl, {}, 0, size};
-            // Load instruction sequence for BF16 kernel (opcode-3 convention)
-            std::string seq_path = detail::find_prebuilt_sequence("silu_" + profile_str_ + ".xclbin", cache_dir_);
-            if (!seq_path.empty()) {
-                auto words = detail::load_sequence_file(seq_path);
-                if (!words.empty()) {
-                    // Try group_id(0) first - SiLU kernel may only have one argument group
-                    try {
-                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(0));
-                    } catch (...) {
-                        // Fall back to group_id(1) if group_id(0) fails
-                        cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                                  XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
-                    }
-                    void* mapped = cached.bo_instr.map<void*>();
-                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
-                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                    cached.instr_words = words.size();
-                }
-            }
-            silu_kernels_[size] = std::move(cached);
-            return true;
-        } catch (const std::exception& e) {
-            std::cerr << "Error: failed to create silu kernel: " << e.what() << "\n";
-            return false;
-        }
+        // Prebuilt SiLU xclbin was loaded during initialization but instruction sequence
+        // lookup fails. For now, skip prebuilt path and rely on JIT compilation or CPU fallback.
+        // TODO: Pre-load instruction sequence during xclbin initialization phase
+        return false;
     }
 
     // Load or compile the flash_attn xclbin
@@ -1507,10 +1451,12 @@ private:
             return load_flash_attn_kernel_for_shape(cached_path, n_head, head_dim, ctx_len, cache_key);
         }
 
-        if (hw_ctx_fa_) {
+        // Only reuse prebuilt kernel for matching shape (8 heads, 128 head_dim, 2048 ctx)
+        if (n_head == kFlashAttnHeads && head_dim == kFlashAttnHeadDim && ctx_len == kFlashAttnCtxLen && hw_ctx_fa_) {
             return create_flash_attn_kernel_from_loaded_xclbin(n_head, head_dim, ctx_len, cache_key);
         }
 
+        // For other shapes, try JIT compilation (required for different configs)
         if (detail::jit_compilation_available()) {
             std::vector<uint8_t> xclbin_data = detail::jit_compile_flash_attn(n_head, head_dim, ctx_len, npu_profile_);
             if (!xclbin_data.empty()) {
@@ -1542,16 +1488,10 @@ private:
     }
 
     bool create_flash_attn_kernel_from_loaded_xclbin(int n_head, int head_dim, int64_t ctx_len, const std::string& cache_key) {
-        try {
-            xrt::kernel krnl(hw_ctx_fa_, kTritonXdnaKernelName);
-            xrt::run run(krnl);
-
-            flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] = CachedFlashAttnKernel{run, n_head, head_dim, ctx_len};
-            return true;
-        } catch (const std::exception& e) {
-            std::cerr << "Error: failed to create flash_attn kernel: " << e.what() << "\n";
-            return false;
-        }
+        // Prebuilt flash_attn xclbin was loaded during initialization but kernel execution
+        // setup fails. For now, skip prebuilt path and rely on JIT compilation or CPU fallback.
+        // TODO: Investigate flash_attn kernel setup issues
+        return false;
     }
 
     std::shared_ptr<xrt::device> device_;
