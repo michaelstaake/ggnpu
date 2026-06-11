@@ -366,7 +366,7 @@ Work through these in order. Do not skip ahead.
 | 0 Scaffold | CMake, scripts, docs | Mostly done (native host flow documented; no CI) |
 | 1 GGUF loader | Parse, mmap, dump | **Done** |
 | 2 NPU matmul smoke | `bench-matmul` on hardware | **Done (2026-06-10)** — validated output, host-tiled INT8 256³ kernel |
-| 3 Q4_K weight path | Decode + one E2E matmul | Decoders + disk cache done; NPU E2E **next gate** |
+| 3 Q4_K weight path | Decode + one E2E matmul | **Done (2026-06-10)** — `bench-layer` FFN gate/up/down PASS vs CPU ref |
 | 4 Full decoder layer | All ops on NPU | **Not done** — rmsnorm/softmax/silu xclbins exist but need bf16 marshaling |
 | 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — KV `-c`/cap fix done, attention dims fixed, not validated E2E |
 | 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; xclbins not validated E2E |
@@ -400,13 +400,15 @@ Work through these in order. Do not skip ahead.
 - [x] `xrt::run::wait()` after each launch (runs are async)
 - [x] `ggnpu bench-matmul` validates and benches on hardware (~1 ms per 256³ tile)
 
-### Phase 3 — Q4_K weight path
+### Phase 3 — Q4_K weight path — **DONE (2026-06-10)**
 
-- [x] Q4_K + Q6_K block decoders
+- [x] Q4_K + Q6_K block decoders (real ggml layouts: 144 B / 210 B super-blocks, fp16 super-scales)
 - [x] Transparent INT8 NPU weight cache (disk under `~/.cache/ggnpu/weights/`)
-- [ ] One `ffn_gate` matmul end-to-end from GGUF on NPU
+- [x] One `ffn_gate` matmul end-to-end from GGUF on NPU — `bench-layer` passes all three FFN matmuls (gate/up Q4_K, down Q6_K) at <0.09 relative error vs CPU reference
 
-**Done when:** output within tolerance vs CPU reference dequant matmul.
+**Done when:** output within tolerance vs CPU reference dequant matmul. **Gate passed** on `models/llama-3.2-1b-q4_k_m.gguf` layer 0.
+
+**Note:** decoded-weight cache entries are not versioned. After decoder changes, clear `~/.cache/ggnpu/weights/` or stale int8 weights will be reused.
 
 ### Phase 4 — Full decoder layer
 
@@ -497,6 +499,17 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 | Matmul: f32↔int8 conversion + host tiling onto fixed 256³ INT8 kernel | `src/backends/amd_xdna/amd_xdna.cpp` |
 | Instruction sequence (`*_sequence.bin`) loaded into cacheable BO, passed via opcode-3 convention | `src/backends/amd_xdna/{amd_xdna,kernels}.cpp` |
 
+#### Fixed (2026-06-10) — Phase 3 gate
+
+| Fix | File |
+|-----|------|
+| Q4_K/Q6_K decoders rewritten to real ggml layouts (144 B / 210 B super-blocks, fp16 d/dmin, 6-bit / int8 scales); previous layouts were fictional | `src/quant/{q4_k,q6_k}.cpp`, `include/ggnpu/quant/kquant.h` |
+| `GgmlType` enum aligned with ggml type ids (Q4_K=12, Q6_K=14; was 10/12, so Q4_K tensors decoded as Q6_K) + corrected type/block size tables | `include/ggnpu/tensor.h`, `src/gguf/tensor.cpp` |
+| GGUF tensor offsets: use header offsets relative to aligned data section instead of recomputing cumulatively (every tensor pointer was wrong) | `src/gguf/gguf.cpp` |
+| INT8 matmul scaling: per-tensor weight scale (from decoder) × per-call dynamic activation scale applied to outputs; decoded weights indexed row-major N×K | `src/backends/amd_xdna/amd_xdna.cpp` |
+| CPU reference Q4_K/Q6_K matmul uses real dequant with per-row block offsets | `src/backends/cpu_ref/cpu_ref.cpp` |
+| `bench-layer` passes scales for gate/up in SwiGLU test; `token_embd` dequant applies per-tensor scale | `src/cli/main.cpp` |
+
 #### Previously fixed (2025-06-09)
 
 | Fix | File |
@@ -525,6 +538,9 @@ cmake --build build-npu -j2
 ./build-npu/ggnpu bench-matmul
 # → all sizes validate; ~1 ms per 256³ tile (8192³ takes minutes due to host tiling)
 
+# Phase 3 gate — PASSES: FFN gate/up/down matmuls from GGUF on NPU vs CPU ref
+./build-npu/ggnpu bench-layer -m models/llama-3.2-1b-q4_k_m.gguf --layer 0
+
 # Contributor-only: unit tests on host CPU
 cd build && ctest
 ```
@@ -539,9 +555,9 @@ cd build && ctest
 
 #### Path to first inference (next work, in order)
 
-1. **Phase 3 gate:** route one decoded `ffn_gate` weight tensor through `mul_mat_q` on NPU; compare vs CPU reference dequant matmul.
+1. ~~**Phase 3 gate**~~ — done 2026-06-10; `bench-layer` FFN gate/up/down all PASS.
 2. **bf16 marshaling:** convert f32↔bf16 around rmsnorm/softmax/silu DMA; pass their `*_sequence.bin` instr buffers (same opcode-3 convention as matmul).
-3. **Quantization scaling:** add per-tile activation scales to the int8 matmul path so real f32 activations survive quantization.
+3. ~~**Quantization scaling**~~ — done 2026-06-10 (per-call activation scale × per-tensor weight scale; per-tile scales remain a precision improvement).
 4. **Phases 4–5:** full layer, then `./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "..." -c 2048 -n 32`.
 5. **Perf:** batch tile runs, persist converted weight tiles, build larger fixed-shape xclbins.
 
@@ -727,7 +743,7 @@ Do not promise CUDA-class speed in v1.
 
 | Risk | Mitigation |
 |------|------------|
-| Q4_K mixed tensor types | Q4_K + Q6_K decoders done; embedding dequant still needed in CLI |
+| Q4_K mixed tensor types | Q4_K + Q6_K decoders done (real ggml layouts); embedding dequant in CLI done |
 | First-run JIT latency | Prebuilt xclbins + persistent cache |
 | XRT/driver/firmware skew | Pin versions; `verify-npu.sh` checks |
 | 4 MB L2 limit | Tile matmuls; stream from DDR |
