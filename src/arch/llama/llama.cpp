@@ -159,6 +159,11 @@ void Model::set_context_length(uint64_t ctx) {
     }
 }
 
+bool Model::reinit_kv_cache(int64_t ctx_override) {
+    if (!loaded_) return false;
+    return init_kv_cache(ctx_override);
+}
+
 Model::Model() {}
 Model::~Model() { unload(); }
 

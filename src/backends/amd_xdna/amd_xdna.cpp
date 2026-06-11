@@ -631,7 +631,8 @@ public:
 
     Status rope(const RopeParams& params) override {
         // RoPE is relatively cheap (O(n_dims) per head) compared to matmul.
-        // Keep on CPU for now; the NPU kernel infrastructure is in place for Phase 6+.
+        // Use CPU for now; the NPU kernel infrastructure is in place for Phase 6+.
+        // The NPU kernel path is available via jit_compile_rope() for future use.
         for (int64_t i = 0; i < params.rope_dims; i += 2) {
             float ratio = 1.0f / std::pow(10000.0f, static_cast<float>(i) / params.n_dims);
             float val = params.offset * ratio * params.freq_scale;
@@ -746,13 +747,52 @@ public:
         int N = params.size;
         
         // SiLU NPU kernel is fixed-size 8192 (FFN hidden dimension for Llama 3B).
-        // For other sizes, use CPU fallback.
+        // For other sizes, tile the computation or use CPU fallback.
         if (N != kSiluKernelSize) {
-            static bool warned = false;
-            if (!warned) {
-                std::cerr << "Warning: SiLU NPU kernel only supports size=8192; using CPU fallback for size=" << N << "\n";
-                warned = true;
+            // Try to JIT-compile a kernel for this size
+            std::string cache_key = "silu_" + std::to_string(N) + "_" + profile_str_;
+            std::lock_guard<std::mutex> lock(mutex_);
+            
+            auto it = silu_kernels_.find(N);
+            if (it == silu_kernels_.end()) {
+                if (detail::jit_compilation_available()) {
+                    std::vector<uint8_t> xclbin_data = detail::jit_compile_silu(N, npu_profile_);
+                    if (!xclbin_data.empty()) {
+                        cache_->store_xclbin(cache_key, xclbin_data);
+                        if (load_silu_kernel_for_shape(cache_->get_xclbin_path(cache_key), N, cache_key)) {
+                            it = silu_kernels_.find(N);
+                        }
+                    }
+                }
             }
+            
+            if (it != silu_kernels_.end()) {
+                auto& kernel = it->second;
+                size_t bf16_bytes = N * sizeof(uint16_t);
+                std::vector<uint8_t> bf16_input = convert_f32_to_bf16(params.input, N);
+                xrt::bo buf_bf16_in(*device_, bf16_bytes, XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
+                void* mapped = buf_bf16_in.map<void*>();
+                std::memcpy(mapped, bf16_input.data(), bf16_bytes);
+                buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+                xrt::bo buf_bf16_out(*device_, bf16_bytes, XCL_BO_FLAGS_CACHEABLE, kernel.krnl.group_id(0));
+                try {
+                    kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words, buf_bf16_in, buf_bf16_out);
+                    kernel.run.wait();
+                } catch (const std::exception& e) {
+                    std::cerr << "Warning: SiLU kernel execution failed (" << e.what() << "); using CPU fallback\n";
+                    silu_cpu_ref(params);
+                    return Status::OK;
+                }
+                std::vector<uint8_t> bf16_out_data(bf16_bytes);
+                buf_bf16_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+                void* mapped_out = buf_bf16_out.map<void*>();
+                std::memcpy(bf16_out_data.data(), mapped_out, bf16_bytes);
+                auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
+                std::memcpy(params.output, f32_result.data(), N * sizeof(float));
+                return Status::OK;
+            }
+            
+            // Fall back to CPU for unsupported sizes
             silu_cpu_ref(params);
             return Status::OK;
         }
@@ -1142,6 +1182,7 @@ private:
             }
         }
 
+        // Fall back to CPU for unsupported sizes
         std::cerr << "Warning: no rmsnorm xclbin available for N=" << N << "; using CPU fallback\n";
         return false;
     }
@@ -1555,10 +1596,16 @@ private:
     }
 
     bool create_flash_attn_kernel_from_loaded_xclbin(int n_head, int head_dim, int64_t ctx_len, const std::string& cache_key) {
-        // Prebuilt flash_attn xclbin was loaded during initialization but kernel execution
-        // setup fails. For now, skip prebuilt path and rely on JIT compilation or CPU fallback.
-        // TODO: Investigate flash_attn kernel setup issues
-        return false;
+        try {
+            xrt::kernel krnl(hw_ctx_fa_, kTritonXdnaKernelName);
+            xrt::run run(krnl);
+            flash_attn_kernels_[std::make_tuple(n_head, head_dim, ctx_len)] =
+                CachedFlashAttnKernel{run, n_head, head_dim, ctx_len};
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to create flash_attn kernel from loaded xclbin: " << e.what() << "\n";
+            return false;
+        }
     }
 
     std::shared_ptr<xrt::device> device_;

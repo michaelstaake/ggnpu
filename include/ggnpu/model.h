@@ -70,6 +70,7 @@ public:
     bool is_loaded() const { return loaded_; }
     TensorRole get_tensor_role(const std::string& name) const;
     void set_context_length(uint64_t ctx);
+    bool reinit_kv_cache(int64_t ctx_override);
 
 private:
     bool parse_hparams();

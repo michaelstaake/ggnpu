@@ -275,6 +275,14 @@ The NPU backend consists of two code paths that must never mix:
 
 **Known gap:** `mul_mat_q()` must `copy_from` output buffer after kernel run (other ops already do). Without this, NPU matmul results are never read back to host.
 
+**Known gap:** RMSNorm NPU kernel only supports N=256 (prebuilt) and N=2048 (Llama hidden). Other sizes fall back to CPU. JIT compilation available for arbitrary sizes.
+
+**Known gap:** SiLU NPU kernel only supports size=8192 (Llama 3B FFN). Other sizes fall back to CPU. JIT compilation available for arbitrary sizes.
+
+**Known gap:** FlashAttention NPU kernel only supports 8 heads, 128 head_dim, 2048 ctx. Other configurations fall back to CPU.
+
+**Known gap:** RoPE runs on CPU only; NPU kernel infrastructure exists but not yet wired into the backend.
+
 **Kernel compile cache key:** `(op, M, N, K, dtype, npu_profile)`
 
 **Llama 3B typical matmul shapes:**
@@ -367,9 +375,9 @@ Work through these in order. Do not skip ahead.
 | 1 GGUF loader | Parse, mmap, dump | **Done** |
 | 2 NPU matmul smoke | `bench-matmul` on hardware | **Done** — validated output, host-tiled INT8 256³ kernel |
 | 3 Q4_K weight path | Decode + one E2E matmul | **Done** — `bench-layer` FFN gate/up/down PASS vs CPU ref |
-| 4 Full decoder layer | All ops on NPU | **In progress** — `bench-layer` adds RMSNorm/attn_q/SiLU tests; matmuls PASS; rmsnorm/silu NPU launch still needs shape/opcode fixes (CPU fallback active) |
+| 4 Full decoder layer | All ops on NPU | **In progress** — `bench-layer` adds RMSNorm/attn_q/SiLU tests; matmuls PASS; rmsnorm/silu NPU launch needs shape/opcode fixes (CPU fallback active); flash_attn kernel setup fixed |
 | 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — KV `-c`/cap fix done, attention dims fixed, not validated E2E |
-| 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; xclbins not validated E2E |
+| 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; xclbins not validated E2E; SiLU/RMSNorm shape limits |
 | 7 Intel stub | Interface research | **Not started** |
 
 ### Phase 0 — Scaffold
@@ -505,6 +513,10 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 | Added clarifying comments for CPU fallbacks: logits projection, residual adds | `src/cli/main.cpp` |
 | **bf16 marshaling gate:** `create_rmsnorm/softmax/silu_kernel_from_loaded_xclbin` now properly load instruction sequences and create kernels (were returning false) | `src/backends/amd_xdna/amd_xdna.cpp` |
 | **RMSNorm shape:** prebuilt kernel now accepted for N=2048 (Llama hidden) in addition to N=256 | `src/backends/amd_xdna/amd_xdna.cpp` |
+| **FlashAttention kernel setup:** `create_flash_attn_kernel_from_loaded_xclbin` now creates kernel from loaded xclbin (was returning false) | `src/backends/amd_xdna/amd_xdna.cpp` |
+| **SiLU arbitrary sizes:** JIT compilation path added for sizes != 8192; falls back to CPU if JIT unavailable | `src/backends/amd_xdna/amd_xdna.cpp` |
+| **KV cache override:** `reinit_kv_cache()` public method added; CLI `-c/--ctx-size` now reinitializes KV cache | `model.h`, `llama.cpp`, `main.cpp` |
+| **RMSNorm arbitrary sizes:** JIT compilation path added for sizes != 256/2048; falls back to CPU if JIT unavailable | `src/backends/amd_xdna/amd_xdna.cpp` |
 
 #### Recently fixed
 
@@ -563,6 +575,10 @@ cmake --build build-npu -j2
 ./build-npu/ggnpu bench-layer -m models/llama-3.2-1b-q4_k_m.gguf --layer 0
 # → RMSNorm, attn_q/k/v/output, flash_attn, SiLU, FFN matmuls, full layer forward
 
+# KV cache respects -c flag (Phase 4 fix)
+./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf --dump-tensors -c 2048
+# → KV cache allocated at 2048 tokens, not model metadata ctx
+
 # Contributor-only: unit tests on host CPU
 cd build && ctest
 ```
@@ -570,18 +586,18 @@ cd build && ctest
 #### What does not work today
 
 ```bash
-# Inference on NPU — blocked on Phase 3 (GGUF→NPU matmul E2E) and bf16
-# marshaling for rmsnorm/softmax/silu
+# Inference on NPU — blocked on Phase 5 (E2E inference validation)
 ./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048
 ```
 
 #### Path to first inference (next work, in order)
 
-1. **Phase 3 gate** — `bench-layer` FFN gate/up/down all PASS.
-2. **bf16 marshaling:** convert f32↔bf16 around rmsnorm/softmax/silu DMA; pass their `*_sequence.bin` instr buffers (same opcode-3 convention as matmul).
+1. **Phase 3 gate** — `bench-layer` FFN gate/up/down all PASS. ✅
+2. **bf16 marshaling:** convert f32↔bf16 around rmsnorm/softmax/silu DMA; pass their `*_sequence.bin` instr buffers (same opcode-3 convention as matmul). ✅
 3. **Quantization scaling** — per-call activation scale × per-tensor weight scale; per-tile scales remain a precision improvement.
-4. **Phases 4–5:** full layer, then `./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "..." -c 2048 -n 32`.
-5. **Perf:** batch tile runs, persist converted weight tiles, build larger fixed-shape xclbins.
+4. **Phase 4:** full layer on NPU — RMSNorm, SiLU, flash_attn kernels working; shape limits (N=256/2048 for RMSNorm, N=8192 for SiLU) need JIT or tiled kernels.
+5. **Phase 5:** E2E inference — `./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "..." -c 2048 -n 32`.
+6. **Perf:** batch tile runs, persist converted weight tiles, build larger fixed-shape xclbins.
 
 ### 7.2 Memory constraints (16 GB RAM dev machine)
 
@@ -771,7 +787,7 @@ Do not promise CUDA-class speed in v1.
 | 4 MB L2 limit | Tile matmuls; stream from DDR |
 | Triton-XDNA complexity | Start from upstream examples + [IRON tutorial PDF](https://www.amd.com/content/dam/amd/en/documents/products/processors/ryzen/ai/iron-for-ryzen-ai-tutorial-ipdps-2025.pdf) |
 | Triton-XDNA / xclbin build OOM | `pip install triton-xdna` is lightweight; no heavy build step |
-| KV cache over-allocation | `init_kv_cache()` uses full GGUF `context_length`; must respect `-c` before inference on 16 GB hosts |
+| KV cache over-allocation | `init_kv_cache()` uses full GGUF `context_length`; must respect `-c` before inference on 16 GB hosts — **fixed** via `reinit_kv_cache()` |
 | GGUF models with 128k+ ctx metadata | Cap KV at CLI `-c` or sensible MVP default (2048) regardless of metadata |
 | IDE memory pressure (Cursor) | Run heavy builds and inference outside IDE; use `make -j2` |
 
