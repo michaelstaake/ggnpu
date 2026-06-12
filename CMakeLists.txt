@@ -134,6 +134,16 @@ if(GGNPU_BUILD_TESTS)
             add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
         endif()
     endforeach()
+
+    # E2E: France prompt → greedy top-1 is Paris (requires local model.gguf)
+    add_test(
+        NAME test_e2e_logits
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/test-e2e-logits.sh
+                $<TARGET_FILE:ggnpu>
+                ${CMAKE_SOURCE_DIR}/models/llama-3.2-1b-q4_k_m.gguf)
+    set_tests_properties(test_e2e_logits PROPERTIES
+        SKIP_RETURN_CODE 77
+        LABELS "e2e")
 endif()
 
 # Install

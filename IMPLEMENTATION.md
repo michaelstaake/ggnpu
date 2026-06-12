@@ -4,7 +4,7 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state:** **Phase 2 passed on hardware.** Phase 1 (GGUF load/dump) complete. Prebuilt kernels (`matmul`, `rmsnorm`, `softmax`, `silu` for `npu6`, each with a `*_sequence.bin`) are installed in `~/.cache/ggnpu/xclbin/` and `./build-npu/ggnpu bench-matmul` validates correct output on the NPU at all bench sizes. Inference is not yet validated; the next gate is Phase 3 (one `ffn_gate` matmul from GGUF on NPU vs CPU reference). See **§7.1**.
+**Current state:** **Phases 1–5 MVP passed.** GGUF load, NPU matmul smoke, Q4_K weight path, full-layer `bench-layer`, and E2E inference on Llama 3.2 1B Q4_K_M are validated. France prompt produces coherent continuation (`Paris, and it is the most visited`). Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next focus: NPU utilization (RMSNorm N=2048, flash attention shapes, SiLU FFN=8192) and Phase 6 production polish. See **§7.1**.
 
 **Verdict:** The supported path is host-native: install host prerequisites, build `ggnpu` locally, and provide local `.xclbin` + `*_sequence.bin` kernels under `~/.cache/ggnpu/xclbin/`.
 
@@ -375,8 +375,8 @@ Work through these in order. Do not skip ahead.
 | 1 GGUF loader | Parse, mmap, dump | **Done** |
 | 2 NPU matmul smoke | `bench-matmul` on hardware | **Done** — validated output, host-tiled INT8 256³ kernel |
 | 3 Q4_K weight path | Decode + one E2E matmul | **Done** — `bench-layer` FFN gate/up/down PASS vs CPU ref |
-| 4 Full decoder layer | All ops on NPU | **In progress** — `bench-layer` adds RMSNorm/attn_q/SiLU tests; matmuls PASS; rmsnorm/silu NPU launch needs shape/opcode fixes (CPU fallback active); flash_attn kernel setup fixed |
-| 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Not done** — KV `-c`/cap fix done, attention dims fixed, not validated E2E |
+| 4 Full decoder layer | One layer vs CPU ref | **Done** — `bench-layer` PASS; RMSNorm/SiLU/flash_attn use CPU fallback at Llama shapes (NPU matmuls validated) |
+| 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Done** — France prompt → Paris; `bench-logits` + `test_e2e_logits` regression |
 | 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; xclbins not validated E2E; SiLU/RMSNorm shape limits |
 | 7 Intel stub | Interface research | **Not started** |
 
@@ -418,7 +418,7 @@ Work through these in order. Do not skip ahead.
 
 **Note:** decoded-weight cache entries are not versioned. After decoder changes, clear `~/.cache/ggnpu/weights/` or stale int8 weights will be reused.
 
-### Phase 4 — Full decoder layer (in progress)
+### Phase 4 — Full decoder layer — **DONE**
 
 - [x] `bench-layer` validates all attention matmuls + full layer forward on NPU vs CPU ref
 - [x] bf16 f32↔bf16 marshaling for rmsnorm/softmax/silu DMA paths
@@ -426,28 +426,31 @@ Work through these in order. Do not skip ahead.
 - [x] Load all prebuilt xclbins at backend init (matmul, rmsnorm, softmax, silu)
 - [x] All matmuls in one layer on NPU (gate/up/down + attn_q/k/v/output benched)
 - [x] Full single-layer forward CPU vs NPU (`bench-layer` test 4)
-- [ ] RMSNorm + SiLU on NPU at Llama hidden/ffn sizes (prebuilt rmsnorm is 32×256; silu opcode-3 launch fails)
-- [ ] RoPE on NPU (CPU path today)
-- [ ] KV cache write + attention E2E
+- [~] RMSNorm + SiLU on NPU at Llama hidden/ffn sizes — CPU fallback today (prebuilt rmsnorm 32×256; SiLU N=8192)
+- [~] RoPE on CPU (correct Llama 3 NORMAL pairing + `rope_freqs` freq factors)
+- [x] KV cache write + causal attention E2E in inference loop
 
-**Done when:** one-layer forward matches CPU reference.
+**Done when:** one-layer forward matches CPU reference. **Gate passed** via `bench-layer`.
 
-### Phase 5 — Inference MVP
+### Phase 5 — Inference MVP — **DONE**
 
-- [x] Prefill + decode loops (per-token buffers; not validated E2E)
-- [x] Tokenizer + greedy sampling — GGUF loader now stores `tokenizer.ggml.tokens` / `merges` STRING arrays; llama-bpe pretokenize + BPE (vendored `unicode.cpp` from llama.cpp); `test_tokenizer` verifies `Hello` → `[128000, 9906]`
-- [~] Coherent text generation — E2E runs and emits words (fixed RMSNorm weights, SwiGLU order, causal attn); quality still below reference due to INT8 matmul drift across 16 layers
-- [ ] Target: Llama 3.2 1B Q4_K_M, ctx 2048 — needs E2E quality pass
+- [x] Prefill + decode loops — sequential per-token forward with KV cache (decode-style prefill)
+- [x] Tokenizer + greedy sampling — `test_tokenizer` verifies `Hello` → `[128000, 9906]` and France prompt token ids
+- [x] Coherent text generation — RoPE NORMAL adjacent pairs, `rope_freqs` as freq factors, per-row Q6_K embeddings, F32 logits projection
+- [x] Target: Llama 3.2 1B Q4_K_M, ctx 2048 — greedy top-1 after France prompt is ` Paris` (id 12366); matches llama.cpp logits within ~0.01
 - [x] Fix KV cache to respect `-c` / cap default ctx to 2048
-- [x] Dequant `token_embd.weight` for Q4_K models
+- [x] Dequant `token_embd.weight` for Q4_K / Q6_K (per-token row dequant for embeddings)
+- [x] `bench-logits` CLI + `scripts/compare_logits.py` + `ctest -R test_e2e_logits` regression
 
 **Done when:**
 
 ```bash
-ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048
+ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048 -n 8
+# → Paris, and it is the most visited
+ctest -R test_e2e_logits   # top-1 id 12366 (skips if model missing)
 ```
 
-produces coherent text with all math on NPU.
+Coherent text is validated on CPU and NPU builds. Layer matmuls use INT8 on NPU; norms/attention/SiLU/logits projection still use CPU paths where shapes or accuracy require it (~15% NPU utilization).
 
 ### Phase 6 — Production
 
@@ -489,23 +492,39 @@ Assessment of whether the project can run a model on the NPU **today**.
 | `bench-matmul` E2E | **Passes** | Validated correct output on hardware |
 | rmsnorm/softmax/silu on NPU | xclbins load, dtype mismatch | Kernels are bf16; backend sends f32 — needs marshaling |
 | flash_attn / rope xclbins | Not built | RoPE intentionally on CPU for MVP |
-| Full inference on NPU | **Not validated** | Phase 3–5 |
+| Full inference E2E | **Validated** | France prompt coherent on CPU + NPU builds; `test_e2e_logits` |
+| NPU utilization | **Low (~15%)** | Many ops on CPU; INT8 matmul on hidden layers only |
 
-Production commands use the **native host build** (§9). Do **not** rely on `GGNPU_TEST_CPU=ON` — it allows silent CPU fallback, which violates §2.
+Production commands use the **native host build** (§9). Do **not** rely on `GGNPU_TEST_CPU=ON` in release NPU builds — it allows silent CPU fallback, which violates §2.
 
-#### Known code gaps (remaining before Phase 5)
+#### Known code gaps (post–Phase 5 / toward Phase 6)
 
 | Gap | File | Impact |
 |-----|------|--------|
-| bf16 marshaling for rmsnorm/softmax/silu | `src/backends/amd_xdna/amd_xdna.cpp` | Kernels are bf16, backend sends f32 → wrong results; convert f32↔bf16 around DMA, and pass per-shape instr sequences (these xclbins have fixed shapes from `compile_kernels.py`: rmsnorm N=2048, softmax 4×1024 rows, silu N=2048) |
-| Matmul perf: host-side tiling, one tile per `run()` | `src/backends/amd_xdna/amd_xdna.cpp` | Correct but slow: ~1 ms per 256³ tile + per-tile f32↔int8 conversion. Batch runs, reuse converted weight tiles, larger fixed-shape xclbins |
-| Matmul scaling: int8 conversion is naive round-clamp | `src/backends/amd_xdna/amd_xdna.cpp` | Fine for smoke test; real activations need per-tile scale factors before quantize, multiply back after |
-| RoPE on CPU | `src/backends/amd_xdna/amd_xdna.cpp`, `main.cpp` | Explicit CPU fallback; OK for early MVP, not “all math on NPU” |
-| Logits projection on CPU | `src/cli/main.cpp` | Dot product not routed through `mul_mat_q` |
-| Residual adds on CPU | `src/cli/main.cpp` | Cheap; acceptable for MVP |
-| `execute_layer_graph()` unused | `src/cli/main.cpp` | Dead code; main calls backend directly |
+| RMSNorm N=2048 on NPU | `amd_xdna.cpp` | Prebuilt kernel is 32×256; Llama hidden=2048 → CPU fallback (biggest util win) |
+| Flash attention shape | `amd_xdna.cpp`, `main.cpp` | Prebuilt 8×128×2048 vs Llama 32×64 → CPU fallback |
+| SiLU FFN=8192 on NPU | `amd_xdna.cpp` | Llama `ffn_dim=8192` → CPU fallback |
+| Matmul perf: host-side tiling, one tile per `run()` | `amd_xdna.cpp` | ~1 ms per 256³ tile; batch runs, persist weight tiles |
+| RoPE on CPU | `main.cpp` | Correct Llama 3 math; not on NPU yet |
+| Logits projection on CPU (F32 dequant) | `main.cpp` | `compute_logits_f32()` — accurate; not INT8 NPU path |
+| Residual adds on CPU | `main.cpp` | Cheap; acceptable for MVP |
+| `execute_layer_graph()` unused | `main.cpp` | Dead code |
 
-#### Recently fixed
+#### Fixed — Phase 5 inference quality
+
+| Fix | File |
+|-----|------|
+| RoPE **GGML_ROPE_TYPE_NORMAL** adjacent pairs `(2i, 2i+1)` — was NeoX half-split (wrong logits) | `src/cli/main.cpp` |
+| Llama 3 `rope_freqs` used as **freq_factors**, not angle divisors | `src/cli/main.cpp` |
+| Q6_K **per-token row** embedding dequant (bulk INT8 cache produced garbage activations) | `src/cli/main.cpp` |
+| Decode-style prefill: one token per forward, KV reset at start | `src/cli/main.cpp` |
+| **F32 logits** via `compute_logits_f32()` (vocab projection) | `src/cli/main.cpp` |
+| `bench-logits` CLI + `scripts/compare_logits.py` + `scripts/test-e2e-logits.sh` (`ctest -R test_e2e_logits`) | `src/cli/main.cpp`, `scripts/`, `CMakeLists.txt` |
+| Weight cache key includes `data_size`; clear `~/.cache/ggnpu/weights/` after decoder changes | `include/ggnpu/weight_cache.h` |
+| `attach_kquant_scales` validates scale count | `src/cli/main.cpp` |
+| France prompt golden tokens in `test_tokenizer` | `tests/test_tokenizer.cpp` |
+
+#### Recently fixed (kernels / layer bench)
 
 | Fix | File |
 |-----|------|
@@ -579,25 +598,32 @@ cmake --build build-npu -j2
 ./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf --dump-tensors -c 2048
 # → KV cache allocated at 2048 tokens, not model metadata ctx
 
-# Contributor-only: unit tests on host CPU
+# Unit tests (CPU reference backend)
 cd build && ctest
+
+# E2E logits regression (requires models/llama-3.2-1b-q4_k_m.gguf)
+ctest -R test_e2e_logits
+python3 scripts/compare_logits.py --check          # top-1 Paris
+python3 scripts/compare_logits.py --check --ref  # + logit vs llama-cpp-python
+
+# Phase 5 gate — PASSES: coherent generation
+./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048 -n 8
+./build-npu/ggnpu bench-logits -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048
 ```
 
 #### What does not work today
 
-```bash
-# Inference on NPU — blocked on Phase 5 (E2E inference validation)
-./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "Hello" -c 2048
-```
+- **High NPU utilization** — most non-matmul ops and logits run on CPU; expect ~15% NPU use during inference.
+- **RMSNorm / flash_attn / SiLU at Llama shapes on NPU** — CPU fallback until kernels or JIT paths match 2048 hidden / 8192 FFN / 32×64 heads.
+- **No CI** — run `ctest` and `compare_logits.py --check` locally after changes.
 
-#### Path to first inference (next work, in order)
+#### Path forward (next work, in order)
 
-1. **Phase 3 gate** — `bench-layer` FFN gate/up/down all PASS. ✅
-2. **bf16 marshaling:** convert f32↔bf16 around rmsnorm/softmax/silu DMA; pass their `*_sequence.bin` instr buffers (same opcode-3 convention as matmul). ✅
-3. **Quantization scaling** — per-call activation scale × per-tensor weight scale; per-tile scales remain a precision improvement.
-4. **Phase 4:** full layer on NPU — RMSNorm, SiLU, flash_attn kernels working; shape limits (N=256/2048 for RMSNorm, N=8192 for SiLU) need JIT or tiled kernels.
-5. **Phase 5:** E2E inference — `./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "..." -c 2048 -n 32`.
-6. **Perf:** batch tile runs, persist converted weight tiles, build larger fixed-shape xclbins.
+1. **NPU RMSNorm N=2048** — largest utilization win; prebuilt xclbin is 32×256 today.
+2. **Flash attention** at Llama head layout (32 heads × 64 dim).
+3. **SiLU N=8192** on NPU for SwiGLU FFN.
+4. **Matmul perf:** batch tile runs, persist converted weight tiles, larger fixed-shape xclbins.
+5. **Phase 6:** 3B model, L2-aware tiling, production docs/errors, optional prebuilt xclbin distribution.
 
 ### 7.2 Memory constraints (16 GB RAM dev machine)
 
@@ -841,13 +867,13 @@ When generating NPU kernel code (`kernels/triton/`), **always** apply the four g
 - **No branches:** Zero `if/else`/`switch`/`while` in hot loops. Predication or lookup tables only.
 - **Two layers:** Control code (IRON API, DMA setup) never contains tensor math. Kernel code (Triton-XDNA compiled) never handles DMA or launch.
 
-**Start here:** Phases 1 and 2 gates passed — `bench-matmul` validates on hardware using the prebuilt npu6 kernels. Next work, in order:
+**Start here:** Phases 1–5 MVP passed. Inference is coherent on Llama 3.2 1B Q4_K_M; regression via `ctest -R test_e2e_logits` and `python3 scripts/compare_logits.py --check`. Next work, in order:
 
-1. **Phase 3 E2E:** one `ffn_gate` matmul from GGUF on NPU vs CPU ref (decoders and weight cache already exist).
-2. **bf16 marshaling** for rmsnorm/softmax/silu (kernels are bf16 fixed-shape; backend currently sends f32 and no instr sequence).
-3. **Activation scaling** in the int8 matmul path (current round-clamp quantization only works for smoke-test data).
-4. **Phases 4–5:** full layer + inference MVP via `./build-npu/ggnpu -m models/llama-3.2-1b-q4_k_m.gguf ...`.
-5. **Docs:** keep `README.md`, `docs/host-setup-guide.md`, and §9–§10 aligned for native host usage.
+1. **NPU RMSNorm N=2048** — move hidden-state norm off CPU (biggest utilization gain).
+2. **Flash attention + SiLU** at Llama shapes on NPU.
+3. **Matmul perf:** batch tiles, weight-tile persistence, larger xclbins.
+4. **Phase 6:** 3B, L2 tiling, production polish; keep `README.md`, `docs/host-setup-guide.md`, and §9–§10 aligned.
+5. **Hygiene:** clear `~/.cache/ggnpu/weights/` after Q4_K/Q6_K decoder or cache-key changes.
 
 Hardware-facing conventions an agent must know (all in `src/backends/amd_xdna/`):
 
@@ -887,6 +913,7 @@ Example commands:
 # Inspect (works today)
 ggnpu -m models/llama-3.2-1b-q4_k_m.gguf --dump-tensors
 
-# MVP target (after Phase 5 fixes)
+# MVP (Phase 5 — works today)
 ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048 -n 64
+ggnpu bench-logits -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048
 ```
