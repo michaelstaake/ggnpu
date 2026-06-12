@@ -629,7 +629,7 @@ bash scripts/verify-npu.sh
 
 # Native build + validated NPU matmul (Phase 2 gate — PASSES)
 cmake -S . -B build-npu -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
-cmake --build build-npu -j2
+cmake --build build-npu -j1
 ./build-npu/ggnpu bench-matmul
 # → all sizes validate; ~1 ms per 256³ tile (8192³ takes minutes due to host tiling)
 
@@ -674,7 +674,7 @@ Dev laptop has ~14 GiB RAM + 4 GiB swap. Cursor IDE can consume several GB; comb
 
 | Activity | RAM impact | Recommendation |
 |----------|------------|----------------|
-| Native `ggnpu` build | Low (~2–4 GB) | Fine on laptop |
+| Native `ggnpu` build | ~2–4 GB at `-j1`; **much higher** at `-j2+` | **Always** `cmake --build … -j1` (§16) |
 | Local Triton-XDNA kernel build | **Low** (`pip install triton-xdna`) | No heavy build step required |
 | Load Llama 1B Q4_K_M (mmap) | ~770 MB virtual | Fine |
 | KV at **131k ctx** (current code) | **~8.6 GB** | **Will OOM** with IDE open |
@@ -781,7 +781,7 @@ bash scripts/verify-npu.sh
 ```bash
 mkdir -p build-npu && cd build-npu
 cmake .. -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
-cmake --build . -j2
+cmake --build . -j1
 ```
 
 ### Kernel artifacts
@@ -806,7 +806,7 @@ Kernel authoring uses Triton-XDNA (`kernels/triton/compile_kernels.py`). IRON/`X
 
 ```bash
 cmake -S . -B build-npu -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
-cmake --build build-npu -j2
+cmake --build build-npu -j1
 bash scripts/setup-triton-env.sh && source ~/triton-env/bin/activate
 ./scripts/build-kernels.sh npu6 matmul
 
@@ -858,7 +858,7 @@ Do not promise CUDA-class speed in v1.
 | Triton-XDNA / xclbin build OOM | `pip install triton-xdna` is lightweight; no heavy build step |
 | KV cache over-allocation | `init_kv_cache()` uses full GGUF `context_length`; must respect `-c` before inference on 16 GB hosts — **fixed** via `reinit_kv_cache()` |
 | GGUF models with 128k+ ctx metadata | Cap KV at CLI `-c` or sensible MVP default (2048) regardless of metadata |
-| IDE memory pressure (Cursor) | Run heavy builds and inference outside IDE; use `make -j2` |
+| IDE memory pressure (Cursor) | Run heavy builds and inference outside IDE; **always** `cmake --build … -j1` |
 
 ---
 
@@ -896,10 +896,16 @@ On **Ubuntu 24.04 or 26.04** + **Ryzen AI 7 350**, via the native host flow:
 2. Execute phases 0→6 in order; complete each "Done when" gate before proceeding.
 3. Match existing repo conventions; keep diffs focused.
 4. Never add forbidden dependencies.
-5. Never enable CPU/GPU math fallback in release builds.
-6. Add tests for every parser/quant/graph component; NPU tests marked `MANUAL`.
-7. Update `docs/usage.md` and `--help` whenever CLI flags change.
-8. Commit logically per phase; write clear commit messages.
+5. **Never implement CPU fallback for NPU ops.** CPU tensor math is allowed only when:
+   - The op is intentionally **Host** or **CPU** in §2.1 (control plane, or not wired to NPU yet).
+   - `cpu_ref` is used as a **reference / source of truth** in tests (`GGNPU_TEST_CPU=1`), not in production inference.
+   - The work genuinely belongs on CPU (GGUF decode, tokenization, sampling, cheap post-processing after an NPU kernel).
+   
+   Ops marked **NPU** in §2.1 must run on the NPU or **fail with an error**. If an xclbin is missing, a kernel launch fails, validation fails, or output is wrong, propagate the error and stop — **do not** catch the failure and run the same tensor op on CPU. Fixing the NPU path is the only acceptable fix; a CPU workaround is forbidden even as a temporary stub.
+6. **Use `-j1` for all builds** on the 16 GB dev machine. Always run `cmake --build <dir> -j1` (or `make -j1`). Do not use `-j2`, `-j$(nproc)`, or unconstrained Ninja parallelism — parallel C++ compilation plus the IDE is a common OOM trigger (see §7.2).
+7. Add tests for every parser/quant/graph component; NPU tests marked `MANUAL`.
+8. Update `docs/usage.md` and `--help` whenever CLI flags change.
+9. Commit logically per phase; write clear commit messages.
 
 ### Triton kernel rules (enforce on all code generation)
 
