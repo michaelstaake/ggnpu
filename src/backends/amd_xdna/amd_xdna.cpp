@@ -597,7 +597,6 @@ public:
         const size_t row_bf16_bytes = static_cast<size_t>(N) * sizeof(uint16_t);
         const size_t bf16_bytes = static_cast<size_t>(npu_rows) * row_bf16_bytes;
         std::vector<uint8_t> bf16_input;
-        xrt::bo buf_bf16_in;
 
         if (kernel.bo_instr && kernel.instr_words > 0) {
             std::vector<uint8_t> row_bf16 = convert_f32_to_bf16(input_ptr, N);
@@ -607,16 +606,18 @@ public:
                             row_bf16.data(), row_bf16_bytes);
             }
 
-            buf_bf16_in = make_data_bo(*device_, bf16_bytes);
-            void* mapped = buf_bf16_in.map<void*>();
-            std::memcpy(mapped, bf16_input.data(), bf16_bytes);
-            buf_bf16_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            if (!buf_rmsnorm_bf16_in_ || buf_rmsnorm_bf16_in_->size() < bf16_bytes) {
+                buf_rmsnorm_bf16_in_ = buf_mgr_->alloc(bf16_bytes, true);
+            }
+            if (!buf_rmsnorm_bf16_out_ || buf_rmsnorm_bf16_out_->size() < bf16_bytes) {
+                buf_rmsnorm_bf16_out_ = buf_mgr_->alloc(bf16_bytes, true);
+            }
 
-            xrt::bo buf_bf16_out = make_data_bo(*device_, bf16_bytes);
+            buf_mgr_->copy_to(*buf_rmsnorm_bf16_in_, bf16_input.data(), bf16_bytes);
 
             try {
                 kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
-                           buf_bf16_in, buf_bf16_out);
+                           buf_rmsnorm_bf16_in_->handle(), buf_rmsnorm_bf16_out_->handle());
                 kernel.run.wait();
             } catch (const std::exception& e) {
                 std::cerr << "Error: rmsnorm kernel execution failed: " << e.what() << "\n";
@@ -625,9 +626,7 @@ public:
             }
 
             std::vector<uint8_t> bf16_out_data(bf16_bytes);
-            buf_bf16_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            void* mapped_out = buf_bf16_out.map<void*>();
-            std::memcpy(bf16_out_data.data(), mapped_out, bf16_bytes);
+            buf_mgr_->copy_from(*buf_rmsnorm_bf16_out_, bf16_out_data.data(), bf16_bytes);
             auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
             std::memcpy(output_ptr, f32_result.data(), N * sizeof(float));
 
@@ -1097,13 +1096,18 @@ private:
         }
     }
 
-    // Load or compile the rmsnorm xclbin
+    // Load or compile the rmsnorm xclbin (prefer Llama-shaped rmsnorm_2048 when present).
     bool load_rmsnorm_xclbin() {
-        std::string xclbin_name = "rmsnorm_" + profile_str_ + ".xclbin";
-        std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
+        std::string shaped_name = "rmsnorm_2048_" + profile_str_ + ".xclbin";
+        std::string xclbin_name = shaped_name;
+        std::string xclbin_path = detail::find_prebuilt_xclbin(shaped_name, cache_dir_);
 
-        if (xclbin_path.empty() && cache_->has_xclbin(xclbin_name)) {
-            xclbin_path = cache_->get_xclbin_path(xclbin_name);
+        if (xclbin_path.empty()) {
+            xclbin_name = "rmsnorm_" + profile_str_ + ".xclbin";
+            xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
+            if (xclbin_path.empty() && cache_->has_xclbin(xclbin_name)) {
+                xclbin_path = cache_->get_xclbin_path(xclbin_name);
+            }
         }
 
         if (xclbin_path.empty()) {
@@ -1115,6 +1119,7 @@ private:
                                             "_" + profile_str_;
                     cache_->store_xclbin(cache_key, xclbin_data);
                     xclbin_path = cache_->get_xclbin_path(cache_key);
+                    xclbin_name = cache_key + ".xclbin";
                 }
             }
         }
@@ -1132,6 +1137,7 @@ private:
             }
 
             hw_ctx_rmsnorm_ = register_xclbin_from_data(*device_, xclbin_data_rmsnorm_);
+            rmsnorm_xclbin_name_ = fs::path(xclbin_path).filename().string();
             std::cout << "Loaded rmsnorm xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -1141,6 +1147,18 @@ private:
     }
 
     bool ensure_rmsnorm_kernel(int N, const std::string& cache_key) {
+        // Reuse preloaded hw_ctx when the loaded xclbin matches (same pattern as SiLU).
+        if (hw_ctx_rmsnorm_) {
+            if (N == kRmsnormKernelHidden &&
+                rmsnorm_xclbin_name_.find("rmsnorm_2048") != std::string::npos) {
+                return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
+            }
+            if (N == kRmsnormKernelCols &&
+                rmsnorm_xclbin_name_.find("rmsnorm_2048") == std::string::npos) {
+                return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
+            }
+        }
+
         if (cache_->has_xclbin(cache_key)) {
             std::string cached_path = cache_->get_xclbin_path(cache_key);
             return load_rmsnorm_kernel_for_shape(cached_path, N, cache_key);
@@ -1151,11 +1169,6 @@ private:
         std::string shaped_path = detail::find_prebuilt_xclbin(shaped_name, cache_dir_);
         if (!shaped_path.empty()) {
             return load_rmsnorm_kernel_for_shape(shaped_path, N, cache_key);
-        }
-
-        // Legacy prebuilt rmsnorm_npu6.xclbin is 32x256 — only safe for N=256.
-        if (N == kRmsnormKernelCols && hw_ctx_rmsnorm_) {
-            return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
         }
 
         // N=2048 (and other sizes): JIT-compile M=1,N=<size> kernel.
@@ -1210,9 +1223,17 @@ private:
             xrt::run run(krnl);
 
             CachedRmsNormKernel cached{run, krnl, {}, 0, N};
-            std::string seq_path = detail::find_prebuilt_sequence("rmsnorm_" + profile_str_ + ".xclbin", cache_dir_);
+            std::string seq_xclbin = rmsnorm_xclbin_name_.empty()
+                ? "rmsnorm_" + profile_str_ + ".xclbin"
+                : rmsnorm_xclbin_name_;
+            std::string seq_path = detail::find_prebuilt_sequence(seq_xclbin, cache_dir_);
             if (!seq_path.empty()) {
                 load_instr_bo(*device_, krnl, cached.bo_instr, cached.instr_words, seq_path);
+            }
+            if (N == kRmsnormKernelHidden &&
+                (!cached.bo_instr || cached.instr_words == 0)) {
+                std::cerr << "Error: rmsnorm_2048 xclbin missing instruction sequence\n";
+                return false;
             }
             rmsnorm_kernels_[N] = std::move(cached);
             return true;
@@ -1547,6 +1568,7 @@ private:
 
     std::vector<uint8_t> xclbin_data_rmsnorm_;
     xrt::hw_context hw_ctx_rmsnorm_;
+    std::string rmsnorm_xclbin_name_;
 
     std::vector<uint8_t> xclbin_data_softmax_;
     xrt::hw_context hw_ctx_softmax_;
@@ -1565,6 +1587,8 @@ private:
 
     std::shared_ptr<XrtBuffer> buf_rmsnorm_in_;
     std::shared_ptr<XrtBuffer> buf_rmsnorm_out_;
+    std::shared_ptr<XrtBuffer> buf_rmsnorm_bf16_in_;
+    std::shared_ptr<XrtBuffer> buf_rmsnorm_bf16_out_;
 
     std::shared_ptr<XrtBuffer> buf_softmax_in_;
     std::shared_ptr<XrtBuffer> buf_softmax_out_;

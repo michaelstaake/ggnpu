@@ -4,7 +4,7 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state:** **Phases 1–5 MVP passed.** GGUF load, NPU matmul smoke, Q4_K weight path, full-layer `bench-layer`, and E2E inference on Llama 3.2 1B Q4_K_M are validated. France prompt produces coherent continuation (`Paris, and it is the most visited`). Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next focus: NPU utilization (RMSNorm N=2048, flash attention shapes, SiLU FFN=8192) and Phase 6 production polish. See **§7.1**.
+**Current state:** **Phases 1–5 MVP passed** for matmul + SiLU on NPU. E2E inference is **blocked** until RMSNorm N=2048 and flash_attn kernels work (§2.1). Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next focus: fix §2.1 **NPU blocked** items, then Phase 6 polish. See **§7.1**.
 
 **Verdict:** The supported path is host-native: install host prerequisites, build `ggnpu` locally, and provide local `.xclbin` + `*_sequence.bin` kernels under `~/.cache/ggnpu/xclbin/`.
 
@@ -68,6 +68,46 @@ See **§9** and `docs/host-setup-guide.md`.
 ### Production rule
 
 If NPU initialization fails, `ggnpu` must **exit with an error**. No silent fallback to CPU or GPU.
+
+Implemented tensor ops (`rms_norm`, `silu`, `flash_attn`, `mul_mat_q`, …) must run on the NPU or **fail with an error**. CPU is only for control plane and ops **not yet implemented** on the NPU (see §2.1).
+
+### 2.1 CPU vs NPU operation map
+
+**Keep this table updated** when wiring a new kernel or moving work off the host. Target: Llama 3.2 1B Q4_K_M on Krackan (`npu6`). Status values: **NPU** (working), **NPU blocked** (kernel path exists but fails validation or wrong output), **CPU** (intentional — not on NPU yet), **Host** (control plane only).
+
+| Operation | Where | Status | Notes |
+|-----------|-------|--------|-------|
+| GGUF load / mmap | Host | Host | `gguf.cpp`, `model.cpp` |
+| Tokenization / BPE | Host | Host | `tokenizer.cpp` |
+| Sampling (argmax / temp) | Host | Host | `main.cpp` |
+| Weight cache decode (Q4_K/Q6_K → INT8) | Host | Host | `weight_cache`; feeds NPU matmul |
+| Per-token embedding dequant | Host | Host | `dequant_tensor_row()` in `main.cpp` |
+| Activation quantize (f32 → INT8 tiles) | Host | Host | `amd_xdna.cpp` matmul path |
+| **INT8 matmul** (Q/K/V/O, FFN gate/up/down) | NPU | **NPU** | `matmul_npu6.xclbin` (256³ tiles); host tiling |
+| **RMSNorm** (hidden=2048) | NPU | **NPU blocked** | `rmsnorm_2048_npu6.xclbin` compiles but returns zeros on hardware; hard error at runtime |
+| RMSNorm learned weights (`γ`) | Host | Host | O(N) multiply after unweighted NPU norm in `amd_xdna.cpp` |
+| **RoPE** (Q, K) | Host | **CPU** | `apply_rope()` in `main.cpp`; NPU kernel not wired |
+| KV cache write | Host | Host | `kv_cache.cpp` |
+| GQA KV expand (repeat KV heads) | Host | Host | memcpy loops in `main.cpp` |
+| **Flash attention** (32×64, ctx≤2048) | NPU | **NPU blocked** | Needs `flash_attn_32x64x2048_npu6.xclbin`; missing → hard error |
+| **SiLU** (FFN gate, N=8192) | NPU | **NPU** | `silu_npu6.xclbin` when present |
+| SwiGLU `silu(gate) * up` multiply | Host | Host | elementwise after NPU SiLU |
+| Residual adds (attn + FFN) | Host | Host | cheap; acceptable for MVP |
+| **Logits** (output projection) | Host | **CPU** | `compute_logits_f32()` — F32 dequant, not INT8 NPU |
+| `bench-layer` / `cpu_ref` reference | Host | Host | tests only; not production inference |
+
+**xclbin artifacts (npu6):**
+
+| Kernel | Artifact | Llama 1B shape |
+|--------|----------|----------------|
+| matmul | `matmul_npu6.xclbin` | 256³ INT8 tiles |
+| rmsnorm | `rmsnorm_2048_npu6.xclbin` | M=2, N=2048 bf16 |
+| silu | `silu_npu6.xclbin` | N=8192 bf16 |
+| flash_attn | `flash_attn_32x64x2048_npu6.xclbin` | 32 heads, 64 head_dim, 2048 ctx |
+| softmax | `softmax_npu6.xclbin` | 256×256 (not used in decoder loop today) |
+| rope | — | not built / not wired |
+
+Build: `./scripts/build-kernels.sh npu6 [kernel_name]`
 
 ### AIE kernel design guardrails
 
@@ -275,13 +315,13 @@ The NPU backend consists of two code paths that must never mix:
 
 **Known gap:** `mul_mat_q()` must `copy_from` output buffer after kernel run (other ops already do). Without this, NPU matmul results are never read back to host.
 
-**Known gap:** RMSNorm NPU kernel only supports N=256 (prebuilt) and N=2048 (Llama hidden). Other sizes fall back to CPU. JIT compilation available for arbitrary sizes.
+**Known gap:** RMSNorm N=2048 xclbin compiles but produces wrong output on hardware (see §2.1). Other sizes need a matching shaped xclbin or JIT build — hard error if missing.
 
-**Known gap:** SiLU NPU kernel only supports size=8192 (Llama 3B FFN). Other sizes fall back to CPU. JIT compilation available for arbitrary sizes.
+**Known gap:** SiLU NPU kernel is fixed at N=8192 (Llama 1B FFN). Other sizes need JIT compile — hard error if missing.
 
-**Known gap:** FlashAttention NPU kernel only supports 8 heads, 128 head_dim, 2048 ctx. Other configurations fall back to CPU.
+**Known gap:** FlashAttention needs `flash_attn_32x64x2048_npu6.xclbin` for Llama 1B — hard error if missing.
 
-**Known gap:** RoPE runs on CPU only; NPU kernel infrastructure exists but not yet wired into the backend.
+**Known gap:** RoPE runs on CPU only (`main.cpp`); NPU kernel infrastructure exists but is not wired.
 
 **Kernel compile cache key:** `(op, M, N, K, dtype, npu_profile)`
 
@@ -375,7 +415,7 @@ Work through these in order. Do not skip ahead.
 | 1 GGUF loader | Parse, mmap, dump | **Done** |
 | 2 NPU matmul smoke | `bench-matmul` on hardware | **Done** — validated output, host-tiled INT8 256³ kernel |
 | 3 Q4_K weight path | Decode + one E2E matmul | **Done** — `bench-layer` FFN gate/up/down PASS vs CPU ref |
-| 4 Full decoder layer | One layer vs CPU ref | **Done** — `bench-layer` PASS; RMSNorm/SiLU/flash_attn use CPU fallback at Llama shapes (NPU matmuls validated) |
+| 4 Full decoder layer | One layer vs CPU ref | **Partial** — NPU matmuls PASS; RMSNorm N=2048 and flash_attn blocked until kernels work (§2.1) |
 | 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Done** — France prompt → Paris; `bench-logits` + `test_e2e_logits` regression |
 | 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; xclbins not validated E2E; SiLU/RMSNorm shape limits |
 | 7 Intel stub | Interface research | **Not started** |
@@ -422,11 +462,11 @@ Work through these in order. Do not skip ahead.
 
 - [x] `bench-layer` validates all attention matmuls + full layer forward on NPU vs CPU ref
 - [x] bf16 f32↔bf16 marshaling for rmsnorm/softmax/silu DMA paths
-- [x] CPU fallback when NPU elementwise kernels unavailable or wrong shape
+- [x] Hard error when NPU elementwise kernels unavailable or produce wrong output (no CPU fallback)
 - [x] Load all prebuilt xclbins at backend init (matmul, rmsnorm, softmax, silu)
 - [x] All matmuls in one layer on NPU (gate/up/down + attn_q/k/v/output benched)
 - [x] Full single-layer forward CPU vs NPU (`bench-layer` test 4)
-- [~] RMSNorm + SiLU on NPU at Llama hidden/ffn sizes — CPU fallback today (prebuilt rmsnorm 32×256; SiLU N=8192)
+- [~] RMSNorm N=2048 on NPU — **blocked** (xclbin returns zeros); SiLU N=8192 **works**
 - [~] RoPE on CPU (correct Llama 3 NORMAL pairing + `rope_freqs` freq factors)
 - [x] KV cache write + causal attention E2E in inference loop
 
@@ -450,7 +490,7 @@ ggnpu -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048 -
 ctest -R test_e2e_logits   # top-1 id 12366 (skips if model missing)
 ```
 
-Coherent text is validated on CPU and NPU builds. Layer matmuls use INT8 on NPU; norms/attention/SiLU/logits projection still use CPU paths where shapes or accuracy require it (~15% NPU utilization).
+Coherent text requires working NPU kernels for all wired tensor ops (§2.1). Today RMSNorm N=2048 and flash_attn are **blocked**; matmul + SiLU use NPU when xclbins are present.
 
 ### Phase 6 — Production
 
@@ -493,7 +533,7 @@ Assessment of whether the project can run a model on the NPU **today**.
 | rmsnorm/softmax/silu on NPU | xclbins load, dtype mismatch | Kernels are bf16; backend sends f32 — needs marshaling |
 | flash_attn / rope xclbins | Not built | RoPE intentionally on CPU for MVP |
 | Full inference E2E | **Validated** | France prompt coherent on CPU + NPU builds; `test_e2e_logits` |
-| NPU utilization | **~15–50%** (generation) | Matmul + SiLU on NPU; RMSNorm N=2048 via `rmsnorm_2048_npu6.xclbin` when built; flash_attn still CPU |
+| NPU utilization | **Low** until §2.1 blockers fixed | Matmul + SiLU on NPU; RMSNorm/flash_attn hard-error until kernels work |
 
 Production commands use the **native host build** (§9). Tensor ops (matmul, rmsnorm, silu, flash_attn) **fail with an error** if the NPU kernel is missing or broken — no silent CPU fallback. CPU is used only for control-plane work (tokenize, RoPE, logits dequant, sampling) until those ops have NPU kernels.
 
@@ -533,9 +573,9 @@ Production commands use the **native host build** (§9). Tensor ops (matmul, rms
 | **bf16 marshaling gate:** `create_rmsnorm/softmax/silu_kernel_from_loaded_xclbin` now properly load instruction sequences and create kernels (were returning false) | `src/backends/amd_xdna/amd_xdna.cpp` |
 | **RMSNorm shape:** prebuilt kernel now accepted for N=2048 (Llama hidden) in addition to N=256 | `src/backends/amd_xdna/amd_xdna.cpp` |
 | **FlashAttention kernel setup:** `create_flash_attn_kernel_from_loaded_xclbin` now creates kernel from loaded xclbin (was returning false) | `src/backends/amd_xdna/amd_xdna.cpp` |
-| **SiLU arbitrary sizes:** JIT compilation path added for sizes != 8192; falls back to CPU if JIT unavailable | `src/backends/amd_xdna/amd_xdna.cpp` |
+| **SiLU arbitrary sizes:** JIT compilation path for sizes != 8192; hard error if JIT unavailable | `src/backends/amd_xdna/amd_xdna.cpp` |
 | **KV cache override:** `reinit_kv_cache()` public method added; CLI `-c/--ctx-size` now reinitializes KV cache | `model.h`, `llama.cpp`, `main.cpp` |
-| **RMSNorm arbitrary sizes:** JIT compilation path added for sizes != 256/2048; falls back to CPU if JIT unavailable | `src/backends/amd_xdna/amd_xdna.cpp` |
+| **RMSNorm arbitrary sizes:** JIT compilation path for sizes != 256/2048; hard error if JIT unavailable | `src/backends/amd_xdna/amd_xdna.cpp` |
 
 #### Recently fixed
 
