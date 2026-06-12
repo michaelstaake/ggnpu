@@ -775,9 +775,9 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             auto cmp = compare_vectors(normed.data(), npu_normed.data(), hidden_size, 0.01f);
-            if (hidden_size != 256) {
-                std::cout << "    Note: prebuilt rmsnorm xclbin is 32x256; hidden="
-                          << hidden_size << " uses CPU fallback on NPU path\n";
+            if (hidden_size != 2048) {
+                std::cout << "    Note: prebuilt rmsnorm xclbin is M=1,N=2048; hidden="
+                          << hidden_size << " may JIT-compile or use CPU fallback\n";
             }
             if (!report_compare("RMSNorm", cmp, hidden_size, 0.05f, 0.1f, 0.01f)) return 1;
         }
@@ -1139,7 +1139,6 @@ int main(int argc, char* argv[]) {
     // Dequantize token embeddings once before the generation loop
     const TensorView* tok_embd = find_tensor(model, "token_embd.weight");
     std::vector<float> tok_embd_f32;
-    std::vector<float> output_w_f32;
     const float* embd_data = nullptr;
     if (tok_embd) {
         if (tok_embd->type == GgmlType::F32) {
@@ -1169,33 +1168,7 @@ int main(int argc, char* argv[]) {
     }
 
     const TensorView* output_w = find_tensor(model, "output.weight");
-    const float* output_w_ptr = embd_data;
-    if (output_w) {
-        if (output_w->type == GgmlType::F32) {
-            output_w_ptr = get_float_ptr(output_w);
-        } else {
-            const int8_t* decoded = weight_cache.get_or_decode(*output_w);
-            if (decoded) {
-                int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
-                int64_t vocab_size = static_cast<int64_t>(hparams.vocab_size);
-                const auto& out_scales = weight_cache.get_scales(*output_w);
-                const bool per_row = out_scales.size() > 1;
-                output_w_f32.resize(static_cast<size_t>(vocab_size * embd_dim));
-                for (int64_t v = 0; v < vocab_size; v++) {
-                    float row_scale = out_scales.empty() ? 1.0f
-                        : (per_row ? out_scales[static_cast<size_t>(v)] : out_scales[0]);
-                    for (int64_t d = 0; d < embd_dim; d++) {
-                        output_w_f32[static_cast<size_t>(v * embd_dim + d)] =
-                            static_cast<float>(decoded[static_cast<size_t>(v * embd_dim + d)]) *
-                            row_scale;
-                    }
-                }
-                output_w_ptr = output_w_f32.data();
-                std::cout << "  Dequantized output.weight ("
-                    << ggml_type_name(output_w->type) << " -> F32)\n";
-            }
-        }
-    }
+    const TensorView* logits_w = output_w ? output_w : tok_embd;
 
     // Main generation loop
     std::cout << "Generating: ";
@@ -1392,21 +1365,15 @@ int main(int argc, char* argv[]) {
         rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
                  get_float_ptr(output_norm_w));
 
-        // Logits projection from the last token position
-        // NOTE: CPU fallback — not yet routed through mul_mat_q (see IMPLEMENTATION.md §7.1)
-        std::fill(logits.begin(), logits.end(), 0.0f);
-        const float* logits_ptr = output_w_ptr;
-
-        if (logits_ptr) {
+        // Logits projection: hidden @ output.weight^T via NPU matmul (M=1)
+        if (logits_w) {
+            std::fill(logits.begin(), logits.end(), 0.0f);
+            const float* last_hidden =
+                inp_norm.data() + static_cast<size_t>(n_tokens - 1) * hidden_size;
             int vocab_size = static_cast<int>(hparams.vocab_size);
-            const float* last_hidden = inp_norm.data() + static_cast<size_t>(n_tokens - 1) * hidden_size;
-            for (int v = 0; v < vocab_size; v++) {
-                float sum = 0.0f;
-                for (int d = 0; d < hidden_size; d++) {
-                    sum += last_hidden[d] * logits_ptr[v * hidden_size + d];
-                }
-                logits[v] = sum;
-            }
+            mul_mat_weight(last_hidden, logits_w, logits.data(),
+                           1, vocab_size, hidden_size,
+                           hidden_size, hidden_size, vocab_size);
         }
 
         backend->sync();

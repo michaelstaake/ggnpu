@@ -30,9 +30,10 @@ constexpr xrt::memory_group kDefaultMemGroup = 0;
 constexpr const char* kTritonXdnaKernelName = "MLIR_AIE";
 constexpr uint32_t kNpuOpcode = 3;
 constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256 int8
-// Prebuilt rmsnorm xclbin is 32x256 bf16 (per-row norm over 256). Llama hidden=2048
-// needs a dedicated M=1,N=2048 kernel; until then use CPU for other sizes.
+// Prebuilt rmsnorm xclbin is M=1,N=2048 bf16 (Llama 3.2 hidden). Legacy 32x256
+// xclbins still work for N=256 bench sizes; rebuild with compile_kernels.py for 2048.
 constexpr int kRmsnormKernelCols = 256;
+constexpr int kRmsnormKernelHidden = 2048;
 constexpr int kSiluKernelSize = 8192;  // prebuilt silu xclbin default N
 constexpr int kSoftmaxKernelRows = 256;  // prebuilt softmax xclbin is 256x256 bf16
 constexpr int kSoftmaxKernelCols = 256;
@@ -532,21 +533,22 @@ public:
     }
 
     Status rms_norm(const RmsNormParams& params) override {
-        // RMSNorm can run on NPU at any shape (256, 2048, etc.) via prebuilt or JIT-compiled kernels.
-        // Prebuilt kernel: M=32, N=256 (bf16). Larger sizes are JIT-compiled on first use and cached.
-        // Weighted RMSNorm (with learnable per-element weights) falls back to CPU ref for now.
-        
+        // RMSNorm on NPU: prebuilt M=1,N=2048 (Llama hidden) or JIT for other sizes.
+        // Learned weights are applied on CPU after the unweighted NPU norm (O(N) multiply).
+
         if (!params.input || !params.output || params.size <= 0) {
             last_status_ = Status::INVALID_PARAM;
             return last_status_;
         }
 
         int N = params.size;
-        
-        // Weighted RMSNorm is not yet supported on NPU; fall back to CPU ref
-        if (params.weight) {
-            rms_norm_cpu_ref(params);
-            return Status::OK;
+        const float* weight = params.weight;
+        std::vector<float> unweighted_out;
+        RmsNormParams npu_params = params;
+        if (weight) {
+            unweighted_out.resize(static_cast<size_t>(N));
+            npu_params.weight = nullptr;
+            npu_params.output = unweighted_out.data();
         }
 
         std::string cache_key = "rmsnorm_" + std::to_string(N) + "_" + profile_str_;
@@ -568,6 +570,8 @@ public:
         }
 
         auto& kernel = it->second;
+        const float* input_ptr = npu_params.input;
+        float* output_ptr = npu_params.output;
 
         // RMSNorm kernels are BF16 — convert f32 input → bf16 for DMA
         size_t bf16_bytes = N * sizeof(uint16_t);
@@ -576,7 +580,7 @@ public:
 
         if (kernel.bo_instr && kernel.instr_words > 0) {
             // BF16 kernel with instruction sequence: convert f32→bf16, pass opcode+instr
-            bf16_input = convert_f32_to_bf16(params.input, N);
+            bf16_input = convert_f32_to_bf16(input_ptr, N);
 
             buf_bf16_in = make_data_bo(*device_, bf16_bytes);
             void* mapped = buf_bf16_in.map<void*>();
@@ -602,7 +606,7 @@ public:
             void* mapped_out = buf_bf16_out.map<void*>();
             std::memcpy(bf16_out_data.data(), mapped_out, bf16_bytes);
             auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
-            std::memcpy(params.output, f32_result.data(), N * sizeof(float));
+            std::memcpy(output_ptr, f32_result.data(), N * sizeof(float));
 
         } else {
             // Fallback: F32 kernel without instruction sequence (legacy path)
@@ -614,7 +618,7 @@ public:
                 buf_rmsnorm_out_ = buf_mgr_->alloc(size_bytes, true);
             }
 
-            buf_mgr_->copy_to(*buf_rmsnorm_in_, params.input, size_bytes);
+            buf_mgr_->copy_to(*buf_rmsnorm_in_, input_ptr, size_bytes);
 
             try {
                 kernel.run(buf_rmsnorm_in_->handle(), buf_rmsnorm_out_->handle(),
@@ -627,7 +631,13 @@ public:
                 return Status::OK;
             }
 
-            buf_mgr_->copy_from(*buf_rmsnorm_out_, params.output, size_bytes);
+            buf_mgr_->copy_from(*buf_rmsnorm_out_, output_ptr, size_bytes);
+        }
+
+        if (weight) {
+            for (int i = 0; i < N; i++) {
+                params.output[i] = unweighted_out[static_cast<size_t>(i)] * weight[i];
+            }
         }
 
         return Status::OK;
@@ -1080,9 +1090,11 @@ private:
 
         if (xclbin_path.empty()) {
             if (detail::jit_compilation_available()) {
-                std::vector<uint8_t> xclbin_data = detail::jit_compile_rmsnorm(4096, npu_profile_);
+                std::vector<uint8_t> xclbin_data =
+                    detail::jit_compile_rmsnorm(kRmsnormKernelHidden, npu_profile_);
                 if (!xclbin_data.empty()) {
-                    std::string cache_key = detail::make_cache_key("rmsnorm", 4096, 0, 0, profile_str_);
+                    std::string cache_key = "rmsnorm_" + std::to_string(kRmsnormKernelHidden) +
+                                            "_" + profile_str_;
                     cache_->store_xclbin(cache_key, xclbin_data);
                     xclbin_path = cache_->get_xclbin_path(cache_key);
                 }
@@ -1116,18 +1128,30 @@ private:
             return load_rmsnorm_kernel_for_shape(cached_path, N, cache_key);
         }
 
-        // Only reuse prebuilt kernel when N matches the compiled shape (32x256 -> N=256).
+        // Shape-specific cache (e.g. rmsnorm_2048_npu6.xclbin from JIT or manual install).
+        std::string shaped_name = "rmsnorm_" + std::to_string(N) + "_" + profile_str_ + ".xclbin";
+        std::string shaped_path = detail::find_prebuilt_xclbin(shaped_name, cache_dir_);
+        if (!shaped_path.empty()) {
+            return load_rmsnorm_kernel_for_shape(shaped_path, N, cache_key);
+        }
+
+        // Legacy prebuilt rmsnorm_npu6.xclbin is 32x256 — only safe for N=256.
         if (N == kRmsnormKernelCols && hw_ctx_rmsnorm_) {
             return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
         }
 
-        // For other shapes, try JIT compilation (required for N != 256)
+        // N=2048: JIT-compile M=1,N=2048 kernel (rebuilds generic rmsnorm_npu6.xclbin too).
         if (detail::jit_compilation_available()) {
             std::vector<uint8_t> xclbin_data = detail::jit_compile_rmsnorm(N, npu_profile_);
             if (!xclbin_data.empty()) {
                 cache_->store_xclbin(cache_key, xclbin_data);
                 return load_rmsnorm_kernel_for_shape(cache_->get_xclbin_path(cache_key), N, cache_key);
             }
+        }
+
+        // After rebuilding rmsnorm_npu6.xclbin with M=1,N=2048, generic prebuilt works for hidden=2048.
+        if (N == kRmsnormKernelHidden && hw_ctx_rmsnorm_) {
+            return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
         }
 
         // Fall back to CPU for unsupported sizes

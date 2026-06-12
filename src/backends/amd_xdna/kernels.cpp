@@ -241,7 +241,9 @@ std::vector<uint8_t> jit_compile_kernel(const std::string& op_name,
         // Parameters will be passed via environment or a config file
         // For now, use default dimensions
         cmd += " --M 256 --N 256 --K 256";
-    } else if (op_name == "rmsnorm" || op_name == "silu" || op_name == "rope") {
+    } else if (op_name == "rmsnorm") {
+        cmd += " --M 1 --N 2048";
+    } else if (op_name == "silu" || op_name == "rope") {
         cmd += " --N 2048";
     } else if (op_name == "softmax") {
         cmd += " --rows 1 --cols 1024";
@@ -296,7 +298,50 @@ std::vector<uint8_t> jit_compile_rmsnorm(int N, int npu_profile) {
     else if (npu_profile == 5) profile_str = "npu5";
     else profile_str = "npu6";
 
-    return jit_compile_kernel("rmsnorm", profile_str, npu_profile);
+    std::string python = find_python();
+    if (python.empty()) return {};
+
+    std::string script = find_triton_compile_script();
+    if (script.empty()) return {};
+
+    std::string cache_dir = get_env("HOME") + "/.cache/ggnpu";
+    fs::path xclbin_dir = fs::path(cache_dir) / "xclbin";
+    fs::create_directories(xclbin_dir);
+
+    std::string cache_key = "rmsnorm_" + std::to_string(N) + "_" + profile_str;
+    fs::path xclbin_file = xclbin_dir / (cache_key + ".xclbin");
+    if (fs::exists(xclbin_file)) {
+        auto data = load_xclbin_file(xclbin_file.string());
+        if (!data.empty()) return data;
+    }
+
+    std::string cmd = python + " \"" + script + "\"";
+    cmd += " --op rmsnorm --profile " + profile_str;
+    cmd += " --output-dir " + xclbin_dir.string();
+    cmd += " --M 1 --N " + std::to_string(N);
+
+    std::cerr << "JIT: compiling rmsnorm N=" << N << " for " << profile_str << " (Triton-XDNA)\n";
+    if (std::system(cmd.c_str()) != 0) {
+        std::cerr << "Error: Triton-XDNA rmsnorm compilation failed\n";
+        return {};
+    }
+
+    fs::path default_xclbin = xclbin_dir / ("rmsnorm_" + profile_str + ".xclbin");
+    if (!fs::exists(xclbin_file) && fs::exists(default_xclbin)) {
+        fs::copy_file(default_xclbin, xclbin_file, fs::copy_options::overwrite_existing);
+        fs::path default_seq = xclbin_dir / ("rmsnorm_" + profile_str + "_sequence.bin");
+        fs::path shaped_seq = xclbin_dir / (cache_key + "_sequence.bin");
+        if (fs::exists(default_seq) && !fs::exists(shaped_seq)) {
+            fs::copy_file(default_seq, shaped_seq, fs::copy_options::overwrite_existing);
+        }
+    }
+
+    if (!fs::exists(xclbin_file)) {
+        std::cerr << "Error: rmsnorm xclbin not produced for N=" << N << "\n";
+        return {};
+    }
+
+    return load_xclbin_file(xclbin_file.string());
 }
 
 //====//
