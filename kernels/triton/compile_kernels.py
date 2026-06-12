@@ -72,14 +72,15 @@ KERNELS = {
         ),
     },
     "flash_attn": {
-        "description": "FlashAttention v1 (online softmax; no working transform yet)",
+        "description": "FlashAttention v1 (online softmax; elementwise decomposition)",
         "params": ["n_head", "head_dim", "ctx_len"],
         "defaults": {"n_head": 8, "head_dim": 128, "ctx_len": 2048},
         "transform": "flash_attn_aie2p.mlir",
         "experimental": (
-            "flash_attn uses scf.for with loop-carried online-softmax state; "
-            "flash_attn_aie2p.mlir is a placeholder (not matmul). "
-            "Inference uses host f32 decomposed attention until a transform ships."
+            "Triton-XDNA default pipeline fails on kernels with multiple tl.sum reductions. "
+            "Kernel IR produces linalg.reduce ops that the transform dialect can't handle. "
+            "Workaround: use host f32 decomposed path (GGNPU_FLASH_ATTN_FUSED not set). "
+            "To fix: need Triton-XDNA support for multi-reduction kernel lowering."
         ),
     },
 }
@@ -621,37 +622,33 @@ def build_kernel_script(op: str, params: dict) -> str:
             compiled = flash_attn_kernel[grid](
                 Q, K, V, O, head_dim, ctx_len,
                 head_dim, ctx_len * head_dim, ctx_len * head_dim, head_dim,
-                BLOCK_K=64,
             )
         """)
         kernel_src = textwrap.dedent("""
             @triton.jit
             def flash_attn_kernel(Q, K, V, output, head_dim: tl.constexpr, ctx_len: tl.constexpr,
-                stride_qh: tl.constexpr, stride_kh: tl.constexpr, stride_vh: tl.constexpr, stride_oh: tl.constexpr,
-                BLOCK_K: tl.constexpr):
+                stride_qh: tl.constexpr, stride_kh: tl.constexpr, stride_vh: tl.constexpr, stride_oh: tl.constexpr):
                 pid = tl.program_id(0)
                 q_offs = tl.arange(0, head_dim)
+                # Load Q for this head: shape [head_dim]
                 q = tl.load(Q + pid * stride_qh + q_offs)
                 k_base = pid * stride_kh
                 v_base = pid * stride_vh
-                m = tl.full([], -1e9, tl.float32)
-                l = tl.full([], 0.0, tl.float32)
-                acc = tl.zeros([head_dim], dtype=tl.float32)
-                for start in range(0, ctx_len, BLOCK_K):
-                    k_idx = start + tl.arange(0, BLOCK_K)
-                    mask = k_idx < ctx_len
-                    k_row = tl.load(K + k_base + k_idx[:, None] * head_dim + q_offs[None, :], mask=mask[:, None], other=0.0)
-                    scores = tl.sum(q[None, :] * k_row, axis=1)
-                    scores = tl.where(mask, scores, -1e9)
-                    block_max = tl.max(scores, axis=0)
-                    new_m = tl.maximum(m, block_max)
-                    alpha = tl.exp(m - new_m)
-                    beta = tl.exp(scores - new_m)
-                    v_row = tl.load(V + v_base + k_idx[:, None] * head_dim + q_offs[None, :], mask=mask[:, None], other=0.0)
-                    acc = acc * alpha + tl.sum(beta[:, None] * v_row, axis=0)
-                    l = l * alpha + tl.sum(beta, axis=0)
-                    m = new_m
-                out = acc / l
+                # Index tensors for context and dimension dimensions
+                k_idx = tl.arange(0, ctx_len)
+                d_offs = tl.arange(0, head_dim)
+                # QK^T: compute [ctx_len] attention scores via broadcasted dot products
+                q_bcast = q[None, :]              # shape [1, head_dim]
+                k_row = tl.load(K + k_base + k_idx[:, None] * head_dim + d_offs[None, :])  # shape [ctx_len, head_dim]
+                scores = tl.sum(q_bcast * k_row, axis=1)                      # shape [ctx_len]
+                # Softmax decomposition: max - sub - exp - sum - div
+                scores_minus_max = scores - tl.max(scores, axis=0)            # shape [ctx_len]
+                exp_scores = tl.exp(scores_minus_max)                         # shape [ctx_len]
+                sum_exp = tl.sum(exp_scores, axis=0)                          # scalar
+                weights = exp_scores / sum_exp                                # shape [ctx_len]
+                # AV: weighted sum of V rows -> [head_dim] output
+                v_row = tl.load(V + v_base + k_idx[:, None] * head_dim + d_offs[None, :])  # shape [ctx_len, head_dim]
+                out = tl.sum(weights[:, None] * v_row, axis=0)                # shape [head_dim]
                 tl.store(output + pid * stride_oh + q_offs, out)
         """)
     else:

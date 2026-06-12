@@ -4,7 +4,7 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state:** **Phases 1–5 MVP passed** on hardware. NPU path: INT8 matmul, RMSNorm N=2048, SiLU N=8192. Flash attention uses **host f32** (fused NPU kernel has no working mlir transform yet). E2E regression passes: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check` (France prompt → Paris). Next focus: fused flash_attn / RoPE on NPU, matmul perf, Phase 6 polish. See **§7.1**.
+**Current state:** **Phases 1–5 MVP passed** on hardware. NPU path: INT8 matmul, RMSNorm N=2048, SiLU N=8192. Flash attention uses **host f32** (fused NPU kernel blocked on Triton-XDNA multi-reduction lowering). E2E regression passes: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check` (France prompt → Paris). Next focus: fused flash_attn / RoPE on NPU, matmul perf, Phase 6 polish. See **§7.1**.
 
 **Verdict:** The supported path is host-native: install host prerequisites, build `ggnpu` locally, and provide local `.xclbin` + `*_sequence.bin` kernels under `~/.cache/ggnpu/xclbin/`.
 
@@ -550,7 +550,7 @@ Production commands use the **native host build** (§9). NPU ops (matmul, rmsnor
 
 | Gap | File | Impact |
 |-----|------|--------|
-| Fused flash attention on NPU | `flash_attn_aie2p.mlir`, `compile_kernels.py` | Placeholder transform; production uses host f32 decomposed path |
+| Fused flash attention on NPU | `flash_attn_aie2p.mlir`, `compile_kernels.py` | **Blocked**: Triton-XDNA default pipeline fails on kernels with multiple `tl.sum` reductions. Error: `requires exactly one producer_op handle (got N)`. Kernel IR produces 4 `linalg.reduce` ops that the transform dialect can't lower. Workaround: use host f32 decomposed path. See **Known limitation** below. |
 | Flash attention fused opt-in | `amd_xdna.cpp` | `GGNPU_FLASH_ATTN_FUSED=1` + experimental xclbin; default is host f32 |
 | RMSNorm xclbin staleness | `build-kernels.sh`, `rmsnorm_aie2p.mlir` | Old `rmsnorm_2048` xclbins (~8% error) must be rebuilt after mlir fix |
 | SiLU FFN=8192 on NPU | `amd_xdna.cpp` | **Works** when `silu_npu6.xclbin` present |
@@ -591,9 +591,35 @@ Production commands use the **native host build** (§9). NPU ops (matmul, rmsnor
 | **KV cache override:** `reinit_kv_cache()` public method added; CLI `-c/--ctx-size` now reinitializes KV cache | `model.h`, `llama.cpp`, `main.cpp` |
 | **RMSNorm arbitrary sizes:** JIT compilation path for sizes != 256/2048; hard error if JIT unavailable | `src/backends/amd_xdna/amd_xdna.cpp` |
 
+#### Known limitation: Triton-XDNA multi-reduction kernel lowering
+
+**Issue:** Triton-XDNA's default compilation pipeline (without custom transform scripts) fails on kernels with multiple `tl.sum` operations. The error is:
+```
+loc("-":17:27): error: requires exactly one producer_op handle (got N)
+```
+
+**Root cause:** Each `tl.sum(axis=N)` lowers to a `linalg.reduce` operation. Triton-XDNA's default transform pipeline expects at most one reduction per kernel. Kernels with 2+ reductions (like flash attention with QK^T sum, softmax sum, and AV sum = 3 reductions) fail during the handle resolution phase before any custom transform runs.
+
+**Workaround:** Production inference uses host f32 decomposed flash attention (`flash_attn_decomposed()` in `amd_xdna.cpp`). This path:
+- Matches CPU reference output exactly
+- No xclbin required
+- Opt-in via `GGNPU_FLASH_ATTN_FUSED=1` when Triton-XDNA support improves
+
+**Path to fix:** Either:
+1. Wait for upstream Triton-XDNA to support multi-reduction kernels
+2. Restructure flash attention kernel to use a single reduction (e.g., accumulate all attention weights into a larger output tensor and reduce once at the end)
+3. Use `tl.dot` for QK^T and AV matmuls instead of `tl.sum(elementwise_mul)` — but this requires pack/unpack transforms that don't compose well with elementwise softmax ops
+
+**Files:** `flash_attn_aie2p.mlir` contains a working transform script structure (follows rmsnorm/softmax patterns), but the kernel IR itself fails before the transform even runs. The issue is in Triton-XDNA's compiler, not the transform script.
+
 #### Recently fixed
 
 | Fix | File |
+|-----|------|
+| **Flash attention kernel:** rewrote from scf.for loop-carried online-softmax to elementwise + reductions (q_bcast * k_row → tl.sum, softmax decomposition, weights * v_row → tl.sum). Transform script follows rmsnorm/softmax patterns. Blocked on Triton-XDNA multi-reduction lowering (§7.1 Known limitation). | `compile_kernels.py`, `flash_attn_aie2p.mlir` |
+| **Flash attention:** default to host f32 decomposed; fused NPU opt-in via `GGNPU_FLASH_ATTN_FUSED=1`; removed from default `build-kernels.sh` | `amd_xdna.cpp`, `build-kernels.sh`, `flash_attn_aie2p.mlir` |
+
+
 |-----|------|
 | GGUF STRING arrays (`tokenizer.ggml.tokens`, `merges`) were skipped during load → 0 vocab; now serialized into `GgufKV::data` | `src/gguf/gguf.cpp` |
 | Llama-bpe tokenizer: unicode pretokenize + ranked BPE merges + GPT-2 byte decode | `src/cli/tokenizer.cpp`, `src/cli/unicode*.cpp` |
@@ -667,7 +693,7 @@ python3 scripts/compare_logits.py --check --ref  # + logit vs llama-cpp-python
 
 #### What does not work today
 
-- **Fused NPU flash attention** — no working mlir transform; host f32 path is production.
+- **Fused NPU flash attention** — blocked on Triton-XDNA multi-reduction kernel lowering (§7.1 Known limitation). Kernel with 3+ `tl.sum` ops fails in default pipeline: `requires exactly one producer_op handle (got N)`. Host f32 decomposed path is production.
 - **NPU RoPE** — gather/index math not lowered by Triton-XDNA transforms yet.
 - **High NPU utilization** — flash_attn, RoPE, logits, residuals still on host; matmul dominates time but norms/activations are now partially on NPU.
 - **Stale rmsnorm xclbins** — pre-fix `rmsnorm_2048_npu6.xclbin` artifacts give ~8% error; delete and rebuild (see §2.1).
@@ -675,7 +701,7 @@ python3 scripts/compare_logits.py --check --ref  # + logit vs llama-cpp-python
 
 #### Path forward (next work, in order)
 
-1. **Fused flash attention on NPU** — real `flash_attn_aie2p.mlir` for online-softmax `scf.for` (or decomposed NPU matmul+softmax at bf16).
+1. **Fused flash attention on NPU** — blocked on upstream Triton-XDNA fix for multi-reduction kernels. Workaround: host f32 decomposed path is production-quality. See §7.1 Known limitation for kernel restructuring options.
 2. **RoPE on NPU** — working transform for gather/pair-shuffle loads.
 3. **Matmul perf:** batch tile runs, persist converted weight tiles, larger fixed-shape xclbins.
 4. **Phase 6:** 3B model, L2-aware tiling, production docs/errors, optional prebuilt xclbin distribution.
@@ -930,7 +956,7 @@ When generating NPU kernel code (`kernels/triton/`), **always** apply the four g
 
 **Start here:** Phases 1–5 MVP passed on hardware. NPU: matmul + RMSNorm N=2048 + SiLU. Host: flash_attn, RoPE, logits. Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next work, in order:
 
-1. **Fused flash attention on NPU** — replace placeholder `flash_attn_aie2p.mlir`.
+1. **Fused flash attention on NPU** — **blocked** on Triton-XDNA multi-reduction kernel lowering (see §7.1 Known limitation). Kernel with 3+ `tl.sum` ops fails: `requires exactly one producer_op handle (got N)`. See `flash_attn_aie2p.mlir` for attempted transform; host f32 decomposed path is production.
 2. **RoPE on NPU** — experimental transform recipe.
 3. **Matmul perf:** batch tiles, weight-tile persistence, larger xclbins.
 4. **Phase 6:** 3B, L2 tiling, production polish; keep `README.md`, `docs/host-setup-guide.md`, and §9–§10 aligned.
