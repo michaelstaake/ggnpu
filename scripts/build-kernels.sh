@@ -224,6 +224,13 @@ if [ -n "${GGNPU_EXPERIMENTAL:-}" ]; then
     )
 fi
 
+#====//
+# Build kernels (skip experimental unless requested)
+#====//
+TOTAL=0
+SUCCESS=0
+FAILED=0
+
 for kernel_def in "${Kernels[@]}"; do
     IFS=':' read -r kernel_name kernel_args <<< "$kernel_def"
 
