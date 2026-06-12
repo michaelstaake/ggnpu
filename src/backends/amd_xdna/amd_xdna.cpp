@@ -1155,8 +1155,8 @@ private:
         // Fall back to CPU for unsupported sizes
         static bool warned_missing = false;
         if (!warned_missing) {
-            std::cerr << "Warning: no rmsnorm xclbin for N=" << N
-                      << " (rebuild: ./scripts/build-kernels.sh npu6 rmsnorm); using CPU fallback\n";
+            std::cerr << "Warning: no NPU rmsnorm for N=" << N
+                      << " (prebuilt kernel is 32x256 only); using CPU fallback\n";
             warned_missing = true;
         }
         return false;
@@ -1449,18 +1449,7 @@ private:
         }
 
         if (xclbin_path.empty()) {
-            if (detail::jit_compilation_available()) {
-                std::vector<uint8_t> xclbin_data = detail::jit_compile_flash_attn(8, 128, 2048, npu_profile_);
-                if (!xclbin_data.empty()) {
-                    std::string cache_key = detail::make_cache_key("flash_attn", 8, 128, 2048, profile_str_);
-                    cache_->store_xclbin(cache_key, xclbin_data);
-                    xclbin_path = cache_->get_xclbin_path(cache_key);
-                }
-            }
-        }
-
-        if (xclbin_path.empty()) {
-            std::cerr << "Warning: no flash_attn xclbin found for profile " << profile_str_ << "\n";
+            // flash_attn has no working Triton-XDNA transform recipe; CPU fallback only.
             return false;
         }
 
@@ -1491,15 +1480,7 @@ private:
             return create_flash_attn_kernel_from_loaded_xclbin(n_head, head_dim, ctx_len, cache_key);
         }
 
-        // For other shapes, try JIT compilation (required for different configs)
-        if (detail::jit_compilation_available()) {
-            std::vector<uint8_t> xclbin_data = detail::jit_compile_flash_attn(n_head, head_dim, ctx_len, npu_profile_);
-            if (!xclbin_data.empty()) {
-                cache_->store_xclbin(cache_key, xclbin_data);
-                return load_flash_attn_kernel_for_shape(cache_->get_xclbin_path(cache_key), n_head, head_dim, ctx_len, cache_key);
-            }
-        }
-
+        // No JIT for flash_attn (experimental; use CPU fallback).
         return false;
     }
 

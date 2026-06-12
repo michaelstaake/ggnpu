@@ -43,10 +43,9 @@ KERNELS = {
     "rmsnorm": {
         # 2D BLOCK_M x N bf16 kernel (upstream rms_norm example); the 1D
         # scalar-sum form is not tileable by the transform script.
-        # M=1, N=2048 matches Llama 3.2 hidden size (one token row).
         "description": "RMS normalization",
         "params": ["M", "N"],
-        "defaults": {"M": 1, "N": 2048},
+        "defaults": {"M": 32, "N": 256},
         "transform": "rmsnorm_aie2p.mlir",
     },
     "softmax": {
@@ -504,11 +503,11 @@ def build_kernel_script(op: str, params: dict) -> str:
         # keeps a row dimension the transform script can tile at [1]. The 1D
         # form reduces to a scalar chain that is not tileable.
         launch = textwrap.dedent(f"""
-            M, N = {p.get("M", 1)}, {p.get("N", 2048)}
-            BLOCK_M = 1 if M == 1 else 2
+            M, N = {p.get("M", 32)}, {p.get("N", 256)}
+            BLOCK_M = 2
             x = torch.randn(M, N, dtype=torch.bfloat16)
             y = torch.empty(M, N, dtype=torch.bfloat16)
-            grid = (max(1, M // BLOCK_M),)
+            grid = (M // BLOCK_M,)
             compiled = rmsnorm_kernel[grid](x, y, N, 1e-5, BLOCK_M=BLOCK_M, BLOCK_N=N)
         """)
         kernel_src = textwrap.dedent("""

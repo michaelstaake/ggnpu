@@ -168,7 +168,7 @@ bool triton_xdna_available() {
     std::string python = find_python();
     if (python.empty()) return false;
 
-    std::string cmd = python + " -c \"from triton.backends.amd_triton_npu.driver import NPUDriver; print('ok')\" 2>/dev/null";
+    std::string cmd = python + " -c \"from triton.backends.amd_triton_npu.driver import NPUDriver\" >/dev/null 2>&1";
     return std::system(cmd.c_str()) == 0;
 }
 
@@ -242,13 +242,15 @@ std::vector<uint8_t> jit_compile_kernel(const std::string& op_name,
         // For now, use default dimensions
         cmd += " --M 256 --N 256 --K 256";
     } else if (op_name == "rmsnorm") {
-        cmd += " --M 1 --N 2048";
+        cmd += " --M 32 --N 256";
     } else if (op_name == "silu" || op_name == "rope") {
         cmd += " --N 2048";
     } else if (op_name == "softmax") {
         cmd += " --rows 1 --cols 1024";
-    } else if (op_name == "flash_attn") {
-        cmd += " --n_head 8 --head_dim 128 --ctx_len 2048";
+    } else if (op_name == "flash_attn" || op_name == "rope") {
+        // Experimental kernels are skipped by compile_kernels.py unless GGNPU_EXPERIMENTAL=1.
+        std::cerr << "Info: " << op_name << " is experimental; no JIT (set GGNPU_EXPERIMENTAL=1 to try)\n";
+        return {};
     }
 
     // Execute compilation
@@ -318,7 +320,9 @@ std::vector<uint8_t> jit_compile_rmsnorm(int N, int npu_profile) {
     std::string cmd = python + " \"" + script + "\"";
     cmd += " --op rmsnorm --profile " + profile_str;
     cmd += " --output-dir " + xclbin_dir.string();
-    cmd += " --M 1 --N " + std::to_string(N);
+    // Transform recipe only supports 32x256 today; other sizes use CPU fallback.
+    if (N != 256) return {};
+    cmd += " --M 32 --N 256";
 
     std::cerr << "JIT: compiling rmsnorm N=" << N << " for " << profile_str << " (Triton-XDNA)\n";
     if (std::system(cmd.c_str()) != 0) {

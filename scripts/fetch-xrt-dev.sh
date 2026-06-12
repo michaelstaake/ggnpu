@@ -31,7 +31,11 @@ if [ "${1:-}" = "--tools" ]; then
         echo "ERROR: apt-get download failed. Try: sudo apt install libxrt-utils libxrt-utils-npu"
         exit 1
     fi
-    TOOLS_DEB="$(ls -1 libxrt-utils_*.deb xrt-tools_*.deb 2>/dev/null | head -1)"
+    TOOLS_DEB="$(ls -1 libxrt-utils*.deb xrt-tools*.deb 2>/dev/null | head -1)"
+    if [ -z "$TOOLS_DEB" ]; then
+        echo "ERROR: no libxrt-utils .deb downloaded"
+        exit 1
+    fi
     dpkg-deb -x "$TOOLS_DEB" "$SCRIPT_DIR/third_party/xrt-tools"
     test -x "$SCRIPT_DIR/third_party/xrt-tools/usr/bin/xclbinutil" || { echo "ERROR: xclbinutil missing after extract"; exit 1; }
     echo "xclbinutil ready at third_party/xrt-tools/usr/bin/xclbinutil"

@@ -174,6 +174,22 @@ fi
 echo "Compile script: $COMPILE_SCRIPT"
 echo ""
 
+# xclbinutil from third_party needs boost .so (no sudo apt install required)
+XCLBINUTIL="$SCRIPT_DIR/third_party/xrt-tools/usr/bin/xclbinutil"
+if [ -x "$XCLBINUTIL" ]; then
+    export PATH="$SCRIPT_DIR/third_party/xrt-tools/usr/bin:$PATH"
+    BOOST_LIB="$SCRIPT_DIR/third_party/boost-lib/usr/lib/x86_64-linux-gnu"
+    if [ -d "$BOOST_LIB" ]; then
+        export LD_LIBRARY_PATH="${BOOST_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+elif ! command -v xclbinutil >/dev/null 2>&1; then
+    echo "Fetching xclbinutil (libxrt-utils) into third_party/ ..."
+    bash "$SCRIPT_DIR/scripts/fetch-xrt-dev.sh" --tools || true
+    if [ -x "$XCLBINUTIL" ]; then
+        export PATH="$SCRIPT_DIR/third_party/xrt-tools/usr/bin:$PATH"
+    fi
+fi
+
 #====//
 # Build kernels
 #====//
@@ -231,6 +247,17 @@ for kernel_def in "${Kernels[@]}"; do
             if [ -f "$output_xclbin" ]; then
                 size=$(stat -c%s "$output_xclbin" 2>/dev/null || stat -f%z "$output_xclbin" 2>/dev/null || echo "?")
                 echo "OK (${size} bytes)"
+                # Llama hidden=2048: also install shape-specific name for backend lookup
+                if [ "$kernel_name" = "rmsnorm" ] && [[ "$kernel_args" == *"--N 2048"* ]]; then
+                    shaped="$XCLBIN_DIR/rmsnorm_2048_npu${profile}.xclbin"
+                    shaped_seq="$XCLBIN_DIR/rmsnorm_2048_npu${profile}_sequence.bin"
+                    cp -f "$output_xclbin" "$shaped"
+                    seq_src="$XCLBIN_DIR/${kernel_name}_npu${profile}_sequence.bin"
+                    if [ -f "$seq_src" ]; then
+                        cp -f "$seq_src" "$shaped_seq"
+                    fi
+                    echo "  Also installed $shaped"
+                fi
                 SUCCESS=$((SUCCESS + 1))
             else
                 echo "FAILED (xclbin not produced)"

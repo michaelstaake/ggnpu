@@ -1,0 +1,479 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: xrt
+Upstream-Contact: Sonal Santan <sonal.santan@xilinx.com>
+Source: https://github.com/Xilinx/XRT.git
+Files-Excluded:
+ xrt/XRT/src/runtime_src/aie-rt/driver/tests/utest/elf_files/aie_elfs/large_elf
+ xrt/XRT/src/runtime_src/aie-rt/driver/tests/utest/elf_files/aie_elfs/mmul
+ xrt/XRT/src/runtime_src/aie-rt/driver/tests/utest/elf_files/aie_elfs/overlap_elf
+ xrt/XRT/src/runtime_src/aie-rt/driver/tests/utest/elf_files/aie_elfs/passthrough
+ xrt/XRT/src/runtime_src/aie-rt/driver/tests/utest/elf_files/aieml_elfs/passthrough
+ xrt/XRT/src/runtime_src/core/common/aiebu/publish/gradle/wrapper/gradle-wrapper.jar
+ xrt/XRT/src/runtime_src/core/edge/user/test
+
+Files: *
+Copyright: 2016-2022, Xilinx, Inc; 2022-2025, Advanced Micro Devices, Inc
+License: Apache-2.0
+
+Files: xrt/XRT/.github/scripts/clang-tidy-review.py
+ xrt/XRT/.github/workflows/clangtidy-post.yml
+ xrt/XRT/.github/workflows/clangtidy-review.yml
+Copyright: 2020 Peter Hill and 2025 Advanced Micro Devices, Inc. All rights reserved.
+License: Expat
+
+Files: xrt/XRT/LICENSE
+Copyright: 2016-2022, Xilinx, Inc; 2022-2025, Advanced Micro Devices, Inc
+License: Apache-2.0 or GPL-2
+
+Files: xrt/XRT/src/runtime_src/aie-rt/*
+ xrt/XRT/src/runtime_src/core/common/elf/*
+ xrt/XRT/src/runtime_src/tools/xclbinutil/aie-pdi-transform/*
+Copyright: 2016-2022, Xilinx, Inc; 2022-2025, Advanced Micro Devices, Inc
+License: Expat
+
+Files: xrt/XRT/src/runtime_src/core/common/elf/elfio/*
+Copyright: 2001-present, Serge Lamikhov-Center
+License: MIT
+
+Files: xrt/XRT/src/runtime_src/core/common/drv/*
+ xrt/XRT/src/runtime_src/core/edge/include/zynq_ioctl.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/aws/kernel/mgmt/mgmt-sysfs.c
+Copyright: 2017 - 2020 Xilinx, Inc.
+License: Apache-2.0 or GPL-2
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/include/*
+Copyright: 2017 - 2020 Xilinx, Inc.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/include/profile_ioctl.h
+Copyright: 2016-2020 Xilinx, Inc. All rights reserved.
+License: GPL-2
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/*
+Copyright: 2017 - 2020 Xilinx, Inc.
+License: GPL-2
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libqdma/QDMA/DPDK/*
+Copyright: 2017 - 2020 Xilinx, Inc.
+License: BSD-3-clause
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libqdma/QDMA/windows/*
+Copyright: 2017 - 2020 Xilinx, Inc.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/mgmtpf/mgmt-bifurcation-reset.c
+Copyright: 2017 - 2020 Xilinx, Inc.
+License: GPL-2+
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/mgmtpf/mgmt-core.c
+Copyright: 2017-2022 Xilinx, Inc; 2022 Advanced Micro Devices, Inc. All rights reserved
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/mgmtpf/mgmt-utils.c
+Copyright: 2015-2020, Xilinx, Inc.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/subdev/xgq_vmr.c
+Copyright: 2021-2022 Xilinx, Inc; 2022 Advanced Micro Devices, Inc. All rights reserved.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/userpf/xocl_drv.c
+Copyright: 2016-2022 Xilinx, Inc. All rights reserved; 2022 Advanced Micro Devices, Inc. All rights reserved.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/userpf/xocl_sysfs.c
+Copyright: 2016-2022 Xilinx, Inc. All rights reserved.; 2022-2023 Advanced Micro Devices, Inc. All rights reserved.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/xocl_debug.c
+Copyright: 2017 - 2020 Xilinx, Inc.
+License: GPL-2+
+
+Files: xrt/XRT/src/runtime_src/core/include/ert.h
+ xrt/XRT/src/runtime_src/core/include/xclbin.h
+ xrt/XRT/src/runtime_src/core/include/xclfeatures.h
+ xrt/XRT/src/runtime_src/core/include/xrt_error_code.h
+Copyright: 2015-2020, Xilinx Inc
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/include/xclerr_int.h
+ xrt/XRT/src/runtime_src/core/include/xgq_cmd_common.h
+ xrt/XRT/src/runtime_src/core/include/xgq_cmd_ert.h
+ xrt/XRT/src/runtime_src/core/include/xgq_cmd_vmr.h
+ xrt/XRT/src/runtime_src/core/include/xgq_impl.h
+ xrt/XRT/src/runtime_src/core/include/xgq_resp_parser.h
+ xrt/XRT/src/runtime_src/core/include/xrt/deprecated/xclerr.h
+ xrt/XRT/src/runtime_src/core/include/xrt/detail/ert.h
+ xrt/XRT/src/runtime_src/core/include/xrt/detail/xclbin.h
+ xrt/XRT/src/runtime_src/core/include/xrt/detail/xrt_error_code.h
+ xrt/XRT/src/runtime_src/core/include/xrt/detail/xrt_mem.h
+Copyright: 2015-2020, Xilinx Inc
+License: Apache-2.0 or GPL-2+
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/include/cdev_ctrl.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/include/mgmt-ioctl.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/include/qdma_ioctl.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/devices.h
+ xrt/XRT/src/runtime_src/tools/scripts/header.lic
+Copyright: 2015-2020, Xilinx Inc
+License: Apache-2.0 or GPL-2+
+
+Files: xrt/XRT/src/runtime_src/core/pcie/emulation/hw_emu/alveo_shim/xgq_hwemu.cxx
+ xrt/XRT/src/runtime_src/core/pcie/emulation/hw_emu/alveo_shim/xgq_hwemu.h
+ xrt/XRT/src/runtime_src/core/pcie/emulation/hw_emu/alveo_shim/xgq_hwemu_plat.h
+Copyright: 2016-2022, Xilinx, Inc; 2022-2025, Advanced Micro Devices, Inc
+License: Apache-2.0 or GPL-2+
+
+Files: xrt/XRT/src/runtime_src/core/pcie/emulation/hw_emu/zynqu/pllauncher_defines.h
+Copyright: 2016-2022, Xilinx, Inc; 2022-2025, Advanced Micro Devices, Inc
+License: Apache-2.0 or Expat
+
+Files: xrt/XRT/src/runtime_src/core/tools/xbtracer/Detours/LICENSE
+ xrt/XRT/src/runtime_src/core/tools/xbtracer/Detours/LICENSE.md
+Copyright: Microsoft Corporation
+License: Expat
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libqdma/QDMA/linux-kernel/LICENSE
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libqdma/XDMA/linux-kernel/LICENSE
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libqdma/XVSEC/linux-kernel/LICENSE
+Copyright: 2016-present, Xilinx, Inc. All rights reserved.
+License: BSD-3-clause
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/xocl_drv.h
+Copyright: 2016-2022 Xilinx, Inc. All rights reserved.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/aws/kernel/mgmt/mgmt-bit.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/aws/kernel/mgmt/mgmt-bit.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/aws/kernel/mgmt/mgmt-core.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/aws/kernel/mgmt/mgmt-core.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/aws/kernel/mgmt/mgmt-cw.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/aws/kernel/mgmt/mgmt-firewall.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/aws/kernel/mgmt/mgmt-thread.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libxdma.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/mgmtpf/mgmt-core.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/mgmtpf/mgmt-cw.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/mgmtpf/mgmt-ioctl.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/subdev/firewall.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/subdev/icap.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/xocl_thread.c
+Copyright: 2015-2020, Xilinx, Inc.
+License: GPL-2+
+
+Files: xrt/XRT/src/runtime_src/core/include/ert_fa.h
+Copyright: 2020, Xilinx Inc
+License: Apache-2.0 or GPL-2+
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/fdt.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/fdt_addresses.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/fdt_empty_tree.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/fdt.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/fdt_overlay.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/fdt_ro.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/fdt_rw.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/fdt_strerror.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/fdt_sw.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/fdt_wip.c
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/libfdt.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/libfdt_env.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libfdt/libfdt_internal.h
+Copyright: 2006, David Gibson, IBM Corporation.
+License: BSD-2-clause or GPL-2+
+
+Files: xrt/XRT/src/runtime_src/core/common/aiebu/*
+Copyright: 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+License: MIT
+
+Files: xrt/XRT/src/runtime_src/core/common/aiebu/cmake/*
+Copyright: 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+License: Expat
+
+Files: xrt/XRT/src/runtime_src/core/common/aiebu/cmake/config/aiebu.fp.in
+ xrt/XRT/src/runtime_src/core/common/aiebu/cmake/config/version.h.in
+ xrt/XRT/src/runtime_src/core/common/aiebu/cmake/findpackage.cmake
+ xrt/XRT/src/runtime_src/core/common/aiebu/cmake/version.cmake
+ xrt/XRT/src/runtime_src/core/common/aiebu/gradlew
+ xrt/XRT/src/runtime_src/core/common/aiebu/test/cmake-test/check_and_run.bat
+ xrt/XRT/src/runtime_src/core/common/aiebu/test/cmake-test/check_and_run.sh
+ xrt/XRT/src/runtime_src/core/common/aiebu/templates/aie2/stubs.h
+Copyright: 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/common/aiebu/src/cpp/cxxopts/*
+Copyright: 2014-2022, Jarryd Beck
+License: Expat
+
+Files: xrt/XRT/src/runtime_src/core/common/aiebu/src/cpp/cxxopts/test/catch.hpp
+ xrt/XRT/src/runtime_src/core/tools/xbtracer/Detours/tests/catch.hpp
+Copyright: 2024 Two Blue Cubes Ltd. All rights reserved.
+License: BSL-1.0
+
+Files: xrt/XRT/src/runtime_src/core/common/api/aie/xrt_graph.cpp
+Copyright: 2020-2021 Xilinx, Inc. All rights reserved.; 2023 Advanced Micro Devices, Inc. All rights reserved.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/include/xcl_graph.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/include/libxdma_api.h
+ xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/lib/libxdma_api.h
+Copyright: 2016-2020, Xilinx, Inc
+License: Apache-2.0 or GPL-2
+
+Files: xrt/XRT/src/include/1_2/CL/cl_ext.h
+ xrt/XRT/src/include/1_2/CL/cl_ext_xilinx.h
+Copyright: 2008-2015, The Khronos Group Inc.
+License: Khronos
+
+Files: xrt/XRT/src/runtime_src/xocl/api/icd/windows/icd_dispatch.h
+Copyright: 2016-2019, The Khronos Group Inc.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/include/xclerr.h
+Copyright: 2017, Xilinx, Inc.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/include/xocl_ioctl.h
+Copyright: 2017, Xilinx, Inc. All rights reserved.
+License: Apache-2.0 or GPL-2+
+
+Files: xrt/XRT/build/checkpatch/spelling.txt
+Copyright: Xilinx, Inc.
+License: GPL-2
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/subdev/ulite.c
+Copyright: 2006, Peter Korsgaard <jacmet@sunsite.dk>; 2007, Secret Lab Technologies Ltd.; 2020, Chien-Wei Lan <chienwei@xilinx.com>
+License: GPL-2
+
+Files: xrt/XRT/src/runtime_src/core/pcie/driver/linux/xocl/subdev/xiic.c
+Copyright: 2009-2010, Intel Corporation; 2017, Xilinx, Inc.
+License: GPL-2+
+
+Files: xrt/XRT/src/runtime_src/core/common/gsl/*
+Copyright: 2015, Microsoft Corporation. All rights reserved.
+License: MIT
+
+Files: xrt/XRT/src/runtime_src/core/common/gsl/ThirdPartyNotices.txt
+Copyright: 2015, Microsoft Corporation. All rights reserved.
+License: BSD-3-clause
+
+Files: xrt/XRT/src/runtime_src/core/edge/drm/zocl/*
+Copyright: 2017 - 2020 Xilinx, Inc.
+License: Apache-2.0 or GPL-2
+
+Files: xrt/XRT/src/runtime_src/core/edge/drm/zocl/edge/zocl_hwctx.c
+ xrt/XRT/src/runtime_src/core/edge/drm/zocl/include/zocl_hwctx.h
+Copyright: 2017 - 2020 Xilinx, Inc.
+License: Apache-2.0
+
+Files: xrt/XRT/src/runtime_src/core/edge/drm/zocl/LICENSE
+Copyright: 2017 - 2020 Xilinx, Inc.
+License: Apache-2.0 or GPL-2
+
+Files: xrt/XRT/src/runtime_src/core/common/json/nlohmann/*
+Copyright: 2013-2025, Niels Lohmann <https://nlohmann.me>
+License: MIT
+
+Files: xdna/xdna-driver/CMake/*
+ xdna/xdna-driver/CMakeLists.txt
+ xdna/xdna-driver/src/shim/*
+ xdna/xdna-driver/src/shim_ve2/*
+ xdna/xdna-driver/test/*
+ xdna/xdna-driver/tools/*
+Copyright: 2022-2025, Advanced Micro Devices, Inc. All rights reserved.
+License: Apache-2.0
+
+Files: xdna/xdna-driver/src/driver/*
+Copyright: 2022-2025, Advanced Micro Devices, Inc.
+License: GPL-2
+
+Files: xdna/xdna-driver/src/driver/CMakeLists.txt
+ xdna/xdna-driver/src/driver/tools/*
+Copyright: 2022-2025, Advanced Micro Devices, Inc. All rights reserved.
+License: Apache-2.0
+
+Files: xdna/xdna-driver/src/include/uapi/drm_local/amdxdna_accel.h
+Copyright: 2022-2025, Advanced Micro Devices, Inc.
+License: GPL-2
+
+Files: xrt/XRT/NOTICE
+Copyright: 2016-2022, Xilinx, Inc; 2022-2025, Advanced Micro Devices, Inc
+License: Khronos
+
+Files: xdna/xdna-driver/src/shim/virtio/drm_hw.h
+Copyright: 2022, Google LLC
+License: MIT
+
+Files: xdna/xdna-driver/src/shim/virtio/amdxdna_proto.h
+Copyright: 2025, Advanced Micro Devices, Inc.
+License: MIT
+
+Files: xrt/XRT/src/runtime_src/xocl/api/khronos/check_copy_overlap.cpp
+Copyright: 2011, The Khronos Group Inc.
+License: Khronos
+
+Files: debian/*
+Copyright: 2021, Punit Agrawal <punit@debian.org>; 2021,2022, Nobuhiro Iwamatsu <iwamatsu@debian.org>
+License: Apache-2.0
+
+Files: debian/io.xilinx.xrt-xocl-dkms.metainfo.xml
+Copyright: 2021, Punit Agrawal <punit@debian.org>; 2021,2022, Nobuhiro Iwamatsu <iwamatsu@debian.org>
+License: CC0-1.0
+
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+ .
+     http://www.apache.org/licenses/LICENSE-2.0
+ .
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ .
+ On Debian systems, the full text of the Apache License version 2 can
+ be found in /usr/share/common-licenses/Apache-2.0.
+
+License: Khronos
+ Permission is hereby granted, free of charge, to any person obtaining a
+ copy of this software and/or associated documentation files (the
+ "Materials"), to deal in the Materials without restriction, including
+ without limitation the rights to use, copy, modify, merge, publish,
+ distribute, sublicense, and/or sell copies of the Materials, and to
+ permit persons to whom the Materials are furnished to do so, subject to
+ the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included
+ in all copies or substantial portions of the Materials.
+ .
+ THE MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.
+
+License: GPL-2
+ On Debian systems the full text of the GPL-2 can be found in
+  /usr/share/common-licenses/GPL-2
+
+License: GPL-2+
+ On Debian systems the full text of the GPL-2 can be found in
+  /usr/share/common-licenses/GPL-2
+
+License: GPL-3+
+ On Debian systems the full text of the GPL-3 can be found in
+  /usr/share/common-licenses/GPL-3
+
+License: BSD-2-clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ POSSIBILITY OF SUCH DAMAGE.
+
+License: BSD-3-clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions
+ are met:
+ 1. Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+ 3. Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+ A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+ HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+License: Expat
+ Permission is hereby granted, free of charge, to any person obtaining a
+ copy of this software and associated documentation files (the "Software"),
+ to deal in the Software without restriction, including without limitation
+ the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ and/or sell copies of the Software, and to permit persons to whom the
+ Software is furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included
+ in all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+License: BSL-1.0
+ Permission is hereby granted, free of charge, to any person or organization
+ obtaining a copy of the software and accompanying documentation covered by
+ this license (the "Software") to use, reproduce, display, distribute,
+ execute, and transmit the Software, and to prepare derivative works of the
+ Software, and to permit third-parties to whom the Software is furnished to
+ do so, all subject to the following:
+ .
+ The copyright notices in the Software and this entire statement, including
+ the above license grant, this restriction and the following disclaimer,
+ must be included in all copies of the Software, in whole or in part, and
+ all derivative works of the Software, unless such copies or derivative
+ works are solely in the form of machine-executable object code generated by
+ a source language processor.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
+ SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
+ FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
+ ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ DEALINGS IN THE SOFTWARE.
+
+License: MIT
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+
+License: CC0-1.0
+ On Debian systems, the full text of the Creative Commons Zero 1.0 Universal
+ license can be found in /usr/share/common-licenses/CC0-1.0.
