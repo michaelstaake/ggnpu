@@ -6,6 +6,9 @@
 #   ./scripts/build-kernels.sh              # Build with available tools
 #   ./scripts/build-kernels.sh npu6         # Build only for npu6 (Krackan)
 #   ./scripts/build-kernels.sh matmul       # Build only matmul kernel
+#   ./scripts/build-kernels.sh npu6 rmsnorm_2048   # One kernel (low-RAM hosts)
+#
+# C++ rebuild: cmake --build build-npu -j1
 #
 # Kernels built:
 #   - matmul: INT8 matrix multiplication (core bottleneck)
@@ -203,12 +206,17 @@ FAILED=0
 Kernels=(
     "matmul:--M 256 --N 256 --K 256"
     "rmsnorm:--M 32 --N 256"
+    "rmsnorm_2048:--M 2 --N 2048"
     "softmax:--rows 256 --cols 256"
     "silu:--N 8192"
 )
 
-# rope and flash_attn have no working Triton-XDNA transform recipe yet
-# (gather loads / loop-carried accumulators). Build with GGNPU_EXPERIMENTAL=1.
+# Llama 3.2 1B flash attention (32 heads, 64 head_dim, 2048 ctx).
+Kernels+=(
+    "flash_attn_32x64x2048:--n_head 32 --head_dim 64 --ctx_len 2048"
+)
+
+# rope has no working Triton-XDNA transform recipe yet (gather loads).
 if [ -n "${GGNPU_EXPERIMENTAL:-}" ]; then
     Kernels+=(
         "rope:--N 2048 --dims 64"
@@ -226,9 +234,28 @@ for kernel_def in "${Kernels[@]}"; do
 
     echo "Building kernel: $kernel_name"
 
+    # Shape-specific kernels compile under base op name but install with shaped artifact names.
+    compile_op="$kernel_name"
+    shaped_install=""
+    if [ "$kernel_name" = "rmsnorm_2048" ]; then
+        compile_op="rmsnorm"
+        shaped_install="rmsnorm_2048"
+    elif [ "$kernel_name" = "flash_attn_32x64x2048" ]; then
+        compile_op="flash_attn"
+        shaped_install="flash_attn_32x64x2048"
+    fi
+
     for profile in "${PROFILES[@]}"; do
         TOTAL=$((TOTAL + 1))
-        output_xclbin="$XCLBIN_DIR/${kernel_name}_npu${profile}.xclbin"
+
+        if [ -n "$shaped_install" ]; then
+            output_xclbin="$XCLBIN_DIR/${shaped_install}_npu${profile}.xclbin"
+            build_dir="$(mktemp -d)"
+            compile_out_dir="$build_dir"
+        else
+            output_xclbin="$XCLBIN_DIR/${kernel_name}_npu${profile}.xclbin"
+            compile_out_dir="$XCLBIN_DIR"
+        fi
 
         if [ -f "$output_xclbin" ]; then
             echo "  [npu$profile] already exists, skipping"
@@ -239,25 +266,27 @@ for kernel_def in "${Kernels[@]}"; do
         echo -n "  [npu$profile] "
 
         if $PYTHON3_BIN "$COMPILE_SCRIPT" \
-            --op "$kernel_name" \
+            --op "$compile_op" \
             --profile "npu${profile}" \
-            --output-dir "$XCLBIN_DIR" \
+            --output-dir "$compile_out_dir" \
             $kernel_args 2>&1; then
-            
+
+            built_xclbin="${compile_out_dir}/${compile_op}_npu${profile}.xclbin"
+            if [ -n "$shaped_install" ]; then
+                if [ -f "$built_xclbin" ]; then
+                    cp -f "$built_xclbin" "$output_xclbin"
+                    seq_src="${compile_out_dir}/${compile_op}_npu${profile}_sequence.bin"
+                    seq_dst="$XCLBIN_DIR/${shaped_install}_npu${profile}_sequence.bin"
+                    if [ -f "$seq_src" ]; then
+                        cp -f "$seq_src" "$seq_dst"
+                    fi
+                fi
+                rm -rf "$build_dir"
+            fi
+
             if [ -f "$output_xclbin" ]; then
                 size=$(stat -c%s "$output_xclbin" 2>/dev/null || stat -f%z "$output_xclbin" 2>/dev/null || echo "?")
                 echo "OK (${size} bytes)"
-                # Llama hidden=2048: also install shape-specific name for backend lookup
-                if [ "$kernel_name" = "rmsnorm" ] && [[ "$kernel_args" == *"--N 2048"* ]]; then
-                    shaped="$XCLBIN_DIR/rmsnorm_2048_npu${profile}.xclbin"
-                    shaped_seq="$XCLBIN_DIR/rmsnorm_2048_npu${profile}_sequence.bin"
-                    cp -f "$output_xclbin" "$shaped"
-                    seq_src="$XCLBIN_DIR/${kernel_name}_npu${profile}_sequence.bin"
-                    if [ -f "$seq_src" ]; then
-                        cp -f "$seq_src" "$shaped_seq"
-                    fi
-                    echo "  Also installed $shaped"
-                fi
                 SUCCESS=$((SUCCESS + 1))
             else
                 echo "FAILED (xclbin not produced)"
@@ -266,6 +295,7 @@ for kernel_def in "${Kernels[@]}"; do
         else
             echo "FAILED"
             FAILED=$((FAILED + 1))
+            [ -n "$shaped_install" ] && rm -rf "$build_dir" 2>/dev/null || true
         fi
     done
 

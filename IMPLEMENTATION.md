@@ -493,7 +493,7 @@ Assessment of whether the project can run a model on the NPU **today**.
 | rmsnorm/softmax/silu on NPU | xclbins load, dtype mismatch | Kernels are bf16; backend sends f32 — needs marshaling |
 | flash_attn / rope xclbins | Not built | RoPE intentionally on CPU for MVP |
 | Full inference E2E | **Validated** | France prompt coherent on CPU + NPU builds; `test_e2e_logits` |
-| NPU utilization | **Low (~15%)** | Many ops on CPU; INT8 matmul on hidden layers only |
+| NPU utilization | **~15–50%** (generation) | Matmul + SiLU on NPU; RMSNorm N=2048 via `rmsnorm_2048_npu6.xclbin` when built; flash_attn still CPU |
 
 Production commands use the **native host build** (§9). Do **not** rely on `GGNPU_TEST_CPU=ON` in release NPU builds — it allows silent CPU fallback, which violates §2.
 
@@ -501,10 +501,10 @@ Production commands use the **native host build** (§9). Do **not** rely on `GGN
 
 | Gap | File | Impact |
 |-----|------|--------|
-| RMSNorm N=2048 on NPU | `amd_xdna.cpp` | Prebuilt kernel is 32×256; Llama hidden=2048 → CPU fallback (biggest util win) |
-| Flash attention shape | `amd_xdna.cpp`, `main.cpp` | Prebuilt 8×128×2048 vs Llama 32×64 → CPU fallback |
-| SiLU FFN=8192 on NPU | `amd_xdna.cpp` | Llama `ffn_dim=8192` → CPU fallback |
-| Matmul perf: host-side tiling, one tile per `run()` | `amd_xdna.cpp` | ~1 ms per 256³ tile; batch runs, persist weight tiles |
+| RMSNorm N=2048 on NPU | `amd_xdna.cpp`, `build-kernels.sh` | Build `rmsnorm_2048_npu6.xclbin` (`--M 2 --N 2048`); wrong/missing xclbin → CPU fallback |
+| Flash attention shape | `amd_xdna.cpp`, `main.cpp` | Batched 32×64 call; build `flash_attn_32x64x2048_npu6.xclbin` (experimental transform) |
+| SiLU FFN=8192 on NPU | `amd_xdna.cpp` | **Works** when `silu_npu6.xclbin` present |
+| Matmul perf: host-side tiling | `amd_xdna.cpp` | Host weight-tile cache; per-tile DMA (device persist deferred) |
 | RoPE on CPU | `main.cpp` | Correct Llama 3 math; not on NPU yet |
 | Logits projection on CPU (F32 dequant) | `main.cpp` | `compute_logits_f32()` — accurate; not INT8 NPU path |
 | Residual adds on CPU | `main.cpp` | Cheap; acceptable for MVP |

@@ -502,12 +502,15 @@ def build_kernel_script(op: str, params: dict) -> str:
         # 2D BLOCK_M-rows form (upstream rms_norm example): tl.sum over axis=1
         # keeps a row dimension the transform script can tile at [1]. The 1D
         # form reduces to a scalar chain that is not tileable.
+        m_rows = p.get("M", 32)
+        n_cols = p.get("N", 256)
+        block_m = 1 if m_rows < 2 else 2
         launch = textwrap.dedent(f"""
-            M, N = {p.get("M", 32)}, {p.get("N", 256)}
-            BLOCK_M = 2
+            M, N = {m_rows}, {n_cols}
+            BLOCK_M = {block_m}
             x = torch.randn(M, N, dtype=torch.bfloat16)
             y = torch.empty(M, N, dtype=torch.bfloat16)
-            grid = (M // BLOCK_M,)
+            grid = (max(1, M // BLOCK_M),)
             compiled = rmsnorm_kernel[grid](x, y, N, 1e-5, BLOCK_M=BLOCK_M, BLOCK_N=N)
         """)
         kernel_src = textwrap.dedent("""
@@ -611,8 +614,8 @@ def build_kernel_script(op: str, params: dict) -> str:
         launch = textwrap.dedent(f"""
             n_head, head_dim, ctx_len = {n_head}, {head_dim}, {ctx_len}
             Q = torch.randn(n_head, head_dim, dtype=torch.float32)
-            K = torch.randn(ctx_len, head_dim, dtype=torch.float32)
-            V = torch.randn(ctx_len, head_dim, dtype=torch.float32)
+            K = torch.randn(n_head, ctx_len, head_dim, dtype=torch.float32)
+            V = torch.randn(n_head, ctx_len, head_dim, dtype=torch.float32)
             O = torch.empty(n_head, head_dim, dtype=torch.float32)
             grid = lambda META: (n_head,)
             compiled = flash_attn_kernel[grid](
@@ -629,20 +632,22 @@ def build_kernel_script(op: str, params: dict) -> str:
                 pid = tl.program_id(0)
                 q_offs = tl.arange(0, head_dim)
                 q = tl.load(Q + pid * stride_qh + q_offs)
+                k_base = pid * stride_kh
+                v_base = pid * stride_vh
                 m = tl.full([], -1e9, tl.float32)
                 l = tl.full([], 0.0, tl.float32)
                 acc = tl.zeros([head_dim], dtype=tl.float32)
                 for start in range(0, ctx_len, BLOCK_K):
                     k_idx = start + tl.arange(0, BLOCK_K)
                     mask = k_idx < ctx_len
-                    k_row = tl.load(K + k_idx[:, None] * head_dim + q_offs[None, :], mask=mask[:, None], other=0.0)
+                    k_row = tl.load(K + k_base + k_idx[:, None] * head_dim + q_offs[None, :], mask=mask[:, None], other=0.0)
                     scores = tl.sum(q[None, :] * k_row, axis=1)
                     scores = tl.where(mask, scores, -1e9)
                     block_max = tl.max(scores, axis=0)
                     new_m = tl.maximum(m, block_max)
                     alpha = tl.exp(m - new_m)
                     beta = tl.exp(scores - new_m)
-                    v_row = tl.load(V + k_idx[:, None] * head_dim + q_offs[None, :], mask=mask[:, None], other=0.0)
+                    v_row = tl.load(V + v_base + k_idx[:, None] * head_dim + q_offs[None, :], mask=mask[:, None], other=0.0)
                     acc = acc * alpha + tl.sum(beta[:, None] * v_row, axis=0)
                     l = l * alpha + tl.sum(beta, axis=0)
                     m = new_m

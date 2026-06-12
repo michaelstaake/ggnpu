@@ -317,14 +317,14 @@ std::vector<uint8_t> jit_compile_rmsnorm(int N, int npu_profile) {
         if (!data.empty()) return data;
     }
 
+    int M = (N == 256) ? 32 : 2;
     std::string cmd = python + " \"" + script + "\"";
     cmd += " --op rmsnorm --profile " + profile_str;
     cmd += " --output-dir " + xclbin_dir.string();
-    // Transform recipe only supports 32x256 today; other sizes use CPU fallback.
-    if (N != 256) return {};
-    cmd += " --M 32 --N 256";
+    cmd += " --M " + std::to_string(M) + " --N " + std::to_string(N);
 
-    std::cerr << "JIT: compiling rmsnorm N=" << N << " for " << profile_str << " (Triton-XDNA)\n";
+    std::cerr << "JIT: compiling rmsnorm M=" << M << " N=" << N << " for " << profile_str
+              << " (Triton-XDNA)\n";
     if (std::system(cmd.c_str()) != 0) {
         std::cerr << "Error: Triton-XDNA rmsnorm compilation failed\n";
         return {};

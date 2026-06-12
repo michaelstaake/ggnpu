@@ -34,6 +34,7 @@ constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256
 // xclbins still work for N=256 bench sizes; rebuild with compile_kernels.py for 2048.
 constexpr int kRmsnormKernelCols = 256;
 constexpr int kRmsnormKernelHidden = 2048;
+constexpr int kRmsnormHiddenPadRows = 2;  // M=2,N=2048 kernel; row 0 duplicated for Triton tiling
 constexpr int kSiluKernelSize = 8192;  // prebuilt silu xclbin default N
 constexpr int kSoftmaxKernelRows = 256;  // prebuilt softmax xclbin is 256x256 bf16
 constexpr int kSoftmaxKernelCols = 256;
@@ -252,6 +253,37 @@ struct CachedSiluKernel {
     int size;
 };
 
+struct BTileKey {
+    const int8_t* B = nullptr;
+    int n0 = 0;
+    int k0 = 0;
+    int nc = 0;
+    int kc = 0;
+    int K = 0;
+
+    bool operator==(const BTileKey& o) const {
+        return B == o.B && n0 == o.n0 && k0 == o.k0 && nc == o.nc && kc == o.kc && K == o.K;
+    }
+};
+
+struct BTileKeyHash {
+    size_t operator()(const BTileKey& k) const noexcept {
+        size_t h = std::hash<const void*>{}(k.B);
+        h ^= std::hash<int>{}(k.n0) << 1;
+        h ^= std::hash<int>{}(k.k0) << 2;
+        h ^= std::hash<int>{}(k.nc) << 3;
+        h ^= std::hash<int>{}(k.kc) << 4;
+        h ^= std::hash<int>{}(k.K) << 5;
+        return h;
+    }
+};
+
+struct FallbackStats {
+    int rmsnorm = 0;
+    int flash_attn = 0;
+    int silu = 0;
+};
+
 static void rms_norm_cpu_ref(const RmsNormParams& params) {
     float variance = 0.0f;
     for (int i = 0; i < params.size; i++) variance += params.input[i] * params.input[i];
@@ -370,9 +402,19 @@ public:
             std::cerr << "  Prebuilt xclbins are needed, or install Triton-XDNA for JIT compilation.\n";
             std::cerr << "  Run: bash scripts/setup-triton-env.sh && ./scripts/build-kernels.sh npu6\n";
         }
+
+        // Preload Llama-shaped flash attention if present (optional).
+        load_flash_attn_xclbin();
     }
 
-    ~AmdXdnaBackend() override = default;
+    ~AmdXdnaBackend() override {
+        if (fallback_stats_.rmsnorm > 0 || fallback_stats_.flash_attn > 0 ||
+            fallback_stats_.silu > 0) {
+            std::cerr << "NPU fallback ops: rmsnorm=" << fallback_stats_.rmsnorm
+                      << " flash_attn=" << fallback_stats_.flash_attn
+                      << " silu=" << fallback_stats_.silu << "\n";
+        }
+    }
 
     Status mul_mat_q(const MulMatParams& params) override {
         if (!params.A || !params.B || !params.C) {
@@ -413,9 +455,20 @@ public:
         size_t tile_bytes_in = static_cast<size_t>(T) * T;                  // int8
         size_t tile_bytes_out = static_cast<size_t>(T) * T * sizeof(int32_t);
 
-        if (!buf_a_ || buf_a_->size() < tile_bytes_in) buf_a_ = buf_mgr_->alloc(tile_bytes_in, true);
-        if (!buf_b_ || buf_b_->size() < tile_bytes_in) buf_b_ = buf_mgr_->alloc(tile_bytes_in, true);
-        if (!buf_c_ || buf_c_->size() < tile_bytes_out) buf_c_ = buf_mgr_->alloc(tile_bytes_out, true);
+        const int ping = matmul_buf_ping_;
+        matmul_buf_ping_ = 1 - matmul_buf_ping_;
+        if (!buf_a_[ping] || buf_a_[ping]->size() < tile_bytes_in) {
+            buf_a_[ping] = buf_mgr_->alloc(tile_bytes_in, true);
+        }
+        if (!buf_b_[ping] || buf_b_[ping]->size() < tile_bytes_in) {
+            buf_b_[ping] = buf_mgr_->alloc(tile_bytes_in, true);
+        }
+        if (!buf_c_[ping] || buf_c_[ping]->size() < tile_bytes_out) {
+            buf_c_[ping] = buf_mgr_->alloc(tile_bytes_out, true);
+        }
+        auto& buf_a = buf_a_[ping];
+        auto& buf_b = buf_b_[ping];
+        auto& buf_c = buf_c_[ping];
 
         const float* A = static_cast<const float*>(params.A);
         float* C = static_cast<float*>(params.C);
@@ -471,43 +524,52 @@ public:
                                 to_i8(A[(m0 + i) * params.lda + (k0 + k)] * inv_a);
                     }
 
-                    std::fill(b_tile.begin(), b_tile.end(), 0);
+                    const int8_t* B_int8 = nullptr;
                     if (params.B_type == GgmlType::I8 ||
                         params.B_type == GgmlType::Q4_0 ||
                         params.B_type == GgmlType::Q4_K ||
                         params.B_type == GgmlType::Q6_K ||
                         params.B_type == GgmlType::Q8_0) {
-                        // Already-decoded INT8 weights (from weight cache or raw I8).
-                        // Quantized types here mean "decode already done on host".
-                        const int8_t* B = static_cast<const int8_t*>(params.B);
-                        if (kq_path) {
-                            // Decoded buffer keeps GGUF row-major order:
-                            // N rows of K values -> B[n * K + k]
-                            for (int k = 0; k < kc; k++)
-                                for (int j = 0; j < nc; j++)
-                                    b_tile[k * T + j] = B[static_cast<size_t>(n0 + j) * K + (k0 + k)];
-                        } else {
-                            for (int k = 0; k < kc; k++)
-                                for (int j = 0; j < nc; j++)
-                                    b_tile[k * T + j] = B[(k0 + k) * params.ldb + (n0 + j)];
-                        }
-                    } else if (params.B_type == GgmlType::F32) {
-                        const float* B = static_cast<const float*>(params.B);
-                        for (int k = 0; k < kc; k++)
-                            for (int j = 0; j < nc; j++)
-                                b_tile[k * T + j] = to_i8(B[(k0 + k) * params.ldb + (n0 + j)]);
-                    } else {
-                        std::cerr << "Error: matmul B_type not supported on NPU path yet\n";
-                        last_status_ = Status::INVALID_PARAM;
-                        return last_status_;
+                        B_int8 = static_cast<const int8_t*>(params.B);
                     }
 
-                    buf_mgr_->copy_to(*buf_a_, a_tile.data(), tile_bytes_in);
-                    buf_mgr_->copy_to(*buf_b_, b_tile.data(), tile_bytes_in);
+                    BTileKey bkey{B_int8, n0, k0, nc, kc, K};
+                    auto b_cached = b_tile_cache_.find(bkey);
+                    if (b_cached == b_tile_cache_.end()) {
+                        std::fill(b_tile.begin(), b_tile.end(), 0);
+                        if (B_int8) {
+                            if (kq_path) {
+                                for (int k = 0; k < kc; k++)
+                                    for (int j = 0; j < nc; j++)
+                                        b_tile[k * T + j] =
+                                            B_int8[static_cast<size_t>(n0 + j) * K + (k0 + k)];
+                            } else {
+                                for (int k = 0; k < kc; k++)
+                                    for (int j = 0; j < nc; j++)
+                                        b_tile[k * T + j] =
+                                            B_int8[(k0 + k) * params.ldb + (n0 + j)];
+                            }
+                        } else if (params.B_type == GgmlType::F32) {
+                            const float* B = static_cast<const float*>(params.B);
+                            for (int k = 0; k < kc; k++)
+                                for (int j = 0; j < nc; j++)
+                                    b_tile[k * T + j] = to_i8(B[(k0 + k) * params.ldb + (n0 + j)]);
+                        } else {
+                            std::cerr << "Error: matmul B_type not supported on NPU path yet\n";
+                            last_status_ = Status::INVALID_PARAM;
+                            return last_status_;
+                        }
+                        b_cached = b_tile_cache_.emplace(bkey, b_tile).first;
+                    }
+
+                    buf_mgr_->copy_to(*buf_a, a_tile.data(), tile_bytes_in);
+                    // Host b_tile_cache_ avoids re-packing; always DMA each tile because
+                    // buf_b ping-pong buffers are shared across all keys in one matmul.
+                    buf_mgr_->copy_to(*buf_b, b_cached->second.data(), tile_bytes_in);
 
                     try {
                         kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
-                                   buf_a_->handle(), buf_b_->handle(), buf_c_->handle());
+                                   buf_a->handle(), buf_b->handle(), buf_c->handle());
                         kernel.run.wait();
                     } catch (const std::exception& e) {
                         std::cerr << "Error: matmul kernel execution failed: " << e.what() << "\n";
@@ -515,7 +577,7 @@ public:
                         return last_status_;
                     }
 
-                    buf_mgr_->copy_from(*buf_c_, c_tile.data(), tile_bytes_out);
+                    buf_mgr_->copy_from(*buf_c, c_tile.data(), tile_bytes_out);
 
                     for (int i = 0; i < mc; i++) {
                         const float a_scale = a_scales[static_cast<size_t>(m0 + i)];
@@ -563,6 +625,7 @@ public:
                     std::cerr << "Warning: rmsnorm NPU kernel unavailable; using CPU fallback\n";
                     warned = true;
                 }
+                fallback_stats_.rmsnorm++;
                 rms_norm_cpu_ref(params);
                 return Status::OK;
             }
@@ -573,14 +636,21 @@ public:
         const float* input_ptr = npu_params.input;
         float* output_ptr = npu_params.output;
 
-        // RMSNorm kernels are BF16 — convert f32 input → bf16 for DMA
-        size_t bf16_bytes = N * sizeof(uint16_t);
+        // RMSNorm kernels are BF16 — convert f32 input → bf16 for DMA.
+        // Llama hidden=2048 uses M=2,N=2048 bf16 kernel; duplicate row 0 into both rows.
+        const int npu_rows = (N == kRmsnormKernelHidden) ? kRmsnormHiddenPadRows : 1;
+        const size_t row_bf16_bytes = static_cast<size_t>(N) * sizeof(uint16_t);
+        const size_t bf16_bytes = static_cast<size_t>(npu_rows) * row_bf16_bytes;
         std::vector<uint8_t> bf16_input;
         xrt::bo buf_bf16_in;
 
         if (kernel.bo_instr && kernel.instr_words > 0) {
-            // BF16 kernel with instruction sequence: convert f32→bf16, pass opcode+instr
-            bf16_input = convert_f32_to_bf16(input_ptr, N);
+            std::vector<uint8_t> row_bf16 = convert_f32_to_bf16(input_ptr, N);
+            bf16_input.resize(bf16_bytes);
+            for (int r = 0; r < npu_rows; r++) {
+                std::memcpy(bf16_input.data() + static_cast<size_t>(r) * row_bf16_bytes,
+                            row_bf16.data(), row_bf16_bytes);
+            }
 
             buf_bf16_in = make_data_bo(*device_, bf16_bytes);
             void* mapped = buf_bf16_in.map<void*>();
@@ -596,11 +666,11 @@ public:
             } catch (const std::exception& e) {
                 std::cerr << "Warning: rmsnorm kernel execution failed (" << e.what()
                           << "); using CPU fallback\n";
+                fallback_stats_.rmsnorm++;
                 rms_norm_cpu_ref(params);
                 return Status::OK;
             }
 
-            // Convert bf16 output → f32
             std::vector<uint8_t> bf16_out_data(bf16_bytes);
             buf_bf16_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
             void* mapped_out = buf_bf16_out.map<void*>();
@@ -759,6 +829,7 @@ public:
         
         // Prebuilt SiLU xclbin is fixed-size 8192 (Llama 1B/3B FFN).
         if (N != kSiluKernelSize) {
+            fallback_stats_.silu++;
             silu_cpu_ref(params);
             return Status::OK;
         }
@@ -775,6 +846,7 @@ public:
                     std::cerr << "Warning: SiLU NPU kernel unavailable; using CPU fallback\n";
                     warned = true;
                 }
+                fallback_stats_.silu++;
                 silu_cpu_ref(params);
                 return Status::OK;
             }
@@ -805,6 +877,7 @@ public:
             } catch (const std::exception& e) {
                 std::cerr << "Warning: SiLU kernel execution failed (" << e.what()
                           << "); using CPU fallback\n";
+                fallback_stats_.silu++;
                 silu_cpu_ref(params);
                 return Status::OK;
             }
@@ -832,6 +905,7 @@ public:
             } catch (const std::exception& e) {
                 std::cerr << "Warning: SiLU kernel execution failed (" << e.what()
                           << "); using CPU fallback\n";
+                fallback_stats_.silu++;
                 silu_cpu_ref(params);
                 return Status::OK;
             }
@@ -864,6 +938,7 @@ public:
                     std::cerr << "Warning: flash_attn NPU kernel unavailable; using CPU fallback\n";
                     warned = true;
                 }
+                fallback_stats_.flash_attn++;
                 flash_attn_cpu_ref(params);
                 return Status::OK;
             }
@@ -872,10 +947,10 @@ public:
 
         auto& kernel = it->second;
 
-        size_t size_q = n_head * head_dim * sizeof(float);
-        size_t size_k = ctx_len * head_dim * sizeof(float);
-        size_t size_v = ctx_len * head_dim * sizeof(float);
-        size_t size_out = n_head * head_dim * sizeof(float);
+        size_t size_q = static_cast<size_t>(n_head) * head_dim * sizeof(float);
+        size_t size_k = static_cast<size_t>(n_head) * ctx_len * head_dim * sizeof(float);
+        size_t size_v = static_cast<size_t>(n_head) * ctx_len * head_dim * sizeof(float);
+        size_t size_out = static_cast<size_t>(n_head) * head_dim * sizeof(float);
 
         if (!buf_fa_q_ || buf_fa_q_->size() < size_q) {
             buf_fa_q_ = buf_mgr_->alloc(size_q, true);
@@ -1475,12 +1550,20 @@ private:
             return load_flash_attn_kernel_for_shape(cached_path, n_head, head_dim, ctx_len, cache_key);
         }
 
-        // Only reuse prebuilt kernel for matching shape (8 heads, 128 head_dim, 2048 ctx)
-        if (n_head == kFlashAttnHeads && head_dim == kFlashAttnHeadDim && ctx_len == kFlashAttnCtxLen && hw_ctx_fa_) {
+        std::string shaped_name = "flash_attn_" + std::to_string(n_head) + "x" +
+                                  std::to_string(head_dim) + "x" + std::to_string(ctx_len) + "_" +
+                                  profile_str_ + ".xclbin";
+        std::string shaped_path = detail::find_prebuilt_xclbin(shaped_name, cache_dir_);
+        if (!shaped_path.empty()) {
+            return load_flash_attn_kernel_for_shape(shaped_path, n_head, head_dim, ctx_len, cache_key);
+        }
+
+        // Reuse generic prebuilt kernel for matching shape (8 heads, 128 head_dim, 2048 ctx).
+        if (n_head == kFlashAttnHeads && head_dim == kFlashAttnHeadDim && ctx_len == kFlashAttnCtxLen &&
+            hw_ctx_fa_) {
             return create_flash_attn_kernel_from_loaded_xclbin(n_head, head_dim, ctx_len, cache_key);
         }
 
-        // No JIT for flash_attn (experimental; use CPU fallback).
         return false;
     }
 
@@ -1536,9 +1619,11 @@ private:
     std::vector<uint8_t> xclbin_data_fa_;
     xrt::hw_context hw_ctx_fa_;
 
-    std::shared_ptr<XrtBuffer> buf_a_;
-    std::shared_ptr<XrtBuffer> buf_b_;
-    std::shared_ptr<XrtBuffer> buf_c_;
+    std::shared_ptr<XrtBuffer> buf_a_[2];
+    std::shared_ptr<XrtBuffer> buf_b_[2];
+    std::shared_ptr<XrtBuffer> buf_c_[2];
+    int matmul_buf_ping_ = 0;
+    std::unordered_map<BTileKey, std::vector<int8_t>, BTileKeyHash> b_tile_cache_;
 
     std::shared_ptr<XrtBuffer> buf_rmsnorm_in_;
     std::shared_ptr<XrtBuffer> buf_rmsnorm_out_;
@@ -1568,6 +1653,7 @@ private:
 
     Status last_status_;
     mutable std::mutex mutex_;
+    FallbackStats fallback_stats_;
 };
 
 std::shared_ptr<Backend> create_amd_xdna_backend(int device_id) {
