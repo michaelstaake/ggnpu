@@ -19,10 +19,58 @@
 #include "kv_cache.h"
 #include "tokenizer.h"
 #include "weight_cache.h"
+#include "quant/kquant.h"
 
 namespace ggnpu {
 
 namespace {
+
+// Dequantize one row from a mmap'd GGUF weight tensor (accurate; no INT8 cache).
+void dequant_tensor_row(const TensorView* tv, int row, float* out, int row_dim) {
+    if (!tv || !tv->data || row_dim <= 0) return;
+
+    if (tv->type == GgmlType::F32) {
+        const float* src = reinterpret_cast<const float*>(tv->data);
+        std::memcpy(out, src + static_cast<size_t>(row) * row_dim, static_cast<size_t>(row_dim) * sizeof(float));
+        return;
+    }
+
+    const size_t blocks_per_row =
+        (static_cast<size_t>(row_dim) + QK_K - 1) / QK_K;
+
+    if (tv->type == GgmlType::Q6_K) {
+        const size_t row_bytes = blocks_per_row * Q6_K_BLOCK_BYTES;
+        const uint8_t* row_data =
+            static_cast<const uint8_t*>(tv->data) + static_cast<size_t>(row) * row_bytes;
+        std::vector<float> block_f32(QK_K);
+        for (size_t b = 0; b < blocks_per_row; b++) {
+            dequant_q6_k_block(row_data + b * Q6_K_BLOCK_BYTES, block_f32.data());
+            for (size_t j = 0; j < QK_K; j++) {
+                size_t k = b * QK_K + j;
+                if (k < static_cast<size_t>(row_dim)) {
+                    out[k] = block_f32[j];
+                }
+            }
+        }
+        return;
+    }
+
+    if (tv->type == GgmlType::Q4_K) {
+        const size_t row_bytes = blocks_per_row * Q4_K_BLOCK_BYTES;
+        const uint8_t* row_data =
+            static_cast<const uint8_t*>(tv->data) + static_cast<size_t>(row) * row_bytes;
+        std::vector<float> block_f32(QK_K);
+        for (size_t b = 0; b < blocks_per_row; b++) {
+            dequant_q4_k_block(row_data + b * Q4_K_BLOCK_BYTES, block_f32.data());
+            for (size_t j = 0; j < QK_K; j++) {
+                size_t k = b * QK_K + j;
+                if (k < static_cast<size_t>(row_dim)) {
+                    out[k] = block_f32[j];
+                }
+            }
+        }
+    }
+}
 
 constexpr const char* VERSION = "0.1.0";
 
@@ -640,10 +688,14 @@ int main(int argc, char* argv[]) {
     std::vector<float> ffn_silu;
     std::vector<float> logits(static_cast<size_t>(hparams.vocab_size));
 
-    // RoPE frequency buffer
-    std::vector<float> rope_freqs(head_dim / 2);
-    for (int i = 0; i < head_dim / 2; i++) {
-        rope_freqs[i] = 1.0f / std::pow(rope_freq_base, static_cast<float>(i * 2) / head_dim) / rope_freq_scale;
+    // Llama 3+ ships rope_freqs.weight as per-dimension factors for ggml_rope_ext (not divisors).
+    std::vector<float> rope_freq_factors(head_dim / 2, 1.0f);
+    const TensorView* rope_freqs_t = find_tensor(model, "rope_freqs.weight");
+    if (rope_freqs_t && rope_freqs_t->type == GgmlType::F32) {
+        const float* rf = get_float_ptr(rope_freqs_t);
+        for (int i = 0; i < head_dim / 2; i++) {
+            rope_freq_factors[static_cast<size_t>(i)] = rf[i];
+        }
     }
 
     uint64_t rng_seed = params.seed;
@@ -656,13 +708,18 @@ int main(int argc, char* argv[]) {
     std::vector<int> current_tokens = input_tokens;
 
     auto apply_rope = [&](float* out, const float* inp, int n_heads, int64_t offset,
-                          int n_dims, const std::vector<float>& freqs) {
+                          int n_dims, const std::vector<float>& freq_factors) {
         for (int h = 0; h < n_heads; h++) {
             for (int i = 0; i < n_dims / 2; i++) {
-                float freq = freqs[i];
-                float val = static_cast<float>(offset) * freq;
-                float cos_val = std::cos(val);
-                float sin_val = std::sin(val);
+                float ff = (i < static_cast<int>(freq_factors.size()))
+                               ? freq_factors[static_cast<size_t>(i)]
+                               : 1.0f;
+                if (ff == 0.0f) ff = 1.0f;
+                float wavelength = std::pow(
+                    rope_freq_base, 2.0f * static_cast<float>(i) / static_cast<float>(n_dims));
+                float angle = rope_freq_scale * static_cast<float>(offset) / (wavelength * ff);
+                float cos_val = std::cos(angle);
+                float sin_val = std::sin(angle);
 
                 float v0 = inp[h * n_dims + i];
                 float v1 = inp[h * n_dims + i + n_dims / 2];
@@ -685,15 +742,14 @@ int main(int argc, char* argv[]) {
         }
     };
 
+    const bool npu_matmul = (backend->name() == "amd_xdna");
+
     auto mul_mat_weight = [&](const float* A, const TensorView* weight, float* C,
                               int M, int N, int K, int lda, int ldb, int ldc) {
         if (!weight) return;
-        const int8_t* decoded = weight_cache.get_or_decode(*weight);
-        if (!decoded) return;
 
         MulMatParams mat_params;
         mat_params.A = A;
-        mat_params.B = decoded;
         mat_params.C = C;
         mat_params.M = M;
         mat_params.N = N;
@@ -703,7 +759,18 @@ int main(int argc, char* argv[]) {
         mat_params.ldc = ldc;
         mat_params.n_batches = 1;
         mat_params.B_type = weight->type;
-        attach_kquant_scales(mat_params, weight, weight_cache);
+        mat_params.scales = nullptr;
+        mat_params.n_weight_scales = 0;
+
+        if (npu_matmul) {
+            const int8_t* decoded = weight_cache.get_or_decode(*weight);
+            if (!decoded) return;
+            mat_params.B = decoded;
+            attach_kquant_scales(mat_params, weight, weight_cache);
+        } else {
+            // CPU reference dequantizes from raw GGUF block layout (not INT8 cache).
+            mat_params.B = weight->data;
+        }
         backend->mul_mat_q(mat_params);
     };
 
@@ -1063,8 +1130,8 @@ int main(int argc, char* argv[]) {
                                hidden_size, kv_dim, kv_dim)) return false;
                 backend->sync();
 
-                apply_rope(q_r.data(), q.data(), num_heads, 0, head_dim, rope_freqs);
-                apply_rope(k_r.data(), k.data(), num_kv_heads, 0, head_dim, rope_freqs);
+                apply_rope(q_r.data(), q.data(), num_heads, 0, head_dim, rope_freq_factors);
+                apply_rope(k_r.data(), k.data(), num_kv_heads, 0, head_dim, rope_freq_factors);
 
                 std::vector<float> attn_out(hidden_size, 0.0f);
                 for (int h = 0; h < num_heads; h++) {
@@ -1136,37 +1203,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Dequantize token embeddings once before the generation loop
     const TensorView* tok_embd = find_tensor(model, "token_embd.weight");
-    std::vector<float> tok_embd_f32;
-    const float* embd_data = nullptr;
-    if (tok_embd) {
-        if (tok_embd->type == GgmlType::F32) {
-            embd_data = get_float_ptr(tok_embd);
-        } else {
-            const int8_t* decoded = weight_cache.get_or_decode(*tok_embd);
-            if (decoded) {
-                int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
-                int64_t vocab_size = static_cast<int64_t>(hparams.vocab_size);
-                const auto& embd_scales = weight_cache.get_scales(*tok_embd);
-                const bool per_row = embd_scales.size() > 1;
-                tok_embd_f32.resize(static_cast<size_t>(vocab_size * embd_dim));
-                for (int64_t i = 0; i < vocab_size; i++) {
-                    float row_scale = embd_scales.empty() ? 1.0f
-                        : (per_row ? embd_scales[static_cast<size_t>(i)] : embd_scales[0]);
-                    for (int64_t d = 0; d < embd_dim; d++) {
-                        tok_embd_f32[static_cast<size_t>(i * embd_dim + d)] =
-                            static_cast<float>(decoded[static_cast<size_t>(i * embd_dim + d)]) *
-                            row_scale;
-                    }
-                }
-                embd_data = tok_embd_f32.data();
-                std::cout << "  Dequantized token_embd.weight ("
-                    << ggml_type_name(tok_embd->type) << " -> F32)\n";
-            }
-        }
-    }
-
     const TensorView* output_w = find_tensor(model, "output.weight");
     const TensorView* logits_w = output_w ? output_w : tok_embd;
 
@@ -1178,12 +1215,10 @@ int main(int argc, char* argv[]) {
         int n_tokens = static_cast<int>(current_tokens.size());
         if (n_tokens == 0) break;
 
-        // Embedding lookup - one hidden vector per token
-        if (!embd_data) {
+        if (!tok_embd) {
             std::cerr << "Error: token_embd.weight not available\n";
             break;
         }
-        int64_t embd_dim = static_cast<int64_t>(hparams.embedding_length);
 
         inp_embd.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
         inp_norm.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
@@ -1199,11 +1234,9 @@ int main(int argc, char* argv[]) {
         ffn_silu.assign(static_cast<size_t>(n_tokens) * ffn_size, 0.0f);
 
         for (int t = 0; t < n_tokens; t++) {
-            int tok_id = current_tokens[t];
-            for (int d = 0; d < hidden_size; d++) {
-                inp_embd[static_cast<size_t>(t) * hidden_size + d] =
-                    embd_data[tok_id * embd_dim + d];
-            }
+            dequant_tensor_row(tok_embd, current_tokens[t],
+                               inp_embd.data() + static_cast<size_t>(t) * hidden_size,
+                               hidden_size);
         }
 
         // Transformer layers
@@ -1239,10 +1272,10 @@ int main(int argc, char* argv[]) {
                 int64_t token_pos = pos + t;
                 apply_rope(q_rope.data() + t * hidden_size,
                            q_proj.data() + t * hidden_size,
-                           num_heads, token_pos, head_dim, rope_freqs);
+                           num_heads, token_pos, head_dim, rope_freq_factors);
                 apply_rope(k_rope.data() + t * num_kv_heads * head_dim,
                            k_proj.data() + t * num_kv_heads * head_dim,
-                           num_kv_heads, token_pos, head_dim, rope_freqs);
+                           num_kv_heads, token_pos, head_dim, rope_freq_factors);
             }
 
             // Store KV in cache (per token row)
@@ -1365,7 +1398,7 @@ int main(int argc, char* argv[]) {
         rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
                  get_float_ptr(output_norm_w));
 
-        // Logits projection: hidden @ output.weight^T via NPU matmul (M=1)
+        // Logits: hidden @ weight^T (tied to token_embd when output.weight absent)
         if (logits_w) {
             std::fill(logits.begin(), logits.end(), 0.0f);
             const float* last_hidden =
@@ -1395,7 +1428,7 @@ int main(int argc, char* argv[]) {
         pos += n_tokens;
         generated++;
 
-        if (next_token == tokenizer.eos_token_id() || next_token == 0) break;
+        if (next_token == tokenizer.eos_token_id()) break;
         if (pos >= ctx_size) break;
     }
 
