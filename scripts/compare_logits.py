@@ -23,7 +23,8 @@ LOGIT_TOL = 0.15
 
 
 def find_ggnpu() -> Path:
-    for candidate in (ROOT / "build" / "ggnpu", ROOT / "build-npu" / "ggnpu"):
+    # Prefer NPU production build when present (true hardware regression path).
+    for candidate in (ROOT / "build-npu" / "ggnpu", ROOT / "build" / "ggnpu"):
         if candidate.exists():
             return candidate
     raise FileNotFoundError("ggnpu binary not found under build/ or build-npu/")

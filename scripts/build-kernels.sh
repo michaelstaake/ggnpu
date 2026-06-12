@@ -264,10 +264,22 @@ for kernel_def in "${Kernels[@]}"; do
             compile_out_dir="$XCLBIN_DIR"
         fi
 
-        if [ -f "$output_xclbin" ]; then
+        output_seq=""
+        if [ -n "$shaped_install" ]; then
+            output_seq="$XCLBIN_DIR/${shaped_install}_npu${profile}_sequence.bin"
+        else
+            output_seq="$XCLBIN_DIR/${kernel_name}_npu${profile}_sequence.bin"
+        fi
+
+        if [ -f "$output_xclbin" ] && [ -f "$output_seq" ]; then
             echo "  [npu$profile] already exists, skipping"
             SUCCESS=$((SUCCESS + 1))
             continue
+        fi
+
+        if [ -f "$output_xclbin" ] && [ ! -f "$output_seq" ]; then
+            echo "  [npu$profile] xclbin present but sequence missing, rebuilding"
+            rm -f "$output_xclbin"
         fi
 
         echo -n "  [npu$profile] "

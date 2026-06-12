@@ -524,8 +524,7 @@ def build_kernel_script(op: str, params: dict) -> str:
                 x = tl.load(X + offsets)
                 x_f32 = x.to(tl.float32)
                 x_sq = x_f32 * x_f32
-                x_sq_bf16 = x_sq.to(x.dtype)  # AIE2P only supports bf16 vector add
-                sum_sq = tl.sum(x_sq_bf16, axis=1).to(tl.float32)
+                sum_sq = tl.sum(x_sq, axis=1)
                 mean_sq = sum_sq / N
                 rstd = tl.math.rsqrt(mean_sq + eps)
                 y = (x_f32 * rstd[:, None]).to(x.dtype)
