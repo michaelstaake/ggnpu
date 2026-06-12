@@ -15,8 +15,8 @@
 #include "tensor.h"
 #include "model.h"
 #include "backend.h"
-#include "graph.h"
 #include "cache.h"
+#include "bf16.h"
 #include "kv_cache.h"
 #include "tokenizer.h"
 #include "weight_cache.h"
@@ -300,24 +300,8 @@ const char* status_name(Status status) {
     }
 }
 
-// Match NPU bf16 DMA path for bench-layer RMSNorm comparisons.
-static float bf16_roundtrip_f32(float f) {
-    uint32_t bits = 0;
-    std::memcpy(&bits, &f, sizeof(bits));
-    uint32_t lsb = (bits >> 16) & 1;
-    bits += 0x7fff + lsb;
-    uint16_t b = static_cast<uint16_t>(bits >> 16);
-    uint32_t out_bits = static_cast<uint32_t>(b) << 16;
-    float result = 0.0f;
-    std::memcpy(&result, &out_bits, sizeof(result));
-    return result;
-}
-
-static void bf16_roundtrip_vector(const float* in, float* out, int n) {
-    for (int i = 0; i < n; i++) {
-        out[i] = bf16_roundtrip_f32(in[i]);
-    }
-}
+// BF16 roundtrip functions are in src/utils/bf16.cpp (shared header: ggnpu/bf16.h)
+// Used here for bench-layer RMSNorm comparisons matching NPU DMA path.
 
 struct CompareResult {
     float max_diff = 0.0f;

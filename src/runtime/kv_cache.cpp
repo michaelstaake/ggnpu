@@ -105,6 +105,7 @@ uint64_t KVCache::current_position() const { return current_pos_; }
 void KVCache::set_position(uint64_t pos) { current_pos_ = std::min(pos, n_ctx_); }
 void KVCache::increment_position(uint64_t n) { current_pos_ = std::min(current_pos_ + n, n_ctx_); }
 uint64_t KVCache::capacity() const { return n_ctx_; }
+uint64_t KVCache::n_ctx() const { return n_ctx_; }
 uint64_t KVCache::n_layers() const { return n_layers_; }
 uint64_t KVCache::n_head_kv() const { return n_head_kv_; }
 uint64_t KVCache::head_dim() const { return head_dim_; }

@@ -69,9 +69,9 @@ set(LIB_SOURCES
     src/quant/q6_k.cpp
     src/quant/quant.cpp
     src/arch/llama/llama.cpp
-    src/graph/graph.cpp
     src/runtime/kv_cache.cpp
     src/cache/cache.cpp
+    src/utils/bf16.cpp
     src/backends/cpu_ref/cpu_ref.cpp
     src/cli/tokenizer.cpp
     src/cli/unicode.cpp
@@ -81,7 +81,6 @@ set(LIB_SOURCES
 if(GGNPU_NPU_BACKEND)
     list(APPEND LIB_SOURCES
         src/backends/amd_xdna/amd_xdna.cpp
-        src/backends/amd_xdna/buffer.cpp
         src/backends/amd_xdna/kernels.cpp
     )
 endif()
@@ -118,16 +117,18 @@ if(GGNPU_BUILD_TESTS)
     set(TEST_FILES
         test_gguf
         test_quant
-        test_graph
-        test_arch
         test_tokenizer
+        test_kv_cache
+        test_weight_cache
+        test_bf16
+        test_gguf_io
     )
 
     foreach(TEST_NAME ${TEST_FILES})
         add_executable(${TEST_NAME} tests/${TEST_NAME}.cpp)
         target_link_libraries(${TEST_NAME} PRIVATE ggnpu_lib Threads::Threads)
         target_compile_definitions(${TEST_NAME} PRIVATE GGNPU_TEST_CPU=1)
-        if(TEST_NAME STREQUAL "test_tokenizer")
+        if(TEST_NAME STREQUAL "test_tokenizer" OR TEST_NAME STREQUAL "test_gguf_io")
             add_test(NAME ${TEST_NAME}
                 COMMAND ${TEST_NAME} ${CMAKE_SOURCE_DIR}/models/llama-3.2-1b-q4_k_m.gguf)
         else()

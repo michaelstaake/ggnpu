@@ -28,6 +28,7 @@ public:
     void set_position(uint64_t pos);
     void increment_position(uint64_t n = 1);
     uint64_t capacity() const;
+    uint64_t n_ctx() const;
     uint64_t n_layers() const;
     uint64_t n_head_kv() const;
     uint64_t head_dim() const;
