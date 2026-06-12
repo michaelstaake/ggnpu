@@ -4,7 +4,7 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state:** **Phases 1–5 MVP passed** for matmul + SiLU on NPU. E2E inference is **blocked** until RMSNorm N=2048 and flash_attn kernels work (§2.1). Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next focus: fix §2.1 **NPU blocked** items, then Phase 6 polish. See **§7.1**.
+**Current state:** **Phases 1–5 MVP passed** for matmul + SiLU on NPU. E2E inference is **blocked** until RMSNorm N=2048 (rebuilt with correct dimensions, needs hardware verification) and flash_attn kernels work (§2.1). Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next focus: verify §2.1 **NPU blocked** items on hardware, then Phase 6 polish. See **§7.1**.
 
 **Verdict:** The supported path is host-native: install host prerequisites, build `ggnpu` locally, and provide local `.xclbin` + `*_sequence.bin` kernels under `~/.cache/ggnpu/xclbin/`.
 
@@ -84,12 +84,12 @@ Implemented tensor ops (`rms_norm`, `silu`, `flash_attn`, `mul_mat_q`, …) must
 | Per-token embedding dequant | Host | Host | `dequant_tensor_row()` in `main.cpp` |
 | Activation quantize (f32 → INT8 tiles) | Host | Host | `amd_xdna.cpp` matmul path |
 | **INT8 matmul** (Q/K/V/O, FFN gate/up/down) | NPU | **NPU** | `matmul_npu6.xclbin` (256³ tiles); host tiling |
-| **RMSNorm** (hidden=2048) | NPU | **NPU blocked** | `rmsnorm_2048_npu6.xclbin` compiles but returns zeros on hardware; hard error at runtime |
+| **RMSNorm** (hidden=2048) | NPU | **NPU blocked** | `rmsnorm_2048_npu6.xclbin` rebuilt with correct M=2,N=2048 dims (was M=32,N=256); needs hardware verification — may still return zeros if transform script has issues |
 | RMSNorm learned weights (`γ`) | Host | Host | O(N) multiply after unweighted NPU norm in `amd_xdna.cpp` |
 | **RoPE** (Q, K) | Host | **CPU** | `apply_rope()` in `main.cpp`; NPU kernel not wired |
 | KV cache write | Host | Host | `kv_cache.cpp` |
 | GQA KV expand (repeat KV heads) | Host | Host | memcpy loops in `main.cpp` |
-| **Flash attention** (32×64, ctx≤2048) | NPU | **NPU blocked** | Needs `flash_attn_32x64x2048_npu6.xclbin`; missing → hard error |
+| **Flash attention** (32×64, ctx≤2048) | NPU | **NPU blocked** | `flash_attn_32x64x2048_npu6.xclbin` fails to compile — transform script (`flash_attn_aie2p.mlir`) is actually a matmul recipe expecting 2 inputs, but flash_attn has 3 (Q,K,V). Requires new transform recipe. |
 | **SiLU** (FFN gate, N=8192) | NPU | **NPU** | `silu_npu6.xclbin` when present |
 | SwiGLU `silu(gate) * up` multiply | Host | Host | elementwise after NPU SiLU |
 | Residual adds (attn + FFN) | Host | Host | cheap; acceptable for MVP |
