@@ -591,23 +591,14 @@ int main(int argc, char* argv[]) {
 #ifdef GGNPU_HAS_NPU_BACKEND
         backend = create_amd_xdna_backend(params.npu_device);
         if (!backend || !backend->is_available()) {
-#ifdef GGNPU_TEST_CPU
-            std::cerr << "Warning: NPU backend unavailable, using CPU reference for testing\n";
-            backend = create_cpu_ref_backend();
-#else
             std::cerr << "Error: NPU backend unavailable. AMD NPU (amdxdna) driver must be loaded.\n";
             std::cerr << "  lsmod | grep amdxdna\n";
             std::cerr << "  ls -la /dev/accel/accel0\n";
             return 1;
-#endif
         }
-#else
-#ifdef GGNPU_TEST_CPU
-        backend = create_cpu_ref_backend();
 #else
         std::cerr << "Error: NPU backend not compiled in. Build with -DGGNPU_NPU_BACKEND=ON\n";
         return 1;
-#endif
 #endif
 
         std::cout << "Backend: " << backend->name() << "\n\n";
@@ -691,23 +682,14 @@ int main(int argc, char* argv[]) {
 #ifdef GGNPU_HAS_NPU_BACKEND
     backend = create_amd_xdna_backend(params.npu_device);
     if (!backend || !backend->is_available()) {
-#ifdef GGNPU_TEST_CPU
-        std::cerr << "Warning: NPU backend unavailable, using CPU reference for testing\n";
-        backend = create_cpu_ref_backend();
-#else
         std::cerr << "Error: NPU backend unavailable. AMD NPU (amdxdna) driver must be loaded.\n";
         std::cerr << "  lsmod | grep amdxdna\n";
         std::cerr << "  ls -la /dev/accel/accel0\n";
         return 1;
-#endif
     }
-#else
-#ifdef GGNPU_TEST_CPU
-    backend = create_cpu_ref_backend();
 #else
     std::cerr << "Error: NPU backend not compiled in. Build with -DGGNPU_NPU_BACKEND=ON\n";
     return 1;
-#endif
 #endif
 
     std::cout << "Backend: " << backend->name() << "\n";
@@ -854,7 +836,7 @@ int main(int argc, char* argv[]) {
     };
 
     auto rms_norm = [&](float* out, const float* inp, int n_rows, int row_size, float eps,
-                        const float* weight) {
+                        const float* weight) -> bool {
         for (int row = 0; row < n_rows; row++) {
             RmsNormParams rms_params;
             rms_params.input = inp + row * row_size;
@@ -862,8 +844,12 @@ int main(int argc, char* argv[]) {
             rms_params.size = row_size;
             rms_params.eps = eps;
             rms_params.weight = weight;
-            backend->rms_norm(rms_params);
+            if (backend->rms_norm(rms_params) != Status::OK) {
+                std::cerr << "Error: rms_norm failed at row " << row << " (N=" << row_size << ")\n";
+                return false;
+            }
         }
+        return true;
     };
 
     const bool npu_matmul = (backend->name() == "amd_xdna");
@@ -973,8 +959,8 @@ int main(int argc, char* argv[]) {
             }
             auto cmp = compare_vectors(normed.data(), npu_normed.data(), hidden_size, 0.01f);
             if (hidden_size != 2048) {
-                std::cout << "    Note: prebuilt rmsnorm xclbin is M=1,N=2048; hidden="
-                          << hidden_size << " may JIT-compile or use CPU fallback\n";
+                std::cout << "    Note: Llama hidden=2048 uses rmsnorm_2048_npu6.xclbin; hidden="
+                          << hidden_size << " needs a matching shaped kernel\n";
             }
             if (!report_compare("RMSNorm", cmp, hidden_size, 0.05f, 0.1f, 0.01f)) return 1;
         }
@@ -1399,8 +1385,11 @@ int main(int argc, char* argv[]) {
             // RMSNorm for attention
             {
                 ScopedTimer t(step_timings.rms_norm_ms);
-                rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
-                         get_float_ptr(attn_norm_w));
+                if (!rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
+                              get_float_ptr(attn_norm_w))) {
+                    model.unload();
+                    return 1;
+                }
             }
 
             // Attention projections
@@ -1472,7 +1461,11 @@ int main(int argc, char* argv[]) {
                 fa_params.ctx_len = ctx_len;
                 fa_params.query_pos = pos;
                 fa_params.freq_factors = nullptr;
-                backend->flash_attn(fa_params);
+                if (backend->flash_attn(fa_params) != Status::OK) {
+                    std::cerr << "Error: flash_attn failed at layer " << layer << "\n";
+                    model.unload();
+                    return 1;
+                }
             }
 
             // Attention output projection
@@ -1500,8 +1493,11 @@ int main(int argc, char* argv[]) {
             // FFN path
             {
                 ScopedTimer t(step_timings.rms_norm_ms);
-                rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
-                         get_float_ptr(ffn_norm_w));
+                if (!rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
+                              get_float_ptr(ffn_norm_w))) {
+                    model.unload();
+                    return 1;
+                }
             }
 
             const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer);
@@ -1527,7 +1523,11 @@ int main(int argc, char* argv[]) {
                     silu_params.input = ffn_gate.data() + t * ffn_size;
                     silu_params.output = ffn_silu.data() + t * ffn_size;
                     silu_params.size = ffn_size;
-                    backend->silu(silu_params);
+                    if (backend->silu(silu_params) != Status::OK) {
+                        std::cerr << "Error: silu failed at layer " << layer << "\n";
+                        model.unload();
+                        return 1;
+                    }
                 }
 
                 for (int i = 0; i < ffn_size; i++) {
@@ -1561,8 +1561,11 @@ int main(int argc, char* argv[]) {
         const TensorView* output_norm_w = find_tensor(model, "output_norm.weight");
         {
             ScopedTimer t(step_timings.rms_norm_ms);
-            rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
-                     get_float_ptr(output_norm_w));
+            if (!rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
+                          get_float_ptr(output_norm_w))) {
+                model.unload();
+                return 1;
+            }
         }
 
         pos++;

@@ -495,14 +495,14 @@ Assessment of whether the project can run a model on the NPU **today**.
 | Full inference E2E | **Validated** | France prompt coherent on CPU + NPU builds; `test_e2e_logits` |
 | NPU utilization | **~15–50%** (generation) | Matmul + SiLU on NPU; RMSNorm N=2048 via `rmsnorm_2048_npu6.xclbin` when built; flash_attn still CPU |
 
-Production commands use the **native host build** (§9). Do **not** rely on `GGNPU_TEST_CPU=ON` in release NPU builds — it allows silent CPU fallback, which violates §2.
+Production commands use the **native host build** (§9). Tensor ops (matmul, rmsnorm, silu, flash_attn) **fail with an error** if the NPU kernel is missing or broken — no silent CPU fallback. CPU is used only for control-plane work (tokenize, RoPE, logits dequant, sampling) until those ops have NPU kernels.
 
 #### Known code gaps (post–Phase 5 / toward Phase 6)
 
 | Gap | File | Impact |
 |-----|------|--------|
-| RMSNorm N=2048 on NPU | `amd_xdna.cpp`, `build-kernels.sh` | Build `rmsnorm_2048_npu6.xclbin` (`--M 2 --N 2048`); wrong/missing xclbin → CPU fallback |
-| Flash attention shape | `amd_xdna.cpp`, `main.cpp` | Batched 32×64 call; build `flash_attn_32x64x2048_npu6.xclbin` (experimental transform) |
+| RMSNorm N=2048 on NPU | `amd_xdna.cpp`, `build-kernels.sh` | Build `rmsnorm_2048_npu6.xclbin` (`--M 2 --N 2048`); missing/wrong xclbin → **hard error** (no CPU fallback) |
+| Flash attention shape | `amd_xdna.cpp`, `main.cpp` | Batched 32×64 call; build `flash_attn_32x64x2048_npu6.xclbin`; missing → **hard error** |
 | SiLU FFN=8192 on NPU | `amd_xdna.cpp` | **Works** when `silu_npu6.xclbin` present |
 | Matmul perf: host-side tiling | `amd_xdna.cpp` | Host weight-tile cache; per-tile DMA (device persist deferred) |
 | RoPE on CPU | `main.cpp` | Correct Llama 3 math; not on NPU yet |

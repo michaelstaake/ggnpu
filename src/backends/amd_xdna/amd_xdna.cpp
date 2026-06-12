@@ -34,7 +34,7 @@ constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256
 // xclbins still work for N=256 bench sizes; rebuild with compile_kernels.py for 2048.
 constexpr int kRmsnormKernelCols = 256;
 constexpr int kRmsnormKernelHidden = 2048;
-constexpr int kRmsnormHiddenPadRows = 2;  // M=2,N=2048 kernel; row 0 duplicated for Triton tiling
+constexpr int kRmsnormHiddenPadRows = 2;  // M=2,N=2048 (row 0 duplicated; M=1 won't compile)
 constexpr int kSiluKernelSize = 8192;  // prebuilt silu xclbin default N
 constexpr int kSoftmaxKernelRows = 256;  // prebuilt softmax xclbin is 256x256 bf16
 constexpr int kSoftmaxKernelCols = 256;
@@ -278,12 +278,6 @@ struct BTileKeyHash {
     }
 };
 
-struct FallbackStats {
-    int rmsnorm = 0;
-    int flash_attn = 0;
-    int silu = 0;
-};
-
 static void rms_norm_cpu_ref(const RmsNormParams& params) {
     float variance = 0.0f;
     for (int i = 0; i < params.size; i++) variance += params.input[i] * params.input[i];
@@ -296,50 +290,20 @@ static void rms_norm_cpu_ref(const RmsNormParams& params) {
     }
 }
 
-static void silu_cpu_ref(const SiluParams& params) {
-    for (int i = 0; i < params.size; i++) {
-        float x = params.input[i];
-        params.output[i] = x / (1.0f + std::exp(-x));
+// Sanity-check NPU rmsnorm_2048 output on first call (mis-built xclbins return zeros).
+static bool rmsnorm_npu_matches_cpu(const float* input, const float* npu_out, int N, float eps) {
+    std::vector<float> cpu_out(static_cast<size_t>(N));
+    RmsNormParams rp{input, cpu_out.data(), N, eps, nullptr};
+    rms_norm_cpu_ref(rp);
+
+    float max_diff = 0.0f;
+    float max_ref = 0.0f;
+    for (int i = 0; i < N; i++) {
+        max_diff = std::max(max_diff, std::fabs(cpu_out[static_cast<size_t>(i)] - npu_out[i]));
+        max_ref = std::max(max_ref, std::fabs(cpu_out[static_cast<size_t>(i)]));
     }
-}
-
-// CPU reference flash attention (used when NPU kernel is unavailable)
-static void flash_attn_cpu_ref(const AttnParams& params) {
-    int nh = params.n_head;
-    int hd = params.head_dim;
-    int64_t cl = params.ctx_len;
-    int64_t qpos = params.query_pos >= 0 ? params.query_pos : cl - 1;
-    float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-
-    for (int h = 0; h < nh; h++) {
-        const float* Qh = params.Q + h * hd;
-        const float* Kh = params.K + h * cl * hd;
-        const float* Vh = params.V + h * cl * hd;
-        float* outh = params.output + h * hd;
-
-        std::vector<float> scores(cl, -INFINITY);
-        for (int64_t j = 0; j <= qpos && j < cl; j++) {
-            float sum = 0.0f;
-            for (int d = 0; d < hd; d++) sum += Qh[d] * Kh[j * hd + d];
-            scores[j] = sum * scale;
-        }
-
-        float max_val = -INFINITY;
-        for (int64_t j = 0; j < cl; j++) if (scores[j] > max_val) max_val = scores[j];
-
-        float sum = 0.0f;
-        std::vector<float> weights(cl);
-        for (int64_t j = 0; j < cl; j++) {
-            weights[j] = std::exp(scores[j] - max_val);
-            sum += weights[j];
-        }
-        for (int64_t j = 0; j < cl; j++) weights[j] /= sum;
-
-        std::fill(outh, outh + hd, 0.0f);
-        for (int64_t j = 0; j < cl; j++)
-            for (int d = 0; d < hd; d++)
-                outh[d] += weights[j] * Vh[j * hd + d];
-    }
+    if (max_ref < 1e-6f) return true;
+    return (max_diff / max_ref) < 0.05f;
 }
 
 // Cached kernel for FlashAttention
@@ -405,15 +369,6 @@ public:
 
         // Preload Llama-shaped flash attention if present (optional).
         load_flash_attn_xclbin();
-    }
-
-    ~AmdXdnaBackend() override {
-        if (fallback_stats_.rmsnorm > 0 || fallback_stats_.flash_attn > 0 ||
-            fallback_stats_.silu > 0) {
-            std::cerr << "NPU fallback ops: rmsnorm=" << fallback_stats_.rmsnorm
-                      << " flash_attn=" << fallback_stats_.flash_attn
-                      << " silu=" << fallback_stats_.silu << "\n";
-        }
     }
 
     Status mul_mat_q(const MulMatParams& params) override {
@@ -620,14 +575,14 @@ public:
         auto it = rmsnorm_kernels_.find(N);
         if (it == rmsnorm_kernels_.end()) {
             if (!ensure_rmsnorm_kernel(N, cache_key)) {
-                static bool warned = false;
-                if (!warned) {
-                    std::cerr << "Warning: rmsnorm NPU kernel unavailable; using CPU fallback\n";
-                    warned = true;
+                std::cerr << "Error: no NPU rmsnorm kernel for N=" << N << "\n";
+                if (N == kRmsnormKernelHidden) {
+                    std::cerr << "  Build: ./scripts/build-kernels.sh npu6 rmsnorm_2048\n";
+                    std::cerr << "  Expect: " << cache_dir_ << "/xclbin/rmsnorm_2048_"
+                              << profile_str_ << ".xclbin\n";
                 }
-                fallback_stats_.rmsnorm++;
-                rms_norm_cpu_ref(params);
-                return Status::OK;
+                last_status_ = Status::NPU_UNAVAILABLE;
+                return last_status_;
             }
             it = rmsnorm_kernels_.find(N);
         }
@@ -664,11 +619,9 @@ public:
                            buf_bf16_in, buf_bf16_out);
                 kernel.run.wait();
             } catch (const std::exception& e) {
-                std::cerr << "Warning: rmsnorm kernel execution failed (" << e.what()
-                          << "); using CPU fallback\n";
-                fallback_stats_.rmsnorm++;
-                rms_norm_cpu_ref(params);
-                return Status::OK;
+                std::cerr << "Error: rmsnorm kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
             }
 
             std::vector<uint8_t> bf16_out_data(bf16_bytes);
@@ -678,8 +631,24 @@ public:
             auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
             std::memcpy(output_ptr, f32_result.data(), N * sizeof(float));
 
+            if (N == kRmsnormKernelHidden && !rmsnorm_hidden_npu_checked_) {
+                rmsnorm_hidden_npu_checked_ = true;
+                if (!rmsnorm_npu_matches_cpu(input_ptr, output_ptr, N, npu_params.eps)) {
+                    std::cerr << "Error: rmsnorm_2048 NPU kernel produced incorrect output\n";
+                    std::cerr << "  The xclbin may be mis-built. Rebuild:\n";
+                    std::cerr << "    ./scripts/build-kernels.sh npu6 rmsnorm_2048\n";
+                    last_status_ = Status::ERROR;
+                    return last_status_;
+                }
+            }
+
         } else {
-            // Fallback: F32 kernel without instruction sequence (legacy path)
+            if (N == kRmsnormKernelHidden) {
+                std::cerr << "Error: rmsnorm_2048 xclbin missing BF16 instruction sequence\n";
+                last_status_ = Status::NPU_UNAVAILABLE;
+                return last_status_;
+            }
+            // Legacy F32 kernel without instruction sequence (N=256 bench only)
             size_t size_bytes = N * sizeof(float);
             if (!buf_rmsnorm_in_ || buf_rmsnorm_in_->size() < size_bytes) {
                 buf_rmsnorm_in_ = buf_mgr_->alloc(size_bytes, true);
@@ -695,10 +664,9 @@ public:
                            static_cast<uint32_t>(N));
                 kernel.run.wait();
             } catch (const std::exception& e) {
-                std::cerr << "Warning: rmsnorm kernel execution failed (" << e.what()
-                          << "); using CPU fallback\n";
-                rms_norm_cpu_ref(params);
-                return Status::OK;
+                std::cerr << "Error: rmsnorm kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
             }
 
             buf_mgr_->copy_from(*buf_rmsnorm_out_, output_ptr, size_bytes);
@@ -829,9 +797,10 @@ public:
         
         // Prebuilt SiLU xclbin is fixed-size 8192 (Llama 1B/3B FFN).
         if (N != kSiluKernelSize) {
-            fallback_stats_.silu++;
-            silu_cpu_ref(params);
-            return Status::OK;
+            std::cerr << "Error: SiLU NPU kernel is N=" << kSiluKernelSize
+                      << " but model requested N=" << N << "\n";
+            last_status_ = Status::INVALID_PARAM;
+            return last_status_;
         }
 
         std::string cache_key = "silu_" + std::to_string(N) + "_" + profile_str_;
@@ -841,14 +810,10 @@ public:
         auto it = silu_kernels_.find(N);
         if (it == silu_kernels_.end()) {
             if (!ensure_silu_kernel(N, cache_key)) {
-                static bool warned = false;
-                if (!warned) {
-                    std::cerr << "Warning: SiLU NPU kernel unavailable; using CPU fallback\n";
-                    warned = true;
-                }
-                fallback_stats_.silu++;
-                silu_cpu_ref(params);
-                return Status::OK;
+                std::cerr << "Error: SiLU NPU kernel unavailable for N=" << N << "\n";
+                std::cerr << "  Build: ./scripts/build-kernels.sh npu6 silu\n";
+                last_status_ = Status::NPU_UNAVAILABLE;
+                return last_status_;
             }
             it = silu_kernels_.find(N);
         }
@@ -875,11 +840,9 @@ public:
                            buf_silu_bf16_in_->handle(), buf_silu_bf16_out_->handle());
                 kernel.run.wait();
             } catch (const std::exception& e) {
-                std::cerr << "Warning: SiLU kernel execution failed (" << e.what()
-                          << "); using CPU fallback\n";
-                fallback_stats_.silu++;
-                silu_cpu_ref(params);
-                return Status::OK;
+                std::cerr << "Error: SiLU kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
             }
 
             std::vector<uint8_t> bf16_out_data(bf16_bytes);
@@ -888,29 +851,9 @@ public:
             std::memcpy(params.output, f32_result.data(), N * sizeof(float));
 
         } else {
-            size_t size_bytes = N * sizeof(float);
-            if (!buf_silu_in_ || buf_silu_in_->size() < size_bytes) {
-                buf_silu_in_ = buf_mgr_->alloc(size_bytes, true);
-            }
-            if (!buf_silu_out_ || buf_silu_out_->size() < size_bytes) {
-                buf_silu_out_ = buf_mgr_->alloc(size_bytes, true);
-            }
-
-            buf_mgr_->copy_to(*buf_silu_in_, params.input, size_bytes);
-
-            try {
-                kernel.run(buf_silu_in_->handle(), buf_silu_out_->handle(),
-                           static_cast<uint32_t>(N));
-                kernel.run.wait();
-            } catch (const std::exception& e) {
-                std::cerr << "Warning: SiLU kernel execution failed (" << e.what()
-                          << "); using CPU fallback\n";
-                fallback_stats_.silu++;
-                silu_cpu_ref(params);
-                return Status::OK;
-            }
-
-            buf_mgr_->copy_from(*buf_silu_out_, params.output, size_bytes);
+            std::cerr << "Error: SiLU xclbin missing BF16 instruction sequence\n";
+            last_status_ = Status::NPU_UNAVAILABLE;
+            return last_status_;
         }
 
         return Status::OK;
@@ -933,14 +876,14 @@ public:
         auto it = flash_attn_kernels_.find(key);
         if (it == flash_attn_kernels_.end()) {
             if (!ensure_flash_attn_kernel(n_head, head_dim, ctx_len, cache_key)) {
-                static bool warned = false;
-                if (!warned) {
-                    std::cerr << "Warning: flash_attn NPU kernel unavailable; using CPU fallback\n";
-                    warned = true;
-                }
-                fallback_stats_.flash_attn++;
-                flash_attn_cpu_ref(params);
-                return Status::OK;
+                std::cerr << "Error: no NPU flash_attn kernel for "
+                          << n_head << "x" << head_dim << "x" << ctx_len << "\n";
+                std::cerr << "  Build: ./scripts/build-kernels.sh npu6 flash_attn_32x64x2048\n";
+                std::cerr << "  Expect: " << cache_dir_ << "/xclbin/flash_attn_"
+                          << n_head << "x" << head_dim << "x" << ctx_len << "_"
+                          << profile_str_ << ".xclbin\n";
+                last_status_ = Status::NPU_UNAVAILABLE;
+                return last_status_;
             }
             it = flash_attn_kernels_.find(key);
         }
@@ -1227,13 +1170,6 @@ private:
         // Do not use generic rmsnorm_npu6.xclbin for N=2048 unless it was rebuilt as M=1,N=2048
         // (install as rmsnorm_2048_npu6.xclbin). Legacy 32x256 prebuilt gives wrong results at N=2048.
 
-        // Fall back to CPU for unsupported sizes
-        static bool warned_missing = false;
-        if (!warned_missing) {
-            std::cerr << "Warning: no NPU rmsnorm for N=" << N
-                      << " (prebuilt kernel is 32x256 only); using CPU fallback\n";
-            warned_missing = true;
-        }
         return false;
     }
 
@@ -1254,6 +1190,11 @@ private:
             std::string seq_path = detail::find_prebuilt_sequence(fs::path(path).filename().string(), cache_dir_);
             if (!seq_path.empty()) {
                 load_instr_bo(*device_, krnl, cached.bo_instr, cached.instr_words, seq_path);
+            }
+            if (N == kRmsnormKernelHidden &&
+                (!cached.bo_instr || cached.instr_words == 0)) {
+                std::cerr << "Error: rmsnorm_2048 xclbin missing instruction sequence\n";
+                return false;
             }
             rmsnorm_kernels_[N] = std::move(cached);
             return true;
@@ -1342,7 +1283,6 @@ private:
             }
         }
 
-        std::cerr << "Warning: no softmax xclbin available for " << rows << "x" << cols << "; using CPU fallback\n";
         return false;
     }
 
@@ -1467,7 +1407,6 @@ private:
             }
         }
 
-        std::cerr << "Warning: no silu xclbin available for size=" << size << "; using CPU fallback\n";
         return false;
     }
 
@@ -1524,7 +1463,6 @@ private:
         }
 
         if (xclbin_path.empty()) {
-            // flash_attn has no working Triton-XDNA transform recipe; CPU fallback only.
             return false;
         }
 
@@ -1653,7 +1591,7 @@ private:
 
     Status last_status_;
     mutable std::mutex mutex_;
-    FallbackStats fallback_stats_;
+    bool rmsnorm_hidden_npu_checked_ = false;
 };
 
 std::shared_ptr<Backend> create_amd_xdna_backend(int device_id) {
