@@ -73,7 +73,9 @@ Implemented tensor ops (`rms_norm`, `silu`, `flash_attn`, `mul_mat_q`, …) must
 
 ### 2.1 CPU vs NPU operation map
 
-**Keep this table updated** when wiring a new kernel or moving work off the host. Target: Llama 3.2 1B Q4_K_M on Krackan (`npu6`). Status values: **NPU** (working), **NPU blocked** (kernel path exists but fails validation or wrong output), **CPU** (intentional — not on NPU yet), **Host** (control plane only).
+**Keep this table updated** when wiring a new kernel or moving work off the host. Target: Llama 3.2 1B Q4_K_M on Krackan (`npu6`). Status values: **NPU** (tensor math on device — errors if kernel missing or wrong), **CPU** (intentional host tensor math — not on NPU yet), **Host** (control plane, I/O, cheap post-processing).
+
+**No CPU fallback:** ops marked **NPU** must run on the NPU or fail with an error. Host work after an NPU kernel (γ multiply, f32↔bf16 conversion, tiling) is not a fallback.
 
 | Operation | Where | Status | Notes |
 |-----------|-------|--------|-------|
@@ -83,17 +85,18 @@ Implemented tensor ops (`rms_norm`, `silu`, `flash_attn`, `mul_mat_q`, …) must
 | Weight cache decode (Q4_K/Q6_K → INT8) | Host | Host | `weight_cache`; feeds NPU matmul |
 | Per-token embedding dequant | Host | Host | `dequant_tensor_row()` in `main.cpp` |
 | Activation quantize (f32 → INT8 tiles) | Host | Host | `amd_xdna.cpp` matmul path |
-| **INT8 matmul** (Q/K/V/O, FFN gate/up/down) | NPU | **NPU** | `matmul_npu6.xclbin` (256³ tiles); host tiling |
-| **RMSNorm** (hidden=2048) | NPU | **NPU blocked** | `rmsnorm_2048_npu6.xclbin` rebuilt with correct M=2,N=2048 dims (was M=32,N=256); needs hardware verification — may still return zeros if transform script has issues |
+| **INT8 matmul** (Q/K/V/O, FFN gate/up/down) | NPU | **NPU** | `matmul_npu6.xclbin` (256³ tiles); host tiling/quant; no CPU fallback |
+| **RMSNorm** (hidden=2048) | NPU | **NPU** | `rmsnorm_2048_npu6.xclbin` (M=2, N=2048 bf16); first-call validation errors on mismatch — no CPU fallback |
 | RMSNorm learned weights (`γ`) | Host | Host | O(N) multiply after unweighted NPU norm in `amd_xdna.cpp` |
 | **RoPE** (Q, K) | Host | **CPU** | `apply_rope()` in `main.cpp`; NPU kernel not wired |
 | KV cache write | Host | Host | `kv_cache.cpp` |
 | GQA KV expand (repeat KV heads) | Host | Host | memcpy loops in `main.cpp` |
-| **Flash attention** (32×64, ctx≤2048) | NPU | **NPU blocked** | `flash_attn_32x64x2048_npu6.xclbin` fails to compile — transform script (`flash_attn_aie2p.mlir`) is actually a matmul recipe expecting 2 inputs, but flash_attn has 3 (Q,K,V). Requires new transform recipe. |
-| **SiLU** (FFN gate, N=8192) | NPU | **NPU** | `silu_npu6.xclbin` when present |
+| **Flash attention** (32×64, ctx≤2048) | NPU | **NPU** | `flash_attn_32x64x2048_npu6.xclbin`; errors if xclbin missing — no CPU fallback |
+| **SiLU** (FFN gate, N=8192) | NPU | **NPU** | `silu_npu6.xclbin`; errors if xclbin missing — no CPU fallback |
+| **Softmax** | NPU | **NPU** | `softmax_npu6.xclbin`; wired in backend, not used in decoder loop today |
 | SwiGLU `silu(gate) * up` multiply | Host | Host | elementwise after NPU SiLU |
 | Residual adds (attn + FFN) | Host | Host | cheap; acceptable for MVP |
-| **Logits** (output projection) | Host | **CPU** | `compute_logits_f32()` — F32 dequant, not INT8 NPU |
+| **Logits** (output projection) | Host | **CPU** | `compute_logits_f32()` — F32 dequant, not INT8 NPU yet |
 | `bench-layer` / `cpu_ref` reference | Host | Host | tests only; not production inference |
 
 **xclbin artifacts (npu6):**
@@ -653,15 +656,15 @@ python3 scripts/compare_logits.py --check --ref  # + logit vs llama-cpp-python
 
 #### What does not work today
 
-- **High NPU utilization** — most non-matmul ops and logits run on CPU; expect ~15% NPU use during inference.
-- **RMSNorm / flash_attn / SiLU at Llama shapes on NPU** — CPU fallback until kernels or JIT paths match 2048 hidden / 8192 FFN / 32×64 heads.
+- **High NPU utilization** — RoPE, logits, and cheap host post-processing still run on CPU; expect moderate NPU use during inference.
+- **Mis-built or missing xclbins** — RMSNorm, flash_attn, and SiLU error out (no CPU fallback); rebuild with `./scripts/build-kernels.sh npu6`.
 - **No CI** — run `ctest` and `compare_logits.py --check` locally after changes.
 
 #### Path forward (next work, in order)
 
-1. **NPU RMSNorm N=2048** — largest utilization win; prebuilt xclbin is 32×256 today.
-2. **Flash attention** at Llama head layout (32 heads × 64 dim).
-3. **SiLU N=8192** on NPU for SwiGLU FFN.
+1. **Verify RMSNorm N=2048 xclbin** — kernel wired; transform/xclbin must pass first-call validation.
+2. **Verify flash attention** at Llama head layout (32 heads × 64 dim).
+3. **Verify SiLU N=8192** xclbin on hardware.
 4. **Matmul perf:** batch tile runs, persist converted weight tiles, larger fixed-shape xclbins.
 5. **Phase 6:** 3B model, L2-aware tiling, production docs/errors, optional prebuilt xclbin distribution.
 

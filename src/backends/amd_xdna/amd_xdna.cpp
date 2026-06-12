@@ -290,7 +290,7 @@ static void rms_norm_cpu_ref(const RmsNormParams& params) {
     }
 }
 
-// Sanity-check NPU rmsnorm_2048 output on first call (mis-built xclbins return zeros).
+// Validation-only reference (not a production fallback). Mis-built xclbins return zeros.
 static bool rmsnorm_npu_matches_cpu(const float* input, const float* npu_out, int N, float eps) {
     std::vector<float> cpu_out(static_cast<size_t>(N));
     RmsNormParams rp{input, cpu_out.data(), N, eps, nullptr};
@@ -551,7 +551,8 @@ public:
 
     Status rms_norm(const RmsNormParams& params) override {
         // RMSNorm on NPU: prebuilt M=1,N=2048 (Llama hidden) or JIT for other sizes.
-        // Learned weights are applied on CPU after the unweighted NPU norm (O(N) multiply).
+        // Learned weights (γ) are applied on the host after the unweighted NPU norm (O(N) multiply).
+        // No CPU fallback — validation failure is a hard error.
 
         if (!params.input || !params.output || params.size <= 0) {
             last_status_ = Status::INVALID_PARAM;
@@ -681,9 +682,8 @@ public:
     }
 
     Status rope(const RopeParams& params) override {
-        // RoPE is relatively cheap (O(n_dims) per head) compared to matmul.
-        // Use CPU for now; the NPU kernel infrastructure is in place for Phase 6+.
-        // The NPU kernel path is available via jit_compile_rope() for future use.
+        // RoPE: intentional host CPU — not implemented on NPU yet (Phase 6+).
+        // jit_compile_rope() exists for future NPU wiring.
         for (int64_t i = 0; i < params.rope_dims; i += 2) {
             float ratio = 1.0f / std::pow(10000.0f, static_cast<float>(i) / params.n_dims);
             float val = params.offset * ratio * params.freq_scale;
@@ -759,7 +759,7 @@ public:
             std::memcpy(params.output, f32_result.data(), total_elements * sizeof(float));
 
         } else {
-            // Fallback: F32 kernel without instruction sequence (legacy path)
+            // Legacy NPU F32 kernel without instruction sequence (N=256 bench only)
             size_t size_bytes = rows * cols * sizeof(float);
             if (!buf_softmax_in_ || buf_softmax_in_->size() < size_bytes) {
                 buf_softmax_in_ = buf_mgr_->alloc(size_bytes, true);
