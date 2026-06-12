@@ -17,7 +17,9 @@
 #   - silu: SiLU/Swish activation
 # Experimental (GGNPU_EXPERIMENTAL=1; no working transform recipe yet):
 #   - rope: Rotary positional embeddings
-#   - flash_attn: FlashAttention v1 (decomposed)
+#   - flash_attn / flash_attn_32x64x2048: fused attention (placeholder transform)
+#
+# After rmsnorm kernel changes, rebuild: rm ~/.cache/ggnpu/xclbin/rmsnorm_2048_npu6*
 
 set -euo pipefail
 
@@ -211,16 +213,13 @@ Kernels=(
     "silu:--N 8192"
 )
 
-# Llama 3.2 1B flash attention (32 heads, 64 head_dim, 2048 ctx).
-Kernels+=(
-    "flash_attn_32x64x2048:--n_head 32 --head_dim 64 --ctx_len 2048"
-)
-
-# rope has no working Triton-XDNA transform recipe yet (gather loads).
+# rope / flash_attn have no working Triton-XDNA transform recipes yet.
+# Inference uses host f32 flash_attn (decomposed) until a fused kernel compiles.
 if [ -n "${GGNPU_EXPERIMENTAL:-}" ]; then
     Kernels+=(
         "rope:--N 2048 --dims 64"
         "flash_attn:--n_head 8 --head_dim 128 --ctx_len 2048"
+        "flash_attn_32x64x2048:--n_head 32 --head_dim 64 --ctx_len 2048"
     )
 fi
 

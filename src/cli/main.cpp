@@ -300,6 +300,25 @@ const char* status_name(Status status) {
     }
 }
 
+// Match NPU bf16 DMA path for bench-layer RMSNorm comparisons.
+static float bf16_roundtrip_f32(float f) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    uint32_t lsb = (bits >> 16) & 1;
+    bits += 0x7fff + lsb;
+    uint16_t b = static_cast<uint16_t>(bits >> 16);
+    uint32_t out_bits = static_cast<uint32_t>(b) << 16;
+    float result = 0.0f;
+    std::memcpy(&result, &out_bits, sizeof(result));
+    return result;
+}
+
+static void bf16_roundtrip_vector(const float* in, float* out, int n) {
+    for (int i = 0; i < n; i++) {
+        out[i] = bf16_roundtrip_f32(in[i]);
+    }
+}
+
 struct CompareResult {
     float max_diff = 0.0f;
     float max_ref = 0.0f;
@@ -931,10 +950,12 @@ int main(int argc, char* argv[]) {
             test_input[i] = dist(rng);
         }
 
-        // RMSNorm reference (CPU)
+        // RMSNorm reference (CPU f32 on bf16-quantized input — matches NPU DMA path)
+        std::vector<float> bf16_input(test_input.size());
+        bf16_roundtrip_vector(test_input.data(), bf16_input.data(), hidden_size);
         std::vector<float> normed(hidden_size);
         RmsNormParams rms_params;
-        rms_params.input = test_input.data();
+        rms_params.input = bf16_input.data();
         rms_params.output = normed.data();
         rms_params.size = hidden_size;
         rms_params.eps = rms_eps;
@@ -962,8 +983,7 @@ int main(int argc, char* argv[]) {
                 std::cout << "    Note: Llama hidden=2048 uses rmsnorm_2048_npu6.xclbin; hidden="
                           << hidden_size << " needs a matching shaped kernel\n";
             }
-            // bf16 NPU rmsnorm_2048: ~8% rel error vs f32 CPU ref after host bf16 marshaling
-            if (!report_compare("RMSNorm", cmp, hidden_size, 0.10f, 1.0f, 0.15f)) return 1;
+            if (!report_compare("RMSNorm", cmp, hidden_size, 0.01f, 0.05f, 0.01f)) return 1;
         }
 
         // Test 0b–0e: attention matmuls — NPU vs CPU (Phase 4)

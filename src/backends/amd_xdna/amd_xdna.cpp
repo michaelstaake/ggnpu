@@ -303,16 +303,24 @@ static bool rmsnorm_npu_matches_cpu(const float* input, const float* npu_out, in
     RmsNormParams rp{qinput.data(), cpu_out.data(), N, eps, nullptr};
     rms_norm_cpu_ref(rp);
 
-    auto npu_q = roundtrip_bf16_f32(npu_out, N);
-
+    // npu_out is already f32 expanded from the bf16 DMA buffer — do not roundtrip again.
+    constexpr float kRtol = 0.01f;
+    constexpr float kAtol = 0.02f;  // bf16 output quant on large activations (~18 peak)
     float max_diff = 0.0f;
     float max_ref = 0.0f;
+    int mismatches = 0;
     for (int i = 0; i < N; i++) {
-        max_diff = std::max(max_diff, std::fabs(cpu_out[static_cast<size_t>(i)] - npu_q[i]));
-        max_ref = std::max(max_ref, std::fabs(cpu_out[static_cast<size_t>(i)]));
+        float ref = cpu_out[static_cast<size_t>(i)];
+        float diff = std::fabs(ref - npu_out[i]);
+        max_diff = std::max(max_diff, diff);
+        max_ref = std::max(max_ref, std::fabs(ref));
+        float tol = kAtol + kRtol * std::fabs(ref);
+        if (diff > tol) mismatches++;
     }
     if (max_ref < 1e-6f) return true;
-    return (max_diff / max_ref) < 0.10f;
+    // Global gate: typical <0.5% on random data; allow rare outliers on large activations.
+    if (max_diff / max_ref >= 0.012f) return false;
+    return mismatches <= std::max(1, N / 512);
 }
 
 // Cached kernel for FlashAttention
@@ -572,9 +580,8 @@ public:
     }
 
     Status rms_norm(const RmsNormParams& params) override {
-        // RMSNorm: N=256 uses legacy NPU xclbin; N=2048 uses host f32 until the bf16
-        // rmsnorm_2048 kernel matches f32 reference (<1% rel error). The current xclbin
-        // is ~8% off on random activations and breaks 16-layer inference coherence.
+        // RMSNorm on NPU: rmsnorm_2048_npu6.xclbin (M=2,N=2048 bf16, BLOCK_N=256 tiles).
+        // First call for N=2048 validates against bf16-roundtrip f32 reference (<1% rel).
         // Learned weights (γ) are applied on the host after the unweighted norm.
 
         if (!params.input || !params.output || params.size <= 0) {
@@ -583,16 +590,6 @@ public:
         }
 
         int N = params.size;
-        if (N == kRmsnormKernelHidden) {
-            static bool warned = false;
-            if (!warned) {
-                std::cerr << "Note: rmsnorm N=2048 uses host f32 (NPU xclbin ~8% error; "
-                          << "rebuild when transform is fixed)\n";
-                warned = true;
-            }
-            rms_norm_cpu_ref(params);
-            return Status::OK;
-        }
         const float* weight = params.weight;
         std::vector<float> unweighted_out;
         RmsNormParams npu_params = params;
@@ -667,9 +664,8 @@ public:
             if (N == kRmsnormKernelHidden && !rmsnorm_hidden_npu_checked_) {
                 rmsnorm_hidden_npu_checked_ = true;
                 if (!rmsnorm_npu_matches_cpu(input_ptr, output_ptr, N, npu_params.eps)) {
-                    std::cerr << "Error: rmsnorm_2048 NPU kernel produced incorrect output\n";
-                    std::cerr << "  The xclbin may be mis-built. Rebuild:\n";
-                    std::cerr << "    ./scripts/build-kernels.sh npu6 rmsnorm_2048\n";
+                    std::cerr << "Error: rmsnorm_2048 NPU kernel failed bf16-aware validation\n";
+                    std::cerr << "  Rebuild: ./scripts/build-kernels.sh npu6 rmsnorm_2048\n";
                     last_status_ = Status::ERROR;
                     return last_status_;
                 }
@@ -891,14 +887,15 @@ public:
         return Status::OK;
     }
 
-    // Decomposed attention (host f32) when fused flash_attn xclbin is unavailable.
-    // INT8 NPU matmul QK/AV loses too much precision for coherent 16-layer inference.
-    Status flash_attn_decomposed_npu(const AttnParams& params) {
-        static bool warned = false;
-        if (!warned) {
-            std::cerr << "Note: flash_attn uses host f32 decomposed path (fused xclbin not built; "
-                      << "INT8 QK matmul breaks logits)\n";
-            warned = true;
+    // Fused flash_attn Triton kernel has no working mlir transform yet (scf.for +
+    // online softmax). Host f32 decomposed attention matches cpu_ref; INT8 NPU matmul
+    // QK/AV loses too much precision for coherent 16-layer inference.
+    Status flash_attn_decomposed(const AttnParams& params) {
+        static bool noted = false;
+        if (!noted) {
+            std::cerr << "Note: flash_attn uses host f32 (fused NPU kernel not buildable; "
+                      << "set GGNPU_EXPERIMENTAL=1 to attempt compile)\n";
+            noted = true;
         }
 
         int nh = params.n_head;
@@ -950,69 +947,71 @@ public:
             return last_status_;
         }
 
-        int n_head = params.n_head;
-        int head_dim = params.head_dim;
-        int64_t ctx_len = params.ctx_len;
-        std::string cache_key = "flash_attn_" + std::to_string(n_head) + "x" + std::to_string(head_dim) + "x" + std::to_string(ctx_len) + "_" + profile_str_;
+        // Fused NPU flash_attn only when an explicit shaped xclbin is present (experimental).
+        // Default build does not ship one — flash_attn_aie2p.mlir cannot lower the Triton kernel.
+        const char* force_fused = std::getenv("GGNPU_FLASH_ATTN_FUSED");
+        if (force_fused && force_fused[0] != '0') {
+            int n_head = params.n_head;
+            int head_dim = params.head_dim;
+            int64_t ctx_len = params.ctx_len;
+            std::string cache_key = "flash_attn_" + std::to_string(n_head) + "x" +
+                                    std::to_string(head_dim) + "x" + std::to_string(ctx_len) + "_" +
+                                    profile_str_;
 
-        bool use_decomposed = false;
-        {
             std::lock_guard<std::mutex> lock(mutex_);
-
             auto key = std::make_tuple(n_head, head_dim, ctx_len);
             auto it = flash_attn_kernels_.find(key);
             if (it == flash_attn_kernels_.end()) {
                 if (!ensure_flash_attn_kernel(n_head, head_dim, ctx_len, cache_key)) {
-                    use_decomposed = true;
-                } else {
-                    it = flash_attn_kernels_.find(key);
-                }
-            }
-
-            if (!use_decomposed) {
-                auto& kernel = it->second;
-
-                size_t size_q = static_cast<size_t>(n_head) * head_dim * sizeof(float);
-                size_t size_k = static_cast<size_t>(n_head) * ctx_len * head_dim * sizeof(float);
-                size_t size_v = static_cast<size_t>(n_head) * ctx_len * head_dim * sizeof(float);
-                size_t size_out = static_cast<size_t>(n_head) * head_dim * sizeof(float);
-
-                if (!buf_fa_q_ || buf_fa_q_->size() < size_q) {
-                    buf_fa_q_ = buf_mgr_->alloc(size_q, true);
-                }
-                if (!buf_fa_k_ || buf_fa_k_->size() < size_k) {
-                    buf_fa_k_ = buf_mgr_->alloc(size_k, true);
-                }
-                if (!buf_fa_v_ || buf_fa_v_->size() < size_v) {
-                    buf_fa_v_ = buf_mgr_->alloc(size_v, true);
-                }
-                if (!buf_fa_out_ || buf_fa_out_->size() < size_out) {
-                    buf_fa_out_ = buf_mgr_->alloc(size_out, true);
-                }
-
-                buf_mgr_->copy_to(*buf_fa_q_, params.Q, size_q);
-                buf_mgr_->copy_to(*buf_fa_k_, params.K, size_k);
-                buf_mgr_->copy_to(*buf_fa_v_, params.V, size_v);
-
-                try {
-                    kernel.run(buf_fa_q_->handle(), buf_fa_k_->handle(), buf_fa_v_->handle(),
-                               buf_fa_out_->handle(),
-                               static_cast<uint32_t>(n_head),
-                               static_cast<uint32_t>(head_dim),
-                               static_cast<uint32_t>(ctx_len));
-                    kernel.run.wait();
-                } catch (const std::exception& e) {
-                    std::cerr << "Error: flash_attn kernel execution failed: " << e.what() << "\n";
-                    last_status_ = Status::ERROR;
+                    std::cerr << "Error: GGNPU_FLASH_ATTN_FUSED set but no flash_attn xclbin for shape "
+                              << n_head << "x" << head_dim << "x" << ctx_len << "\n";
+                    last_status_ = Status::NPU_UNAVAILABLE;
                     return last_status_;
                 }
-
-                buf_mgr_->copy_from(*buf_fa_out_, params.output, size_out);
-                return Status::OK;
+                it = flash_attn_kernels_.find(key);
             }
+
+            auto& kernel = it->second;
+            size_t size_q = static_cast<size_t>(n_head) * head_dim * sizeof(float);
+            size_t size_k = static_cast<size_t>(n_head) * ctx_len * head_dim * sizeof(float);
+            size_t size_v = static_cast<size_t>(n_head) * ctx_len * head_dim * sizeof(float);
+            size_t size_out = static_cast<size_t>(n_head) * head_dim * sizeof(float);
+
+            if (!buf_fa_q_ || buf_fa_q_->size() < size_q) {
+                buf_fa_q_ = buf_mgr_->alloc(size_q, true);
+            }
+            if (!buf_fa_k_ || buf_fa_k_->size() < size_k) {
+                buf_fa_k_ = buf_mgr_->alloc(size_k, true);
+            }
+            if (!buf_fa_v_ || buf_fa_v_->size() < size_v) {
+                buf_fa_v_ = buf_mgr_->alloc(size_v, true);
+            }
+            if (!buf_fa_out_ || buf_fa_out_->size() < size_out) {
+                buf_fa_out_ = buf_mgr_->alloc(size_out, true);
+            }
+
+            buf_mgr_->copy_to(*buf_fa_q_, params.Q, size_q);
+            buf_mgr_->copy_to(*buf_fa_k_, params.K, size_k);
+            buf_mgr_->copy_to(*buf_fa_v_, params.V, size_v);
+
+            try {
+                kernel.run(buf_fa_q_->handle(), buf_fa_k_->handle(), buf_fa_v_->handle(),
+                           buf_fa_out_->handle(),
+                           static_cast<uint32_t>(n_head),
+                           static_cast<uint32_t>(head_dim),
+                           static_cast<uint32_t>(ctx_len));
+                kernel.run.wait();
+            } catch (const std::exception& e) {
+                std::cerr << "Error: flash_attn kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
+            }
+
+            buf_mgr_->copy_from(*buf_fa_out_, params.output, size_out);
+            return Status::OK;
         }
 
-        last_status_ = flash_attn_decomposed_npu(params);
+        last_status_ = flash_attn_decomposed(params);
         return last_status_;
     }
 

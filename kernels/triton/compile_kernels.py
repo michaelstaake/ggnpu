@@ -72,13 +72,14 @@ KERNELS = {
         ),
     },
     "flash_attn": {
-        "description": "FlashAttention v1 (decomposed matmul path)",
+        "description": "FlashAttention v1 (online softmax; no working transform yet)",
         "params": ["n_head", "head_dim", "ctx_len"],
         "defaults": {"n_head": 8, "head_dim": 128, "ctx_len": 2048},
         "transform": "flash_attn_aie2p.mlir",
         "experimental": (
-            "flash_attn has a loop-carried scf.for accumulator and 3 input copies; "
-            "the matmul transform recipe cannot apply (expects 2 linalg.copy + no iter_args)"
+            "flash_attn uses scf.for with loop-carried online-softmax state; "
+            "flash_attn_aie2p.mlir is a placeholder (not matmul). "
+            "Inference uses host f32 decomposed attention until a transform ships."
         ),
     },
 }
@@ -501,7 +502,8 @@ def build_kernel_script(op: str, params: dict) -> str:
     elif op == "rmsnorm":
         # 2D BLOCK_M-rows form (upstream rms_norm example): tl.sum over axis=1
         # keeps a row dimension the transform script can tile at [1]. The 1D
-        # form reduces to a scalar chain that is not tileable.
+        # form reduces to a scalar chain that is not tileable. M=1 does not
+        # compile; host duplicates row 0 for M=2,N=2048 launches.
         m_rows = p.get("M", 32)
         n_cols = p.get("N", 256)
         block_m = 1 if m_rows < 2 else 2
@@ -523,8 +525,7 @@ def build_kernel_script(op: str, params: dict) -> str:
                 offsets = rows[:, None] * N + cols[None, :]
                 x = tl.load(X + offsets)
                 x_f32 = x.to(tl.float32)
-                x_sq = x_f32 * x_f32
-                sum_sq = tl.sum(x_sq, axis=1)
+                sum_sq = tl.sum(x_f32 * x_f32, axis=1)
                 mean_sq = sum_sq / N
                 rstd = tl.math.rsqrt(mean_sq + eps)
                 y = (x_f32 * rstd[:, None]).to(x.dtype)
