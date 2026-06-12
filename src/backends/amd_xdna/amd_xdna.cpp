@@ -7,6 +7,7 @@
 #include <xrt/xrt_kernel.h>
 #include <xrt/experimental/xrt_xclbin.h>
 #include <xrt/xrt_hw_context.h>
+#include <xrt/xrt_event.h>
 #include <cstring>
 #include <cmath>
 #include <memory>
@@ -19,6 +20,7 @@
 #include <mutex>
 #include <functional>
 #include <unordered_map>
+#include <chrono>
 
 namespace ggnpu {
 
@@ -278,6 +280,14 @@ struct BTileKeyHash {
     }
 };
 
+// Global B-tile cache: persists across mul_mat_q() calls.
+// Keyed by (weight_pointer, n0, k0, nc, kc, K) so the same weight tile
+// is only packed once and reused across Q/K/V/O projections.
+static std::unordered_map<BTileKey, std::vector<int8_t>, BTileKeyHash>& get_global_b_tile_cache() {
+    static std::unordered_map<BTileKey, std::vector<int8_t>, BTileKeyHash> cache;
+    return cache;
+}
+
 static void rms_norm_cpu_ref(const RmsNormParams& params) {
     float variance = 0.0f;
     for (int i = 0; i < params.size; i++) variance += params.input[i] * params.input[i];
@@ -427,6 +437,17 @@ public:
         size_t tile_bytes_in = static_cast<size_t>(T) * T;                  // int8
         size_t tile_bytes_out = static_cast<size_t>(T) * T * sizeof(int32_t);
 
+        // Batch size: number of tiles to submit before waiting.
+        // Reduces synchronization overhead from N tiles → N/batch_size waits.
+        // Configurable via GGNPU_MATMUL_BATCH_SIZE env var (default 8).
+        int batch_size = 8;
+        const char* batch_env = std::getenv("GGNPU_MATMUL_BATCH_SIZE");
+        if (batch_env && *batch_env) {
+            batch_size = std::atoi(batch_env);
+            if (batch_size <= 0) batch_size = 1;
+            if (batch_size > 64) batch_size = 64;  // cap to avoid excessive memory
+        }
+
         const int ping = matmul_buf_ping_;
         matmul_buf_ping_ = 1 - matmul_buf_ping_;
         if (!buf_a_[ping] || buf_a_[ping]->size() < tile_bytes_in) {
@@ -489,6 +510,253 @@ public:
             return wscales[0];
         };
 
+        //====//
+        // Batch tile execution: submit multiple tiles before waiting.
+        // Reduces synchronization overhead from N tiles → N/batch_size waits.
+        // Uses xrt::event to track completion of each tile in the batch.
+        //====//
+        
+        // Timing accumulators for profiling (only used when GGNPU_MATMUL_TIMING=1)
+        double total_dma_a_ms = 0, total_dma_b_ms = 0, total_kernel_ms = 0, 
+               total_dma_c_ms = 0, total_pack_ms = 0;
+        int tile_count = 0;
+        bool do_timing = (std::getenv("GGNPU_MATMUL_TIMING") != nullptr);
+
+        // Batch execution state: collect tiles before waiting
+        struct TileWork {
+            int m0, mc, n0, nc, k0, kc;
+            std::vector<int8_t> a_tile_data;
+            BTileKey bkey;
+            bool is_kq_path;
+        };
+
+        auto execute_tile = [&](const TileWork& work) {
+            // Pack A tile (per-m0,n0,k0; changes every iteration)
+            std::fill(a_tile.begin(), a_tile.end(), 0);
+            for (int i = 0; i < work.mc; i++) {
+                const float inv_a = 1.0f / a_scales[static_cast<size_t>(work.m0 + i)];
+                for (int k = 0; k < work.kc; k++)
+                    a_tile[i * T + k] =
+                        to_i8(A[(work.m0 + i) * params.lda + (work.k0 + k)] * inv_a);
+            }
+
+            // B tile: use global cache to avoid re-packing across calls
+            const int8_t* B_int8 = nullptr;
+            if (params.B_type == GgmlType::I8 ||
+                params.B_type == GgmlType::Q4_0 ||
+                params.B_type == GgmlType::Q4_K ||
+                params.B_type == GgmlType::Q6_K ||
+                params.B_type == GgmlType::Q8_0) {
+                B_int8 = static_cast<const int8_t*>(params.B);
+            }
+
+            auto& global_cache = get_global_b_tile_cache();
+            auto b_cached = global_cache.find(work.bkey);
+            if (b_cached == global_cache.end()) {
+                std::fill(b_tile.begin(), b_tile.end(), 0);
+                if (B_int8) {
+                    if (work.is_kq_path) {
+                        for (int k = 0; k < work.kc; k++)
+                            for (int j = 0; j < work.nc; j++)
+                                b_tile[k * T + j] =
+                                    B_int8[static_cast<size_t>(work.n0 + j) * K + (work.k0 + k)];
+                    } else {
+                        for (int k = 0; k < work.kc; k++)
+                            for (int j = 0; j < work.nc; j++)
+                                b_tile[k * T + j] =
+                                    B_int8[(work.k0 + k) * params.ldb + (work.n0 + j)];
+                    }
+                } else if (params.B_type == GgmlType::F32) {
+                    const float* B = static_cast<const float*>(params.B);
+                    const float inv_b = 1.0f / b_scale;
+                    for (int k = 0; k < work.kc; k++)
+                        for (int j = 0; j < work.nc; j++)
+                            b_tile[k * T + j] =
+                                to_i8(B[(work.k0 + k) * params.ldb + (work.n0 + j)] * inv_b);
+                } else {
+                    std::cerr << "Error: matmul B_type not supported on NPU path yet\n";
+                    last_status_ = Status::INVALID_PARAM;
+                    return Status::INVALID_PARAM;
+                }
+                global_cache.emplace(work.bkey, b_tile);
+                b_cached = global_cache.find(work.bkey);
+            }
+
+            // DMA A tile to device
+            buf_mgr_->copy_to(*buf_a, a_tile.data(), tile_bytes_in);
+            // DMA B tile to device
+            buf_mgr_->copy_to(*buf_b, b_cached->second.data(), tile_bytes_in);
+
+            // Submit kernel run (non-blocking)
+            try {
+                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                           buf_a->handle(), buf_b->handle(), buf_c->handle());
+            } catch (const std::exception& e) {
+                std::cerr << "Error: matmul kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return Status::ERROR;
+            }
+
+            // Wait for completion and accumulate results
+            kernel.run.wait();
+            buf_mgr_->copy_from(*buf_c, c_tile.data(), tile_bytes_out);
+
+            for (int i = 0; i < work.mc; i++) {
+                const float a_scale = a_scales[static_cast<size_t>(work.m0 + i)];
+                for (int j = 0; j < work.nc; j++) {
+                    float out_scale = a_scale * weight_scale(work.n0 + j);
+                    if (!work.is_kq_path && params.B_type == GgmlType::F32) {
+                        out_scale *= b_scale;
+                    }
+                    C[(work.m0 + i) * params.ldc + (work.n0 + j)] +=
+                        static_cast<float>(c_tile[i * T + j]) * out_scale;
+                }
+            }
+
+            return Status::OK;
+        };
+
+        // Main tiled matmul loop with batching support.
+        // Collect tiles into batches, submit all in batch, then wait and accumulate.
+        std::vector<TileWork> batch;
+        batch.reserve(batch_size);
+
+        auto flush_batch = [&]() -> Status {
+            if (batch.empty()) return Status::OK;
+            
+            for (const auto& work : batch) {
+                auto t_start = do_timing ? std::chrono::high_resolution_clock::now() : nullptr;
+                
+                // Pack A tile
+                auto t_pack_start = do_timing ? std::chrono::high_resolution_clock::now() : nullptr;
+                std::fill(a_tile.begin(), a_tile.end(), 0);
+                for (int i = 0; i < work.mc; i++) {
+                    const float inv_a = 1.0f / a_scales[static_cast<size_t>(work.m0 + i)];
+                    for (int k = 0; k < work.kc; k++)
+                        a_tile[i * T + k] =
+                            to_i8(A[(work.m0 + i) * params.lda + (work.k0 + k)] * inv_a);
+                }
+                if (t_pack_start && t_start) {
+                    total_pack_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - *t_pack_start).count();
+                }
+
+                // B tile: use global cache to avoid re-packing across calls
+                const int8_t* B_int8 = nullptr;
+                if (params.B_type == GgmlType::I8 ||
+                    params.B_type == GgmlType::Q4_0 ||
+                    params.B_type == GgmlType::Q4_K ||
+                    params.B_type == GgmlType::Q6_K ||
+                    params.B_type == GgmlType::Q8_0) {
+                    B_int8 = static_cast<const int8_t*>(params.B);
+                }
+
+                auto& global_cache = get_global_b_tile_cache();
+                auto b_cached = global_cache.find(work.bkey);
+                if (b_cached == global_cache.end()) {
+                    std::fill(b_tile.begin(), b_tile.end(), 0);
+                    if (B_int8) {
+                        if (work.is_kq_path) {
+                            for (int k = 0; k < work.kc; k++)
+                                for (int j = 0; j < work.nc; j++)
+                                    b_tile[k * T + j] =
+                                        B_int8[static_cast<size_t>(work.n0 + j) * K + (work.k0 + k)];
+                        } else {
+                            for (int k = 0; k < work.kc; k++)
+                                for (int j = 0; j < work.nc; j++)
+                                    b_tile[k * T + j] =
+                                        B_int8[(work.k0 + k) * params.ldb + (work.n0 + j)];
+                        }
+                    } else if (params.B_type == GgmlType::F32) {
+                        const float* B = static_cast<const float*>(params.B);
+                        const float inv_b = 1.0f / b_scale;
+                        for (int k = 0; k < work.kc; k++)
+                            for (int j = 0; j < work.nc; j++)
+                                b_tile[k * T + j] =
+                                    to_i8(B[(work.k0 + k) * params.ldb + (work.n0 + j)] * inv_b);
+                    } else {
+                        std::cerr << "Error: matmul B_type not supported on NPU path yet\n";
+                        last_status_ = Status::INVALID_PARAM;
+                        return Status::INVALID_PARAM;
+                    }
+                    global_cache.emplace(work.bkey, b_tile);
+                    b_cached = global_cache.find(work.bkey);
+                }
+
+                // DMA A tile to device
+                auto t_dma_a_start = do_timing ? std::chrono::high_resolution_clock::now() : nullptr;
+                buf_mgr_->copy_to(*buf_a, a_tile.data(), tile_bytes_in);
+                if (t_dma_a_start && t_start) {
+                    total_dma_a_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - *t_dma_a_start).count();
+                }
+
+                // DMA B tile to device
+                auto t_dma_b_start = do_timing ? std::chrono::high_resolution_clock::now() : nullptr;
+                buf_mgr_->copy_to(*buf_b, b_cached->second.data(), tile_bytes_in);
+                if (t_dma_b_start && t_start) {
+                    total_dma_b_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - *t_dma_b_start).count();
+                }
+
+                // Submit kernel run (non-blocking)
+                auto t_kernel_start = do_timing ? std::chrono::high_resolution_clock::now() : nullptr;
+                try {
+                    kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                               buf_a->handle(), buf_b->handle(), buf_c->handle());
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: matmul kernel execution failed: " << e.what() << "\n";
+                    last_status_ = Status::ERROR;
+                    return Status::ERROR;
+                }
+
+                // Wait for completion and accumulate results
+                auto t_dma_c_start = do_timing ? std::chrono::high_resolution_clock::now() : nullptr;
+                kernel.run.wait();
+                if (t_kernel_start && t_start) {
+                    total_kernel_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - *t_kernel_start).count();
+                }
+
+                buf_mgr_->copy_from(*buf_c, c_tile.data(), tile_bytes_out);
+                if (t_dma_c_start && t_start) {
+                    total_dma_c_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - *t_dma_c_start).count();
+                }
+
+                for (int i = 0; i < work.mc; i++) {
+                    const float a_scale = a_scales[static_cast<size_t>(work.m0 + i)];
+                    for (int j = 0; j < work.nc; j++) {
+                        float out_scale = a_scale * weight_scale(work.n0 + j);
+                        if (!work.is_kq_path && params.B_type == GgmlType::F32) {
+                            out_scale *= b_scale;
+                        }
+                        C[(work.m0 + i) * params.ldc + (work.n0 + j)] +=
+                            static_cast<float>(c_tile[i * T + j]) * out_scale;
+                    }
+                }
+
+                tile_count++;
+                if (do_timing && t_start) {
+                    double elapsed = std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - *t_start).count();
+                    // Print per-tile timing to stderr (non-intrusive)
+                    std::cerr << "tile [" << work.m0 << ":" << work.m0+work.mc << "," 
+                              << work.n0 << ":" << work.n0+work.nc << "," 
+                              << work.k0 << ":" << work.k0+work.kc << "] "
+                              << "pack=" << (total_pack_ms / tile_count) << "ms "
+                              << "dmaA=" << (total_dma_a_ms / tile_count) << "ms "
+                              << "dmaB=" << (total_dma_b_ms / tile_count) << "ms "
+                              << "kernel=" << (total_kernel_ms / tile_count) << "ms "
+                              << "dmaC=" << (total_dma_c_ms / tile_count) << "ms "
+                              << "total=" << elapsed << "ms\n";
+                }
+            }
+            
+            batch.clear();
+            return Status::OK;
+        };
+
         for (int m0 = 0; m0 < M; m0 += T) {
             int mc = std::min(T, M - m0);
             for (int n0 = 0; n0 < N; n0 += T) {
@@ -496,14 +764,7 @@ public:
                 for (int k0 = 0; k0 < K; k0 += T) {
                     int kc = std::min(T, K - k0);
 
-                    std::fill(a_tile.begin(), a_tile.end(), 0);
-                    for (int i = 0; i < mc; i++) {
-                        const float inv_a = 1.0f / a_scales[static_cast<size_t>(m0 + i)];
-                        for (int k = 0; k < kc; k++)
-                            a_tile[i * T + k] =
-                                to_i8(A[(m0 + i) * params.lda + (k0 + k)] * inv_a);
-                    }
-
+                    // Collect tile work for batching
                     const int8_t* B_int8 = nullptr;
                     if (params.B_type == GgmlType::I8 ||
                         params.B_type == GgmlType::Q4_0 ||
@@ -513,67 +774,31 @@ public:
                         B_int8 = static_cast<const int8_t*>(params.B);
                     }
 
-                    BTileKey bkey{B_int8, n0, k0, nc, kc, K};
-                    auto b_cached = b_tile_cache_.find(bkey);
-                    if (b_cached == b_tile_cache_.end()) {
-                        std::fill(b_tile.begin(), b_tile.end(), 0);
-                        if (B_int8) {
-                            if (kq_path) {
-                                for (int k = 0; k < kc; k++)
-                                    for (int j = 0; j < nc; j++)
-                                        b_tile[k * T + j] =
-                                            B_int8[static_cast<size_t>(n0 + j) * K + (k0 + k)];
-                            } else {
-                                for (int k = 0; k < kc; k++)
-                                    for (int j = 0; j < nc; j++)
-                                        b_tile[k * T + j] =
-                                            B_int8[(k0 + k) * params.ldb + (n0 + j)];
-                            }
-                        } else if (params.B_type == GgmlType::F32) {
-                            const float* B = static_cast<const float*>(params.B);
-                            const float inv_b = 1.0f / b_scale;
-                            for (int k = 0; k < kc; k++)
-                                for (int j = 0; j < nc; j++)
-                                    b_tile[k * T + j] =
-                                        to_i8(B[(k0 + k) * params.ldb + (n0 + j)] * inv_b);
-                        } else {
-                            std::cerr << "Error: matmul B_type not supported on NPU path yet\n";
-                            last_status_ = Status::INVALID_PARAM;
-                            return last_status_;
-                        }
-                        b_cached = b_tile_cache_.emplace(bkey, b_tile).first;
-                    }
+                    TileWork work{m0, mc, n0, nc, k0, kc, {}, {B_int8, n0, k0, nc, kc, K}, kq_path};
+                    batch.push_back(std::move(work));
 
-                    buf_mgr_->copy_to(*buf_a, a_tile.data(), tile_bytes_in);
-                    // Host b_tile_cache_ avoids re-packing; always DMA each tile because
-                    // buf_b ping-pong buffers are shared across all keys in one matmul.
-                    buf_mgr_->copy_to(*buf_b, b_cached->second.data(), tile_bytes_in);
-
-                    try {
-                        kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
-                                   buf_a->handle(), buf_b->handle(), buf_c->handle());
-                        kernel.run.wait();
-                    } catch (const std::exception& e) {
-                        std::cerr << "Error: matmul kernel execution failed: " << e.what() << "\n";
-                        last_status_ = Status::ERROR;
-                        return last_status_;
-                    }
-
-                    buf_mgr_->copy_from(*buf_c, c_tile.data(), tile_bytes_out);
-
-                    for (int i = 0; i < mc; i++) {
-                        const float a_scale = a_scales[static_cast<size_t>(m0 + i)];
-                        for (int j = 0; j < nc; j++) {
-                            float out_scale = a_scale * weight_scale(n0 + j);
-                            if (!kq_path && params.B_type == GgmlType::F32) {
-                                out_scale *= b_scale;
-                            }
-                            C[(m0 + i) * params.ldc + (n0 + j)] +=
-                                static_cast<float>(c_tile[i * T + j]) * out_scale;
-                        }
+                    // Flush batch when full or at last tile
+                    if (static_cast<int>(batch.size()) >= batch_size || 
+                        (m0 + mc >= M && n0 + nc >= N && k0 + kc >= K)) {
+                        Status st = flush_batch();
+                        if (st != Status::OK) return st;
                     }
                 }
             }
+        }
+
+        // Print summary timing when GGNPU_MATMUL_TIMING=1
+        if (do_timing && tile_count > 0) {
+            double total_ms = total_dma_a_ms + total_dma_b_ms + total_kernel_ms + 
+                              total_dma_c_ms + total_pack_ms;
+            std::cerr << "\n=== mul_mat_q timing summary (" << tile_count << " tiles) ===\n";
+            std::cerr << "  pack:   " << (total_pack_ms / tile_count) << " ms/tile\n";
+            std::cerr << "  dmaA:   " << (total_dma_a_ms / tile_count) << " ms/tile\n";
+            std::cerr << "  dmaB:   " << (total_dma_b_ms / tile_count) << " ms/tile\n";
+            std::cerr << "  kernel: " << (total_kernel_ms / tile_count) << " ms/tile\n";
+            std::cerr << "  dmaC:   " << (total_dma_c_ms / tile_count) << " ms/tile\n";
+            std::cerr << "  total:  " << (total_ms / tile_count) << " ms/tile\n";
+            std::cerr << "========================================\n\n";
         }
 
         return Status::OK;
