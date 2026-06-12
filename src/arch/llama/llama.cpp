@@ -64,10 +64,15 @@ bool Model::parse_hparams() {
     hparams_.attention_layer_norm_rms_epsilon =
         static_cast<float>(gguf_->attention_layer_norm_rms_epsilon());
 
-    // Get vocab size from GGUF if available
-    auto vocab_it = gguf_->kv_pairs().find("tokenizer.ggml.tokens.length");
+    // Vocab size: prefer llama.vocab_size (Llama 3+), fall back to legacy keys.
+    auto vocab_it = gguf_->kv_pairs().find("llama.vocab_size");
     if (vocab_it != gguf_->kv_pairs().end()) {
         hparams_.vocab_size = static_cast<uint64_t>(vocab_it->second.int_value);
+    } else {
+        vocab_it = gguf_->kv_pairs().find("tokenizer.ggml.tokens.length");
+        if (vocab_it != gguf_->kv_pairs().end()) {
+            hparams_.vocab_size = static_cast<uint64_t>(vocab_it->second.int_value);
+        }
     }
 
     // Default values for missing params

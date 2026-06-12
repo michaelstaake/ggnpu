@@ -72,6 +72,34 @@ void dequant_tensor_row(const TensorView* tv, int row, float* out, int row_dim) 
     }
 }
 
+// Exact vocab projection: hidden @ weight^T with on-the-fly Q4_K/Q6_K dequant.
+void compute_logits_f32(const float* hidden, const TensorView* weight, float* logits,
+                        int vocab_size, int hidden_size) {
+    if (!weight || !hidden || !logits) return;
+
+    std::vector<float> row(static_cast<size_t>(hidden_size));
+    for (int v = 0; v < vocab_size; v++) {
+        dequant_tensor_row(weight, v, row.data(), hidden_size);
+        float sum = 0.0f;
+        for (int d = 0; d < hidden_size; d++) {
+            sum += hidden[d] * row[d];
+        }
+        logits[v] = sum;
+    }
+}
+
+void print_top_logits(const std::vector<float>& logits, const Tokenizer& tokenizer, int k = 8) {
+    std::vector<int> order(logits.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::partial_sort(order.begin(), order.begin() + std::min(k, static_cast<int>(order.size())),
+                      order.end(), [&](int a, int b) { return logits[a] > logits[b]; });
+    for (int i = 0; i < k && i < static_cast<int>(order.size()); i++) {
+        int id = order[static_cast<size_t>(i)];
+        std::cout << "    top" << i << ": id=" << id << " logit=" << logits[static_cast<size_t>(id)]
+                  << " text=" << tokenizer.decode(id) << "\n";
+    }
+}
+
 constexpr const char* VERSION = "0.1.0";
 
 struct CliParams {
@@ -90,6 +118,7 @@ struct CliParams {
     bool bench_matmul = false;
     bool bench_layer = false;
     int bench_layer_num = 0;
+    bool bench_logits = false;
     bool show_version = false;
 };
 
@@ -105,6 +134,7 @@ void print_help() {
     std::cout << "  --dump-tensors                     List tensors; no NPU\n";
     std::cout << "  bench-matmul                       NPU matmul benchmark\n";
     std::cout << "  bench-layer [options]              Validate one decoder layer on NPU vs CPU ref\n";
+    std::cout << "  bench-logits [options]             Print top logits after prompt (CPU F32)\n";
     std::cout << "  --version                          Version + backend info\n\n";
     std::cout << "Flags:\n";
     std::cout << "  -m, --model <path>                 Path to .gguf (required)\n";
@@ -144,6 +174,8 @@ CliParams parse_args(int argc, char* argv[]) {
             params.bench_matmul = true;
         } else if (arg == "bench-layer") {
             params.bench_layer = true;
+        } else if (arg == "bench-logits") {
+            params.bench_logits = true;
         } else if (arg == "-m" || arg == "--model") {
             if (i + 1 < argc) params.model_path = argv[++i];
         } else if (arg == "-p" || arg == "--prompt") {
@@ -230,14 +262,23 @@ bool report_compare(const char* label, const CompareResult& r, int n,
     return false;
 }
 
-void attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cache) {
-    if (w && (w->type == GgmlType::Q4_K || w->type == GgmlType::Q6_K)) {
-        const auto& scales = cache.get_scales(*w);
-        if (!scales.empty()) {
-            p.scales = scales.data();
-            p.n_weight_scales = static_cast<int>(scales.size());
-        }
+bool attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cache) {
+    if (!w || (w->type != GgmlType::Q4_K && w->type != GgmlType::Q6_K)) {
+        return true;
     }
+    const auto& scales = cache.get_scales(*w);
+    if (scales.empty()) {
+        std::cerr << "Error: missing K-quant scales for " << w->name << "\n";
+        return false;
+    }
+    if (static_cast<int>(scales.size()) != 1 && static_cast<int>(scales.size()) != p.N) {
+        std::cerr << "Error: scale count " << scales.size() << " != 1 or N=" << p.N
+                  << " for " << w->name << "\n";
+        return false;
+    }
+    p.scales = scales.data();
+    p.n_weight_scales = static_cast<int>(scales.size());
+    return true;
 }
 
 // Compare NPU decoded matmul vs CPU on-the-fly dequant matmul.
@@ -270,7 +311,7 @@ bool bench_quant_matmul(const char* label, Backend& cpu, Backend& npu, WeightCac
     npu_p.M = M; npu_p.N = N; npu_p.K = K;
     npu_p.lda = lda; npu_p.ldb = ldb; npu_p.ldc = ldc;
     npu_p.B_type = weight->type;
-    attach_kquant_scales(npu_p, weight, cache);
+    if (!attach_kquant_scales(npu_p, weight, cache)) return false;
     Status st = npu.mul_mat_q(npu_p);
     npu.sync();
     if (st != Status::OK) {
@@ -637,7 +678,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  FFN: " << hparams.feed_forward_length << "\n\n";
 
     // bench-layer generates its own test input — skip the prompt requirement
-    if (params.prompt.empty() && !params.bench_layer) {
+    if (params.prompt.empty() && !params.bench_layer && !params.bench_logits) {
         std::cout << "No prompt provided. Use --prompt or -p to specify input.\n";
         model.unload();
         return 0;
@@ -686,7 +727,8 @@ int main(int argc, char* argv[]) {
     std::vector<float> ffn_up;
     std::vector<float> ffn_down;
     std::vector<float> ffn_silu;
-    std::vector<float> logits(static_cast<size_t>(hparams.vocab_size));
+    const int vocab_size = tokenizer.vocab_size();
+    std::vector<float> logits(static_cast<size_t>(vocab_size));
 
     // Llama 3+ ships rope_freqs.weight as per-dimension factors for ggml_rope_ext (not divisors).
     std::vector<float> rope_freq_factors(head_dim / 2, 1.0f);
@@ -705,8 +747,15 @@ int main(int argc, char* argv[]) {
 
     int64_t pos = 0;
     int generated = 0;
-    std::vector<int> current_tokens = input_tokens;
+    int last_sampled = -1;
+    size_t prompt_idx = 0;
+    int max_layers_override = num_layers;
+    if (const char* ml = std::getenv("GGNPU_MAX_LAYERS")) {
+        max_layers_override = std::max(0, std::atoi(ml));
+        if (max_layers_override > num_layers) max_layers_override = num_layers;
+    }
 
+    // Llama uses GGML_ROPE_TYPE_NORMAL: rotate adjacent pairs (2i, 2i+1), not NeoX halves.
     auto apply_rope = [&](float* out, const float* inp, int n_heads, int64_t offset,
                           int n_dims, const std::vector<float>& freq_factors) {
         for (int h = 0; h < n_heads; h++) {
@@ -721,10 +770,12 @@ int main(int argc, char* argv[]) {
                 float cos_val = std::cos(angle);
                 float sin_val = std::sin(angle);
 
-                float v0 = inp[h * n_dims + i];
-                float v1 = inp[h * n_dims + i + n_dims / 2];
-                out[h * n_dims + i] = v0 * cos_val - v1 * sin_val;
-                out[h * n_dims + i + n_dims / 2] = v0 * sin_val + v1 * cos_val;
+                const int i0 = h * n_dims + 2 * i;
+                const int i1 = i0 + 1;
+                float v0 = inp[i0];
+                float v1 = inp[i1];
+                out[i0] = v0 * cos_val - v1 * sin_val;
+                out[i1] = v0 * sin_val + v1 * cos_val;
             }
         }
     };
@@ -745,8 +796,8 @@ int main(int argc, char* argv[]) {
     const bool npu_matmul = (backend->name() == "amd_xdna");
 
     auto mul_mat_weight = [&](const float* A, const TensorView* weight, float* C,
-                              int M, int N, int K, int lda, int ldb, int ldc) {
-        if (!weight) return;
+                              int M, int N, int K, int lda, int ldb, int ldc) -> bool {
+        if (!weight) return false;
 
         MulMatParams mat_params;
         mat_params.A = A;
@@ -764,14 +815,16 @@ int main(int argc, char* argv[]) {
 
         if (npu_matmul) {
             const int8_t* decoded = weight_cache.get_or_decode(*weight);
-            if (!decoded) return;
+            if (!decoded) {
+                std::cerr << "Error: failed to decode " << weight->name << "\n";
+                return false;
+            }
             mat_params.B = decoded;
-            attach_kquant_scales(mat_params, weight, weight_cache);
+            if (!attach_kquant_scales(mat_params, weight, weight_cache)) return false;
         } else {
-            // CPU reference dequantizes from raw GGUF block layout (not INT8 cache).
             mat_params.B = weight->data;
         }
-        backend->mul_mat_q(mat_params);
+        return backend->mul_mat_q(mat_params) == Status::OK;
     };
 
     //====//
@@ -977,7 +1030,7 @@ int main(int argc, char* argv[]) {
             gate_params.ldc = ffn_size;
             gate_params.n_batches = 1;
             gate_params.B_type = ffn_gate_w->type;
-            attach_kquant_scales(gate_params, ffn_gate_w, weight_cache);
+            if (!attach_kquant_scales(gate_params, ffn_gate_w, weight_cache)) return 1;
             npu_backend->mul_mat_q(gate_params);
 
             MulMatParams up_params;
@@ -992,7 +1045,7 @@ int main(int argc, char* argv[]) {
             up_params.ldc = ffn_size;
             up_params.n_batches = 1;
             up_params.B_type = ffn_up_w->type;
-            attach_kquant_scales(up_params, ffn_up_w, weight_cache);
+            if (!attach_kquant_scales(up_params, ffn_up_w, weight_cache)) return 1;
             npu_backend->mul_mat_q(up_params);
             npu_backend->sync();
 
@@ -1019,7 +1072,7 @@ int main(int argc, char* argv[]) {
             down_params.ldc = hidden_size;
             down_params.n_batches = 1;
             down_params.B_type = ffn_down_w->type;
-            attach_kquant_scales(down_params, ffn_down_w, weight_cache);
+            if (!attach_kquant_scales(down_params, ffn_down_w, weight_cache)) return 1;
 
             st = npu_backend->mul_mat_q(down_params);
             npu_backend->sync();
@@ -1099,7 +1152,7 @@ int main(int argc, char* argv[]) {
                         if (!dec) return false;
                         mp.B = dec;
                         mp.B_type = w->type;
-                        attach_kquant_scales(mp, w, weight_cache);
+                        if (!attach_kquant_scales(mp, w, weight_cache)) return false;
                     } else {
                         mp.B = w->data;
                         mp.B_type = w->type;
@@ -1207,18 +1260,36 @@ int main(int argc, char* argv[]) {
     const TensorView* output_w = find_tensor(model, "output.weight");
     const TensorView* logits_w = output_w ? output_w : tok_embd;
 
-    // Main generation loop
-    std::cout << "Generating: ";
+    if (!tok_embd) {
+        std::cerr << "Error: token_embd.weight not available\n";
+        model.unload();
+        return 1;
+    }
+
+    model.kv_cache().reset();
+
+    // Decode-style forward: one token per step (correct KV + causal attention).
+    if (!params.bench_logits) {
+        std::cout << "Generating: ";
+    } else {
+        std::cout << "bench-logits: " << input_tokens.size() << " prompt tokens\n";
+    }
 
     bool first_token = true;
-    while (generated < params.max_tokens) {
-        int n_tokens = static_cast<int>(current_tokens.size());
-        if (n_tokens == 0) break;
-
-        if (!tok_embd) {
-            std::cerr << "Error: token_embd.weight not available\n";
+    while (generated < params.max_tokens || params.bench_logits) {
+        int tok = 0;
+        bool do_sample = false;
+        if (prompt_idx < input_tokens.size()) {
+            tok = input_tokens[prompt_idx++];
+            do_sample = (prompt_idx >= input_tokens.size());
+        } else if (params.bench_logits) {
             break;
+        } else {
+            tok = last_sampled;
+            do_sample = true;
         }
+
+        const int n_tokens = 1;
 
         inp_embd.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
         inp_norm.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
@@ -1233,14 +1304,10 @@ int main(int argc, char* argv[]) {
         ffn_down.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
         ffn_silu.assign(static_cast<size_t>(n_tokens) * ffn_size, 0.0f);
 
-        for (int t = 0; t < n_tokens; t++) {
-            dequant_tensor_row(tok_embd, current_tokens[t],
-                               inp_embd.data() + static_cast<size_t>(t) * hidden_size,
-                               hidden_size);
-        }
+        dequant_tensor_row(tok_embd, tok, inp_embd.data(), hidden_size);
 
         // Transformer layers
-        for (int layer = 0; layer < num_layers; layer++) {
+        for (int layer = 0; layer < max_layers_override; layer++) {
             const TensorView* attn_norm_w =
                 find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", layer);
             const TensorView* ffn_norm_w =
@@ -1267,27 +1334,14 @@ int main(int argc, char* argv[]) {
 
             backend->sync();
 
-            // Apply RoPE to Q and K (per token row)
-            for (int t = 0; t < n_tokens; t++) {
-                int64_t token_pos = pos + t;
-                apply_rope(q_rope.data() + t * hidden_size,
-                           q_proj.data() + t * hidden_size,
-                           num_heads, token_pos, head_dim, rope_freq_factors);
-                apply_rope(k_rope.data() + t * num_kv_heads * head_dim,
-                           k_proj.data() + t * num_kv_heads * head_dim,
-                           num_kv_heads, token_pos, head_dim, rope_freq_factors);
-            }
+            apply_rope(q_rope.data(), q_proj.data(), num_heads, pos, head_dim, rope_freq_factors);
+            apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos, head_dim, rope_freq_factors);
 
-            // Store KV in cache (per token row)
-            for (int t = 0; t < n_tokens; t++) {
-                model.kv_cache().update_slab(layer, pos + t, pos + t + 1,
-                                             k_rope.data() + t * num_kv_heads * head_dim,
-                                             v_proj.data() + t * num_kv_heads * head_dim,
-                                             num_kv_heads, head_dim);
-            }
+            model.kv_cache().update_slab(layer, pos, pos + 1,
+                                         k_rope.data(), v_proj.data(),
+                                         num_kv_heads, head_dim);
 
-            // Attention: compute softmax(QK^T / sqrt(d)) @ V via NPU
-            int64_t ctx_len = pos + n_tokens;
+            int64_t ctx_len = pos + 1;
             int64_t num_kv_heads = hparams.attention_head_count_kv;
             int64_t qkv_groups = hparams.attention_head_count / num_kv_heads;
 
@@ -1310,21 +1364,19 @@ int main(int argc, char* argv[]) {
 
             std::vector<float> attn_out(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
 
-            for (int t = 0; t < n_tokens; t++) {
-                for (int h = 0; h < num_heads; h++) {
-                    AttnParams fa_params;
-                    fa_params.Q = q_rope.data() + t * hidden_size + h * head_dim;
-                    fa_params.K = k_expanded.data() + h * ctx_len * head_dim;
-                    fa_params.V = v_expanded.data() + h * ctx_len * head_dim;
-                    fa_params.output = attn_out.data() + t * hidden_size + h * head_dim;
-                    fa_params.batch_size = 1;
-                    fa_params.n_head = 1;
-                    fa_params.head_dim = head_dim;
-                    fa_params.ctx_len = ctx_len;
-                    fa_params.query_pos = pos + t;
-                    fa_params.freq_factors = nullptr;
-                    backend->flash_attn(fa_params);
-                }
+            for (int h = 0; h < num_heads; h++) {
+                AttnParams fa_params;
+                fa_params.Q = q_rope.data() + h * head_dim;
+                fa_params.K = k_expanded.data() + h * ctx_len * head_dim;
+                fa_params.V = v_expanded.data() + h * ctx_len * head_dim;
+                fa_params.output = attn_out.data() + h * head_dim;
+                fa_params.batch_size = 1;
+                fa_params.n_head = 1;
+                fa_params.head_dim = head_dim;
+                fa_params.ctx_len = ctx_len;
+                fa_params.query_pos = pos;
+                fa_params.freq_factors = nullptr;
+                backend->flash_attn(fa_params);
             }
 
             // Attention output projection
@@ -1398,20 +1450,36 @@ int main(int argc, char* argv[]) {
         rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
                  get_float_ptr(output_norm_w));
 
-        // Logits: hidden @ weight^T (tied to token_embd when output.weight absent)
+        pos++;
+
+        if (!do_sample) {
+            backend->sync();
+            continue;
+        }
+
+        // Logits: exact F32 dequant for vocab projection (128k-way argmax is sensitive).
         if (logits_w) {
-            std::fill(logits.begin(), logits.end(), 0.0f);
-            const float* last_hidden =
-                inp_norm.data() + static_cast<size_t>(n_tokens - 1) * hidden_size;
-            int vocab_size = static_cast<int>(hparams.vocab_size);
-            mul_mat_weight(last_hidden, logits_w, logits.data(),
-                           1, vocab_size, hidden_size,
-                           hidden_size, hidden_size, vocab_size);
+            compute_logits_f32(inp_norm.data(), logits_w, logits.data(),
+                                 vocab_size, hidden_size);
         }
 
         backend->sync();
 
-        // Sample next token from last position
+        if (params.bench_logits) {
+            std::cout << "Top logits after prompt (pos=" << pos
+                      << ", layers=" << max_layers_override << "):\n";
+            for (int paris_id : {12366, 60704}) {
+                if (paris_id < vocab_size) {
+                    std::cout << "    candidate id=" << paris_id << " logit="
+                              << logits[static_cast<size_t>(paris_id)]
+                              << " text=" << tokenizer.decode(paris_id) << "\n";
+                }
+            }
+            print_top_logits(logits, tokenizer, 10);
+            model.unload();
+            return 0;
+        }
+
         int next_token = sample_token(logits, params.temp, rng_seed);
         std::string decoded = tokenizer.decode(next_token);
 
@@ -1423,9 +1491,7 @@ int main(int argc, char* argv[]) {
         }
         std::cout.flush();
 
-        current_tokens.clear();
-        current_tokens.push_back(next_token);
-        pos += n_tokens;
+        last_sampled = next_token;
         generated++;
 
         if (next_token == tokenizer.eos_token_id()) break;

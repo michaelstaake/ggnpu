@@ -45,14 +45,13 @@ public:
                                 GgmlType type,
                                 int64_t n_rows = 0,
                                 int64_t n_cols = 0) {
-        std::string key = make_key(tensor_name, type);
+        std::string key = make_key(tensor_name, type, data_size);
 
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // Check in-memory cache first
-        auto it = memory_cache_.find(key);
-        if (it != memory_cache_.end() && it->second.data_size == data_size) {
-            return it->second.int8_data.data();
+        auto mem_it = memory_cache_.find(key);
+        if (mem_it != memory_cache_.end()) {
+            return mem_it->second.int8_data.data();
         }
 
         // Check persistent cache
@@ -105,8 +104,9 @@ public:
         return get_or_decode(tv.name, tv.data, tv.data_size(), tv.type, n_rows, n_cols);
     }
 
-    const std::vector<float>& get_scales(const std::string& tensor_name, GgmlType type) {
-        std::string key = make_key(tensor_name, type);
+    const std::vector<float>& get_scales(const std::string& tensor_name, GgmlType type,
+                                         size_t data_size = 0) {
+        std::string key = make_key(tensor_name, type, data_size);
         auto it = memory_cache_.find(key);
         if (it != memory_cache_.end()) {
             return it->second.scales;
@@ -116,7 +116,7 @@ public:
     }
 
     const std::vector<float>& get_scales(const TensorView& tv) {
-        return get_scales(tv.name, tv.type);
+        return get_scales(tv.name, tv.type, tv.data_size());
     }
 
     // Clear all cached weights
@@ -131,12 +131,11 @@ public:
     }
 
 private:
-    std::string make_key(const std::string& tensor_name, GgmlType type) {
+    std::string make_key(const std::string& tensor_name, GgmlType type, size_t data_size = 0) {
         std::hash<std::string> hasher;
         size_t hash = hasher(tensor_name);
-        // v2: per-row K-quant scales (invalidate stale per-tensor cache)
-        const char* ver = (type == GgmlType::Q4_K || type == GgmlType::Q6_K) ? "w2_" : "w_";
-        return std::string(ver) + std::to_string(hash);
+        const char* ver = (type == GgmlType::Q4_K || type == GgmlType::Q6_K) ? "w3_" : "w_";
+        return std::string(ver) + std::to_string(hash) + "_" + std::to_string(data_size);
     }
 
     CompileCache& cache_;
