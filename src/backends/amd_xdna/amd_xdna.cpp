@@ -1140,7 +1140,7 @@ private:
             return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
         }
 
-        // N=2048: JIT-compile M=1,N=2048 kernel (rebuilds generic rmsnorm_npu6.xclbin too).
+        // N=2048 (and other sizes): JIT-compile M=1,N=<size> kernel.
         if (detail::jit_compilation_available()) {
             std::vector<uint8_t> xclbin_data = detail::jit_compile_rmsnorm(N, npu_profile_);
             if (!xclbin_data.empty()) {
@@ -1149,13 +1149,16 @@ private:
             }
         }
 
-        // After rebuilding rmsnorm_npu6.xclbin with M=1,N=2048, generic prebuilt works for hidden=2048.
-        if (N == kRmsnormKernelHidden && hw_ctx_rmsnorm_) {
-            return create_rmsnorm_kernel_from_loaded_xclbin(N, cache_key);
-        }
+        // Do not use generic rmsnorm_npu6.xclbin for N=2048 unless it was rebuilt as M=1,N=2048
+        // (install as rmsnorm_2048_npu6.xclbin). Legacy 32x256 prebuilt gives wrong results at N=2048.
 
         // Fall back to CPU for unsupported sizes
-        std::cerr << "Warning: no rmsnorm xclbin available for N=" << N << "; using CPU fallback\n";
+        static bool warned_missing = false;
+        if (!warned_missing) {
+            std::cerr << "Warning: no rmsnorm xclbin for N=" << N
+                      << " (rebuild: ./scripts/build-kernels.sh npu6 rmsnorm); using CPU fallback\n";
+            warned_missing = true;
+        }
         return false;
     }
 
