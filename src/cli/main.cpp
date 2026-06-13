@@ -303,6 +303,54 @@ const char* status_name(Status status) {
 // BF16 roundtrip functions are in src/utils/bf16.cpp (shared header: ggnpu/bf16.h)
 // Used here for bench-layer RMSNorm comparisons matching NPU DMA path.
 
+// Precomputed RoPE embeddings: cos/sin tables indexed by [position][dim/2].
+// Angles depend only on position and dimension, not input data — computed once.
+struct RopeCache {
+    std::vector<float> cos;  // size: max_pos * (n_dims / 2)
+    std::vector<float> sin;  // size: max_pos * (n_dims / 2)
+    int64_t max_pos = 0;
+    int n_dims = 0;
+    float rope_freq_scale = 1.0f;
+    float rope_freq_base = 10000.0f;
+    std::vector<float> freq_factors;
+
+    void build(int64_t max_pos, int n_dims, float freq_scale, float freq_base,
+               const std::vector<float>& freq_factors) {
+        this->max_pos = max_pos;
+        this->n_dims = n_dims;
+        this->rope_freq_scale = freq_scale;
+        this->rope_freq_base = freq_base;
+        this->freq_factors = freq_factors;
+
+        int pairs = n_dims / 2;
+        cos.resize(static_cast<size_t>(max_pos) * pairs);
+        sin.resize(static_cast<size_t>(max_pos) * pairs);
+
+        for (int64_t pos = 0; pos < max_pos; pos++) {
+            for (int i = 0; i < pairs; i++) {
+                float ff = (i < static_cast<int>(freq_factors.size()))
+                               ? freq_factors[static_cast<size_t>(i)]
+                               : 1.0f;
+                if (ff == 0.0f) ff = 1.0f;
+                float wavelength = std::pow(
+                    static_cast<float>(rope_freq_base),
+                    2.0f * static_cast<float>(i) / static_cast<float>(n_dims));
+                float angle = rope_freq_scale * static_cast<float>(pos) / (wavelength * ff);
+                size_t idx = static_cast<size_t>(pos) * pairs + static_cast<size_t>(i);
+                cos[idx] = std::cos(angle);
+                sin[idx] = std::sin(angle);
+            }
+        }
+    }
+
+    const float* cos_ptr(int64_t pos, int pair_idx) const {
+        return cos.data() + static_cast<size_t>(pos) * (n_dims / 2) + pair_idx;
+    }
+    const float* sin_ptr(int64_t pos, int pair_idx) const {
+        return sin.data() + static_cast<size_t>(pos) * (n_dims / 2) + pair_idx;
+    }
+};
+
 struct CompareResult {
     float max_diff = 0.0f;
     float max_ref = 0.0f;
@@ -786,6 +834,12 @@ int main(int argc, char* argv[]) {
     const int vocab_size = tokenizer.vocab_size();
     std::vector<float> logits(static_cast<size_t>(vocab_size));
 
+    // Preallocate GQA K/V expand buffers (max size: num_heads * ctx_size * head_dim).
+    // Reused every token to avoid per-token allocation.
+    const int64_t kv_expand_max = static_cast<int64_t>(num_heads) * ctx_size * head_dim;
+    std::vector<float> k_expanded(static_cast<size_t>(kv_expand_max));
+    std::vector<float> v_expanded(static_cast<size_t>(kv_expand_max));
+
     // Llama 3+ ships rope_freqs.weight as per-dimension factors for ggml_rope_ext (not divisors).
     std::vector<float> rope_freq_factors(head_dim / 2, 1.0f);
     const TensorView* rope_freqs_t = find_tensor(model, "rope_freqs.weight");
@@ -795,6 +849,10 @@ int main(int argc, char* argv[]) {
             rope_freq_factors[static_cast<size_t>(i)] = rf[i];
         }
     }
+
+    // Precompute RoPE embeddings for all positions up to context size.
+    RopeCache rope_cache;
+    rope_cache.build(ctx_size, head_dim, rope_freq_scale, rope_freq_base, rope_freq_factors);
 
     uint64_t rng_seed = params.seed;
     if (rng_seed == 0) {
@@ -814,19 +872,12 @@ int main(int argc, char* argv[]) {
     InferenceTimings total_timings;
 
     // Llama uses GGML_ROPE_TYPE_NORMAL: rotate adjacent pairs (2i, 2i+1), not NeoX halves.
-    auto apply_rope = [&](float* out, const float* inp, int n_heads, int64_t offset,
-                          int n_dims, const std::vector<float>& freq_factors) {
+    // Uses precomputed rope_cache (built above) — no per-call sin/cos.
+    auto apply_rope = [&](float* out, const float* inp, int n_heads, int64_t offset, int n_dims) {
         for (int h = 0; h < n_heads; h++) {
             for (int i = 0; i < n_dims / 2; i++) {
-                float ff = (i < static_cast<int>(freq_factors.size()))
-                               ? freq_factors[static_cast<size_t>(i)]
-                               : 1.0f;
-                if (ff == 0.0f) ff = 1.0f;
-                float wavelength = std::pow(
-                    rope_freq_base, 2.0f * static_cast<float>(i) / static_cast<float>(n_dims));
-                float angle = rope_freq_scale * static_cast<float>(offset) / (wavelength * ff);
-                float cos_val = std::cos(angle);
-                float sin_val = std::sin(angle);
+                const float cos_val = *rope_cache.cos_ptr(offset, i);
+                const float sin_val = *rope_cache.sin_ptr(offset, i);
 
                 const int i0 = h * n_dims + 2 * i;
                 const int i1 = i0 + 1;
@@ -1251,8 +1302,8 @@ int main(int argc, char* argv[]) {
                                hidden_size, kv_dim, kv_dim)) return false;
                 backend->sync();
 
-                apply_rope(q_r.data(), q.data(), num_heads, 0, head_dim, rope_freq_factors);
-                apply_rope(k_r.data(), k.data(), num_kv_heads, 0, head_dim, rope_freq_factors);
+                apply_rope(q_r.data(), q.data(), num_heads, 0, head_dim);
+                apply_rope(k_r.data(), k.data(), num_kv_heads, 0, head_dim);
 
                 std::vector<float> attn_out(hidden_size, 0.0f);
                 for (int h = 0; h < num_heads; h++) {
@@ -1420,8 +1471,8 @@ int main(int argc, char* argv[]) {
 
             {
                 ScopedTimer t(step_timings.rope_ms);
-                apply_rope(q_rope.data(), q_proj.data(), num_heads, pos, head_dim, rope_freq_factors);
-                apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos, head_dim, rope_freq_factors);
+                apply_rope(q_rope.data(), q_proj.data(), num_heads, pos, head_dim);
+                apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos, head_dim);
             }
 
             model.kv_cache().update_slab(layer, pos, pos + 1,
@@ -1432,14 +1483,15 @@ int main(int argc, char* argv[]) {
             int64_t num_kv_heads = hparams.attention_head_count_kv;
             int64_t qkv_groups = hparams.attention_head_count / num_kv_heads;
 
-            // Expand K/V from num_kv_heads to num_heads (GQA support)
-            // Each KV head is repeated qkv_groups times for the corresponding query heads
-            std::vector<float> k_expanded(static_cast<size_t>(hparams.attention_head_count * ctx_len * head_dim));
-            std::vector<float> v_expanded(static_cast<size_t>(hparams.attention_head_count * ctx_len * head_dim));
+            // Expand K/V from num_kv_heads to num_heads (GQA support).
+            // Uses preallocated buffers — resize keeps allocation when capacity suffices.
+            const int64_t n_heads = hparams.attention_head_count;
+            k_expanded.resize(static_cast<size_t>(n_heads) * ctx_len * head_dim);
+            v_expanded.resize(static_cast<size_t>(n_heads) * ctx_len * head_dim);
 
             {
                 ScopedTimer t(step_timings.kv_expand_ms);
-                for (int64_t h = 0; h < static_cast<int64_t>(hparams.attention_head_count); h++) {
+                for (int64_t h = 0; h < n_heads; h++) {
                     int64_t kv_h = h / qkv_groups;
                     float* kh = k_expanded.data() + h * ctx_len * head_dim;
                     float* vh = v_expanded.data() + h * ctx_len * head_dim;

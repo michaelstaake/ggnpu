@@ -558,7 +558,7 @@ Production commands use the **native host build** (§9). NPU ops (matmul, rmsnor
 | RoPE on CPU | `main.cpp` | Correct Llama 3 math; not on NPU yet |
 | Logits projection on CPU (F32 dequant) | `main.cpp` | `compute_logits_f32()` — accurate; not INT8 NPU path |
 | Residual adds on CPU | `main.cpp` | Cheap; acceptable for MVP |
-| `execute_layer_graph()` unused | `main.cpp` | Dead code |
+| `execute_layer_graph()` unused | `main.cpp` | Already removed |
 
 #### Fixed — Phase 5 inference quality
 
