@@ -135,7 +135,8 @@ private:
         std::hash<std::string> hasher;
         size_t hash = hasher(tensor_name);
         const char* ver = (type == GgmlType::Q4_K || type == GgmlType::Q6_K) ? "w3_" : "w_";
-        return std::string(ver) + std::to_string(hash) + "_" + std::to_string(data_size);
+        return std::string(ver) + std::to_string(hash) + "_t" + std::to_string(static_cast<int>(type))
+               + "_" + std::to_string(data_size);
     }
 
     CompileCache& cache_;

@@ -110,15 +110,15 @@ void test_load_real_model(const std::string& model_path) {
     const auto& tdata = loader.tensor_data();
     ASSERT_TRUE(tdata.size() > 0, "tensor data not empty");
 
-    // Check that Q4_K and Q8_0 types exist in the model
+    // Q4_K_M models use Q4_K and/or Q6_K (not necessarily Q8_0)
     bool has_q4k = false;
-    bool has_q80 = false;
+    bool has_kquant = false;
     for (const auto& t : tensors) {
         if (t.type == ggnpu::GgmlType::Q4_K) has_q4k = true;
-        if (t.type == ggnpu::GgmlType::Q8_0) has_q80 = true;
+        if (t.type == ggnpu::GgmlType::Q4_K || t.type == ggnpu::GgmlType::Q6_K) has_kquant = true;
     }
     ASSERT_TRUE(has_q4k, "model contains Q4_K tensors");
-    ASSERT_TRUE(has_q80, "model contains Q8_0 tensors");
+    ASSERT_TRUE(has_kquant, "model contains K-quant tensors (Q4_K or Q6_K)");
 
     // Verify KV pairs contain tokenizer data
     auto it = loader.kv_pairs().find("tokenizer.ggml.model");
@@ -166,10 +166,11 @@ void test_tensor_info(const std::string& model_path) {
         if (t.name.find("token_embd") != std::string::npos) {
             has_embd = true;
             ASSERT_EQ(t.n_dims, 2, "embedding tensor has 2 dims");
-            // First dim should be vocab size (~128256 for Llama 3.2 1B)
-            ASSERT_TRUE(t.dims[0] > 30000, "vocab size > 30000");
-            // Second dim should match embedding length
-            ASSERT_EQ(t.dims[1], loader.embedding_length(), "embedding dim matches model hparams");
+            uint64_t emb = loader.embedding_length();
+            uint64_t d0 = t.dims[0];
+            uint64_t d1 = t.dims[1];
+            bool layout_ok = (d0 == emb && d1 > 30000) || (d1 == emb && d0 > 30000);
+            ASSERT_TRUE(layout_ok, "token_embd dims are [hidden,vocab] or [vocab,hidden]");
             break;
         }
     }

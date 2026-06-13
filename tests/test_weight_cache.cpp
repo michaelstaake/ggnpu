@@ -117,7 +117,8 @@ void test_get_scales() {
     std::vector<float> data(32, 1.0f);
     weight_cache.get_or_decode("tensor_a", reinterpret_cast<const uint8_t*>(data.data()),
                                 data.size() * sizeof(float), ggnpu::GgmlType::F32, 4, 8);
-    const std::vector<float>& scales2 = weight_cache.get_scales("tensor_a", ggnpu::GgmlType::F32);
+    const std::vector<float>& scales2 = weight_cache.get_scales(
+        "tensor_a", ggnpu::GgmlType::F32, data.size() * sizeof(float));
     ASSERT_TRUE(!scales2.empty(), "scales exist for cached tensor");
 }
 

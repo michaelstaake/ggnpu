@@ -58,11 +58,16 @@ void test_f32_to_bf16_negative_one() {
 
 void test_f32_to_bf16_rounding() {
     std::cout << "  test_f32_to_bf16_rounding\n";
-    // BF16 has 7 mantissa bits; values beyond that should round
-    float f = 1.0f + 1.0f / 256.0f;  // Just above 1.0, within BF16 precision
+    // BF16 ULP at 1.0 is ~0.0078125; 1+1/256 is below half-ULP and rounds to 1.0.
+    float f = 1.0f + 1.0f / 256.0f;
     uint16_t b = ggnpu::f32_to_bf16(f);
     float back = ggnpu::bf16_to_f32(b);
-    ASSERT_NEAR(back, f, 0.001f, "rounding near 1.0");
+    ASSERT_NEAR(back, 1.0f, 1e-6f, "sub-ULP value rounds to 1.0");
+
+    // Value above half-ULP should round up to next representable BF16.
+    float f2 = 1.0f + 1.0f / 128.0f;
+    float back2 = ggnpu::bf16_roundtrip_f32(f2);
+    ASSERT_TRUE(back2 > 1.0f, "value above half-ULP rounds above 1.0");
 }
 
 void test_bf16_to_f32_zero() {

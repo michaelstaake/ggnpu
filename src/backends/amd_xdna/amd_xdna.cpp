@@ -1277,6 +1277,7 @@ private:
             }
 
             hw_ctx_matmul_ = register_xclbin_from_data(*device_, xclbin_data_);
+            matmul_hw_ready_ = true;
             std::cout << "Loaded xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
@@ -1287,15 +1288,16 @@ private:
 
     // Ensure a matmul kernel exists for the given dimensions
     bool ensure_matmul_kernel(int M, int N, int K, GgmlType B_type, const std::string& cache_key) {
-        // Check if we have a cached xclbin for this shape
+        // Reuse the xclbin registered at backend init. Re-registering from cache can
+        // produce an invalid kernel handle (segfault in xrt::kernel::group_id).
+        if (matmul_hw_ready_) {
+            return create_matmul_kernel_from_loaded_xclbin(M, N, K, B_type, cache_key);
+        }
+
+        // Fallback: load from per-shape cached xclbin (JIT path)
         if (cache_->has_xclbin(cache_key)) {
             std::string cached_path = cache_->get_xclbin_path(cache_key);
             return load_matmul_kernel_for_shape(cached_path, M, N, K, B_type, cache_key);
-        }
-
-        // Try to create kernel from the base loaded xclbin (works for any shape if kernel is dimension-agnostic)
-        if (hw_ctx_matmul_) {
-            return create_matmul_kernel_from_loaded_xclbin(M, N, K, B_type, cache_key);
         }
 
         // Try JIT compilation
@@ -1323,15 +1325,7 @@ private:
             CachedMatmulKernel cached{std::move(krnl), {}, 0, M, N, K, B_type};
             std::string seq_path = detail::find_prebuilt_sequence(fs::path(path).filename().string(), cache_dir_);
             if (!seq_path.empty()) {
-                auto words = detail::load_sequence_file(seq_path);
-                if (!words.empty()) {
-                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
-                    void* mapped = cached.bo_instr.map<void*>();
-                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
-                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                    cached.instr_words = words.size();
-                }
+                load_instr_bo(*device_, cached.krnl, cached.bo_instr, cached.instr_words, seq_path);
             }
             matmul_kernels_[cache_key] = std::move(cached);
             return true;
@@ -1347,15 +1341,7 @@ private:
             CachedMatmulKernel cached{std::move(krnl), {}, 0, M, N, K, B_type};
             std::string seq_path = detail::find_prebuilt_sequence("matmul_" + profile_str_ + ".xclbin", cache_dir_);
             if (!seq_path.empty()) {
-                auto words = detail::load_sequence_file(seq_path);
-                if (!words.empty()) {
-                    cached.bo_instr = xrt::bo(*device_, words.size() * sizeof(uint32_t),
-                                              XCL_BO_FLAGS_CACHEABLE, krnl.group_id(1));
-                    void* mapped = cached.bo_instr.map<void*>();
-                    std::memcpy(mapped, words.data(), words.size() * sizeof(uint32_t));
-                    cached.bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-                    cached.instr_words = words.size();
-                }
+                load_instr_bo(*device_, cached.krnl, cached.bo_instr, cached.instr_words, seq_path);
             }
             matmul_kernels_[cache_key] = std::move(cached);
             return true;
@@ -1872,6 +1858,7 @@ private:
 
     std::vector<uint8_t> xclbin_data_;
     xrt::hw_context hw_ctx_matmul_;
+    bool matmul_hw_ready_ = false;
     std::vector<xrt::hw_context> matmul_shape_ctxs_;  // keeps per-shape contexts alive
 
     std::vector<uint8_t> xclbin_data_rmsnorm_;

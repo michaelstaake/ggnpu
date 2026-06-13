@@ -130,6 +130,7 @@ bool GgufLoader::parse_header() {
     uint32_t magic;
     std::memcpy(&magic, buf, 4);
     if (magic != GGUF_MAGIC) return false;
+    header_.magic = magic;
 
     uint32_t version;
     std::memcpy(&version, buf + 4, 4);
@@ -419,7 +420,9 @@ uint64_t GgufLoader::tensor_data_offset() const {
     if (it != kv_pairs_.end() && it->second.data.size() >= 8) {
         return static_cast<uint64_t>(read_u64_le(it->second.data.data()));
     }
-    return 0;
+    if (header_end_offset_ == 0) return 0;
+    uint64_t align = general_alignment();
+    return (header_end_offset_ + align - 1) / align * align;
 }
 
 uint64_t GgufLoader::general_alignment() const {
