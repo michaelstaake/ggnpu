@@ -73,6 +73,10 @@ void dequant_tensor_row(const TensorView* tv, int row, float* out, int row_dim) 
     }
 }
 
+// Forward declaration (definition is later in this file). Needed for NPU code paths
+// in compute_logits and various bench/inference helpers when GGNPU_HAS_NPU_BACKEND is enabled.
+bool attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cache);
+
 // Vocab projection: hidden @ weight^T.
 // NPU path: decode weight to INT8 via WeightCache, one mul_mat_q call (M=1, N=vocab, K=hidden).
 // CPU fallback: per-row dequant + dot product (used when NPU unavailable or unsupported type).
