@@ -1132,6 +1132,43 @@ int main(int argc, char* argv[]) {
             if (!report_compare("flash_attn (1 head, ctx=1)", cmp, head_dim, 0.1f, 0.2f, 0.05f)) return 1;
         }
 
+        // Test 0g: RoPE — NPU vs CPU (Phase 6)
+        std::cout << "Testing RoPE (Phase 6)...\n";
+        {
+            std::vector<float> rope_in(static_cast<size_t>(head_dim), 0.5f);
+            for (int i = 0; i < head_dim; i++) rope_in[i] = static_cast<float>(i) * 0.01f;
+
+            // CPU reference RoPE: adjacent pairs (2i, 2i+1)
+            std::vector<float> cpu_rope(static_cast<size_t>(head_dim));
+            for (int i = 0; i < head_dim / 2; i++) {
+                float cos_val = std::cos(0.0f * 0.01f * (1.0f / std::pow(10000.0f, 2.0f * static_cast<float>(i) / static_cast<float>(head_dim))));
+                float sin_val = std::sin(0.0f * 0.01f * (1.0f / std::pow(10000.0f, 2.0f * static_cast<float>(i) / static_cast<float>(head_dim))));
+                cpu_rope[2 * i]     = rope_in[2 * i] * cos_val - rope_in[2 * i + 1] * sin_val;
+                cpu_rope[2 * i + 1] = rope_in[2 * i] * sin_val + rope_in[2 * i + 1] * cos_val;
+            }
+
+            std::vector<float> npu_rope(static_cast<size_t>(head_dim));
+            std::memcpy(npu_rope.data(), rope_in.data(), head_dim * sizeof(float));
+            RopeParams rp;
+            rp.data = npu_rope.data();
+            rp.n_dims = head_dim;
+            rp.rope_dims = head_dim;
+            rp.offset = 0;
+            rp.freq_scale = 1.0f;
+            rp.freq_base = 10000.0f;
+            rp.rope_dims = head_dim;
+            st = npu_backend->rope(rp);
+            npu_backend->sync();
+            if (st != Status::OK) {
+                std::cerr << "Error: NPU rope failed: " << status_name(st) << "\n";
+                return 1;
+            }
+
+            auto cmp = compare_vectors(cpu_rope.data(), npu_rope.data(), head_dim, 0.05f);
+            std::string rope_label = "RoPE (head_dim=" + std::to_string(head_dim) + ")";
+            if (!report_compare(rope_label.c_str(), cmp, head_dim, 0.1f, 0.2f, 0.05f)) return 1;
+        }
+
         // Test 0c: SiLU — NPU vs CPU (Phase 4)
         std::cout << "Testing SiLU (Phase 4)...\n";
         {
@@ -1360,8 +1397,32 @@ int main(int argc, char* argv[]) {
                                hidden_size, kv_dim, kv_dim)) return false;
                 backend->sync();
 
-                apply_rope(q_r.data(), q.data(), num_heads, 0, head_dim);
-                apply_rope(k_r.data(), k.data(), num_kv_heads, 0, head_dim);
+                // RoPE: use NPU kernel when available, CPU fallback otherwise
+                if (backend->name() == "amd_xdna") {
+                    for (int h = 0; h < num_heads; h++) {
+                        RopeParams rp;
+                        rp.data = q_r.data() + h * head_dim;
+                        rp.n_dims = head_dim;
+                        rp.rope_dims = head_dim;
+                        rp.offset = 0;
+                        rp.freq_scale = rope_freq_scale;
+                        rp.freq_base = rope_freq_base;
+                        backend->rope(rp);
+                    }
+                    for (int h = 0; h < num_kv_heads; h++) {
+                        RopeParams rp;
+                        rp.data = k_r.data() + h * head_dim;
+                        rp.n_dims = head_dim;
+                        rp.rope_dims = head_dim;
+                        rp.offset = 0;
+                        rp.freq_scale = rope_freq_scale;
+                        rp.freq_base = rope_freq_base;
+                        backend->rope(rp);
+                    }
+                } else {
+                    apply_rope(q_r.data(), q.data(), num_heads, 0, head_dim);
+                    apply_rope(k_r.data(), k.data(), num_kv_heads, 0, head_dim);
+                }
 
                 std::vector<float> attn_out(hidden_size, 0.0f);
                 for (int h = 0; h < num_heads; h++) {
@@ -1529,8 +1590,33 @@ int main(int argc, char* argv[]) {
 
             {
                 ScopedTimer t(step_timings.rope_ms);
-                apply_rope(q_rope.data(), q_proj.data(), num_heads, pos, head_dim);
-                apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos, head_dim);
+                // NPU RoPE: apply rotary embeddings per head via NPU kernel
+                if (backend->name() == "amd_xdna") {
+                    for (int h = 0; h < num_heads; h++) {
+                        RopeParams rp;
+                        rp.data = q_rope.data() + h * head_dim;
+                        rp.n_dims = head_dim;
+                        rp.rope_dims = head_dim;
+                        rp.offset = pos;
+                        rp.freq_scale = rope_freq_scale;
+                        rp.freq_base = rope_freq_base;
+                        backend->rope(rp);
+                    }
+                    for (int h = 0; h < num_kv_heads; h++) {
+                        RopeParams rp;
+                        rp.data = k_rope.data() + h * head_dim;
+                        rp.n_dims = head_dim;
+                        rp.rope_dims = head_dim;
+                        rp.offset = pos;
+                        rp.freq_scale = rope_freq_scale;
+                        rp.freq_base = rope_freq_base;
+                        backend->rope(rp);
+                    }
+                } else {
+                    // CPU fallback for non-NPU backends
+                    apply_rope(q_rope.data(), q_proj.data(), num_heads, pos, head_dim);
+                    apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos, head_dim);
+                }
             }
 
             model.kv_cache().update_slab(layer, pos, pos + 1,
