@@ -4,7 +4,7 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state:** **Phases 1–5 MVP passed** on hardware. NPU path: INT8 matmul, RMSNorm N=2048, SiLU N=8192. Flash attention uses **host f32** (fused NPU kernel blocked on Triton-XDNA multi-reduction lowering). E2E regression passes: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check` (France prompt → Paris). Next focus: fused flash_attn / RoPE on NPU, matmul perf, Phase 6 polish. See **§7.1**.
+**Current state:** **Phases 1–5 MVP passed** on hardware. NPU path: INT8 matmul (incl. logits via mul_mat_q), RMSNorm N=2048, SiLU N=8192. RoPE precomputed at startup. Flash attention uses **host f32** (fused NPU kernel blocked on Triton-XDNA multi-reduction lowering). E2E regression passes: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check` (France prompt → Paris). Next focus: fused flash_attn / RoPE on NPU, matmul perf, Phase 6 polish. See **§7.1**.
 
 **Verdict:** The supported path is host-native: install host prerequisites, build `ggnpu` locally, and provide local `.xclbin` + `*_sequence.bin` kernels under `~/.cache/ggnpu/xclbin/`.
 
@@ -69,7 +69,7 @@ See **§9** and `docs/host-setup-guide.md`.
 
 If NPU initialization fails, `ggnpu` must **exit with an error**. No silent fallback to CPU or GPU.
 
-Ops marked **NPU** in §2.1 must run on the NPU or **fail with an error**. Ops marked **CPU** are intentional host tensor math (flash_attn today, RoPE, logits). No silent fallback from a failed NPU op to CPU for the same op.
+Ops marked **NPU** in §2.1 must run on the NPU or **fail with an error**. Ops marked **CPU** are intentional host tensor math (flash_attn today, RoPE). No silent fallback from a failed NPU op to CPU for the same op.
 
 ### 2.1 CPU vs NPU operation map
 
@@ -96,7 +96,7 @@ Ops marked **NPU** in §2.1 must run on the NPU or **fail with an error**. Ops m
 | **Softmax** | NPU | **NPU** | `softmax_npu6.xclbin`; wired in backend, not used in decoder loop today |
 | SwiGLU `silu(gate) * up` multiply | Host | Host | elementwise after NPU SiLU |
 | Residual adds (attn + FFN) | Host | Host | cheap; acceptable for MVP |
-| **Logits** (output projection) | Host | **CPU** | `compute_logits_f32()` — F32 dequant, not INT8 NPU yet |
+| **Logits** (output projection) | Host/NPU | **NPU** | `compute_logits()` — INT8 mul_mat_q via WeightCache; CPU fallback for F32 weights |
 | `bench-layer` / `cpu_ref` reference | Host | Host | tests only; not production inference |
 
 **xclbin artifacts (npu6):**
@@ -556,7 +556,7 @@ Production commands use the **native host build** (§9). NPU ops (matmul, rmsnor
 | SiLU FFN=8192 on NPU | `amd_xdna.cpp` | **Works** when `silu_npu6.xclbin` present |
 | Matmul perf: host-side tiling | `amd_xdna.cpp` | Host weight-tile cache; per-tile DMA (device persist deferred) |
 | RoPE on CPU | `main.cpp` | Correct Llama 3 math; not on NPU yet |
-| Logits projection on CPU (F32 dequant) | `main.cpp` | `compute_logits_f32()` — accurate; not INT8 NPU path |
+| Logits projection | `main.cpp` | NPU INT8 mul_mat_q with WeightCache decode (Q4_K/Q6_K); CPU fallback for F32 weights |
 | Residual adds on CPU | `main.cpp` | Cheap; acceptable for MVP |
 | `execute_layer_graph()` unused | `main.cpp` | Already removed |
 
@@ -568,7 +568,7 @@ Production commands use the **native host build** (§9). NPU ops (matmul, rmsnor
 | Llama 3 `rope_freqs` used as **freq_factors**, not angle divisors | `src/cli/main.cpp` |
 | Q6_K **per-token row** embedding dequant (bulk INT8 cache produced garbage activations) | `src/cli/main.cpp` |
 | Decode-style prefill: one token per forward, KV reset at start | `src/cli/main.cpp` |
-| **F32 logits** via `compute_logits_f32()` (vocab projection) | `src/cli/main.cpp` |
+| **NPU logits** via INT8 mul_mat_q + WeightCache decode (Q4_K/Q6_K); CPU fallback | `src/cli/main.cpp` |
 | `bench-logits` CLI + `scripts/compare_logits.py` + `scripts/test-e2e-logits.sh` (`ctest -R test_e2e_logits`) | `src/cli/main.cpp`, `scripts/`, `CMakeLists.txt` |
 | Weight cache key includes `data_size`; clear `~/.cache/ggnpu/weights/` after decoder changes | `include/ggnpu/weight_cache.h` |
 | `attach_kquant_scales` validates scale count | `src/cli/main.cpp` |
@@ -618,6 +618,9 @@ loc("-":17:27): error: requires exactly one producer_op handle (got N)
 |-----|------|
 | **Flash attention kernel:** rewrote from scf.for loop-carried online-softmax to elementwise + reductions (q_bcast * k_row → tl.sum, softmax decomposition, weights * v_row → tl.sum). Transform script follows rmsnorm/softmax patterns. Blocked on Triton-XDNA multi-reduction lowering (§7.1 Known limitation). | `compile_kernels.py`, `flash_attn_aie2p.mlir` |
 | **Flash attention:** default to host f32 decomposed; fused NPU opt-in via `GGNPU_FLASH_ATTN_FUSED=1`; removed from default `build-kernels.sh` | `amd_xdna.cpp`, `build-kernels.sh`, `flash_attn_aie2p.mlir` |
+| **RoPE precomputation:** cos/sin tables built once at startup (indexed by [position][dim/2]); apply_rope does table lookups instead of per-call sin/cos | `src/cli/main.cpp` |
+| **KV expand buffer preallocation:** k_expanded/v_expanded allocated once to max size; resize reuses capacity — eliminates two vector allocations per token | `src/cli/main.cpp` |
+| **Dead code removal:** removed unused execute_tile lambda (duplicate of flush_batch) from mul_mat_q path in amd_xdna.cpp | `amd_xdna.cpp` |
 
 
 |-----|------|
@@ -695,7 +698,7 @@ python3 scripts/compare_logits.py --check --ref  # + logit vs llama-cpp-python
 
 - **Fused NPU flash attention** — blocked on Triton-XDNA multi-reduction kernel lowering (§7.1 Known limitation). Kernel with 3+ `tl.sum` ops fails in default pipeline: `requires exactly one producer_op handle (got N)`. Host f32 decomposed path is production.
 - **NPU RoPE** — gather/index math not lowered by Triton-XDNA transforms yet.
-- **High NPU utilization** — flash_attn, RoPE, logits, residuals still on host; matmul dominates time but norms/activations are now partially on NPU.
+- **High NPU utilization** — flash_attn, RoPE, residuals still on host; matmul (incl. logits INT8) and norms/activations on NPU.
 - **Stale rmsnorm xclbins** — pre-fix `rmsnorm_2048_npu6.xclbin` artifacts give ~8% error; delete and rebuild (see §2.1).
 - **No CI** — run `ctest` and `compare_logits.py --check` locally after changes.
 
@@ -954,7 +957,7 @@ When generating NPU kernel code (`kernels/triton/`), **always** apply the four g
 - **No branches:** Zero `if/else`/`switch`/`while` in hot loops. Predication or lookup tables only.
 - **Two layers:** Control code (IRON API, DMA setup) never contains tensor math. Kernel code (Triton-XDNA compiled) never handles DMA or launch.
 
-**Start here:** Phases 1–5 MVP passed on hardware. NPU: matmul + RMSNorm N=2048 + SiLU. Host: flash_attn, RoPE, logits. Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next work, in order:
+**Start here:** Phases 1–5 MVP passed on hardware. NPU: matmul (incl. logits INT8), RMSNorm N=2048 + SiLU. Host: flash_attn, RoPE. Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next work, in order:
 
 1. **Fused flash attention on NPU** — **blocked** on Triton-XDNA multi-reduction kernel lowering (see §7.1 Known limitation). Kernel with 3+ `tl.sum` ops fails: `requires exactly one producer_op handle (got N)`. See `flash_attn_aie2p.mlir` for attempted transform; host f32 decomposed path is production.
 2. **RoPE on NPU** — experimental transform recipe.

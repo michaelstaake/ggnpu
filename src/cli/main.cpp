@@ -73,11 +73,61 @@ void dequant_tensor_row(const TensorView* tv, int row, float* out, int row_dim) 
     }
 }
 
-// Exact vocab projection: hidden @ weight^T with on-the-fly Q4_K/Q6_K dequant.
+// Vocab projection: hidden @ weight^T.
+// NPU path: decode weight to INT8 via WeightCache, one mul_mat_q call (M=1, N=vocab, K=hidden).
+// CPU fallback: per-row dequant + dot product (used when NPU unavailable or unsupported type).
+void compute_logits(const float* hidden, const TensorView* weight, float* logits,
+                    int vocab_size, int hidden_size, WeightCache& weight_cache,
+                    Backend& backend) {
+    if (!weight || !hidden || !logits) return;
+
+    bool npu_path = backend.name() == "amd_xdna";
+
+    if (npu_path && (weight->type == GgmlType::Q4_K || weight->type == GgmlType::Q6_K)) {
+        const int8_t* decoded = weight_cache.get_or_decode(*weight);
+        if (!decoded) goto cpu_fallback;
+
+        std::vector<float> C(static_cast<size_t>(vocab_size), 0.0f);
+        MulMatParams p;
+        p.A = hidden;
+        p.B = decoded;
+        p.C = C.data();
+        p.M = 1;
+        p.N = vocab_size;
+        p.K = hidden_size;
+        p.lda = hidden_size;
+        p.ldb = hidden_size;
+        p.ldc = vocab_size;
+        p.n_batches = 1;
+        p.B_type = weight->type;
+        if (!attach_kquant_scales(p, weight, weight_cache)) {
+            goto cpu_fallback;
+        }
+
+        Status st = backend.mul_mat_q(p);
+        backend.sync();
+        if (st == Status::OK) {
+            std::memcpy(logits, C.data(), static_cast<size_t>(vocab_size) * sizeof(float));
+            return;
+        }
+    }
+
+cpu_fallback:
+    std::vector<float> row(static_cast<size_t>(hidden_size));
+    for (int v = 0; v < vocab_size; v++) {
+        dequant_tensor_row(weight, v, row.data(), hidden_size);
+        float sum = 0.0f;
+        for (int d = 0; d < hidden_size; d++) {
+            sum += hidden[d] * row[d];
+        }
+        logits[v] = sum;
+    }
+}
+
+// Legacy name kept for compatibility — forwards to compute_logits with CPU-only path.
 void compute_logits_f32(const float* hidden, const TensorView* weight, float* logits,
                         int vocab_size, int hidden_size) {
     if (!weight || !hidden || !logits) return;
-
     std::vector<float> row(static_cast<size_t>(hidden_size));
     for (int v = 0; v < vocab_size; v++) {
         dequant_tensor_row(weight, v, row.data(), hidden_size);
@@ -302,6 +352,10 @@ const char* status_name(Status status) {
 
 // BF16 roundtrip functions are in src/utils/bf16.cpp (shared header: ggnpu/bf16.h)
 // Used here for bench-layer RMSNorm comparisons matching NPU DMA path.
+
+// Forward declarations — defined later in this translation unit.
+struct CliParams;
+bool attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cache);
 
 // Precomputed RoPE embeddings: cos/sin tables indexed by [position][dim/2].
 // Angles depend only on position and dimension, not input data — computed once.
@@ -1636,11 +1690,11 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Logits: exact F32 dequant for vocab projection (128k-way argmax is sensitive).
+        // Logits: NPU INT8 mul_mat_q (cached decode) with CPU fallback.
         if (logits_w) {
             ScopedTimer t(step_timings.logits_ms);
-            compute_logits_f32(inp_norm.data(), logits_w, logits.data(),
-                               vocab_size, hidden_size);
+            compute_logits(inp_norm.data(), logits_w, logits.data(),
+                           vocab_size, hidden_size, weight_cache, *backend);
         }
 
         backend->sync();
