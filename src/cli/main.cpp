@@ -1132,7 +1132,7 @@ int main(int argc, char* argv[]) {
             if (!report_compare("flash_attn (1 head, ctx=1)", cmp, head_dim, 0.1f, 0.2f, 0.05f)) return 1;
         }
 
-        // Test 0g: RoPE — NPU vs CPU (Phase 6)
+        // Test 0g: RoPE — NPU only (Phase 6). No fallback.
         std::cout << "Testing RoPE (Phase 6)...\n";
         {
             std::vector<float> rope_in(static_cast<size_t>(head_dim), 0.5f);
