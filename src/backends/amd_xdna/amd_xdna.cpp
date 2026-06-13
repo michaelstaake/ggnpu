@@ -199,10 +199,14 @@ struct CachedRmsNormKernel {
     int N;
 };
 
-// Cached kernel for RoPE
+// Cached kernel for RoPE (BF16)
 struct CachedRopeKernel {
     xrt::run run;
+    xrt::kernel krnl;
+    xrt::bo bo_instr;
+    size_t instr_words = 0;
     int n_dims;
+    int N;
 };
 
 // Cached kernel for Softmax (BF16)
@@ -717,6 +721,15 @@ public:
                     std::cerr << "  Build: ./scripts/build-kernels.sh npu6 rmsnorm_2048\n";
                     std::cerr << "  Expect: " << cache_dir_ << "/xclbin/rmsnorm_2048_"
                               << profile_str_ << ".xclbin\n";
+                } else {
+                    std::cerr << "  Prebuilt xclbin not found for N=" << N << ".\n";
+                    if (detail::jit_compilation_available()) {
+                        std::cerr << "  JIT compilation failed — check Triton-XDNA environment.\n";
+                    } else {
+                        std::cerr << "  Install Triton-XDNA for JIT: pip install triton-xdna\n";
+                        std::cerr << "  Or build prebuilt: ./scripts/build-kernels.sh npu6 rmsnorm_"
+                                  << N << "\n";
+                    }
                 }
                 last_status_ = Status::NPU_UNAVAILABLE;
                 return last_status_;
@@ -817,19 +830,66 @@ public:
     }
 
     Status rope(const RopeParams& params) override {
-        // RoPE: intentional host CPU — not implemented on NPU yet (Phase 6+).
-        // jit_compile_rope() exists for future NPU wiring.
-        for (int64_t i = 0; i < params.rope_dims; i += 2) {
-            float ratio = 1.0f / std::pow(10000.0f, static_cast<float>(i) / params.n_dims);
-            float val = params.offset * ratio * params.freq_scale;
-            float cos_val = std::cos(val);
-            float sin_val = std::sin(val);
-
-            float v0 = params.data[i];
-            float v1 = params.data[i + 1];
-            params.data[i] = v0 * cos_val - v1 * sin_val;
-            params.data[i + 1] = v0 * sin_val + v1 * cos_val;
+        // RoPE on NPU: elementwise BF16 kernel with gather loads for pair shuffles.
+        // Converts f32 input → bf16 for DMA, runs NPU kernel, converts bf16 output → f32.
+        if (!params.data || params.rope_dims <= 0 || params.n_dims <= 0) {
+            last_status_ = Status::INVALID_PARAM;
+            return last_status_;
         }
+
+        int N = params.rope_dims;
+        int n_dims = params.n_dims;
+        std::string cache_key = "rope_" + std::to_string(N) + "x" + std::to_string(n_dims) + "_" + profile_str_;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = rope_kernels_.find(n_dims);
+        if (it == rope_kernels_.end()) {
+            if (!ensure_rope_kernel(n_dims, N, cache_key)) {
+                std::cerr << "Error: no NPU RoPE kernel for dims=" << n_dims << " N=" << N << "\n";
+                std::cerr << "  Install Triton-XDNA for JIT: pip install triton-xdna\n";
+                std::cerr << "  Or build prebuilt: ./scripts/build-kernels.sh npu6 rope\n";
+                last_status_ = Status::NPU_UNAVAILABLE;
+                return last_status_;
+            }
+            it = rope_kernels_.find(n_dims);
+        }
+
+        auto& kernel = it->second;
+
+        // RoPE kernel is BF16 — convert f32 input → bf16 for DMA
+        size_t bf16_bytes = static_cast<size_t>(N) * sizeof(uint16_t);
+        std::vector<uint8_t> bf16_input = convert_f32_to_bf16(params.data, N);
+
+        if (!buf_rope_bf16_in_ || buf_rope_bf16_in_->size() < bf16_bytes) {
+            buf_rope_bf16_in_ = buf_mgr_->alloc(bf16_bytes, true);
+        }
+        if (!buf_rope_bf16_out_ || buf_rope_bf16_out_->size() < bf16_bytes) {
+            buf_rope_bf16_out_ = buf_mgr_->alloc(bf16_bytes, true);
+        }
+
+        buf_mgr_->copy_to(*buf_rope_bf16_in_, bf16_input.data(), bf16_bytes);
+
+        try {
+            if (kernel.bo_instr && kernel.instr_words > 0) {
+                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                           buf_rope_bf16_in_->handle(), buf_rope_bf16_out_->handle());
+            } else {
+                kernel.run(buf_rope_bf16_in_->handle(), buf_rope_bf16_out_->handle());
+            }
+            kernel.run.wait();
+        } catch (const std::exception& e) {
+            std::cerr << "Error: RoPE kernel execution failed: " << e.what() << "\n";
+            last_status_ = Status::ERROR;
+            return last_status_;
+        }
+
+        // Convert bf16 output → f32
+        std::vector<uint8_t> bf16_out_data(bf16_bytes);
+        buf_mgr_->copy_from(*buf_rope_bf16_out_, bf16_out_data.data(), bf16_bytes);
+        auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
+        std::memcpy(params.data, f32_result.data(), N * sizeof(float));
+
         return Status::OK;
     }
 
@@ -928,14 +988,6 @@ public:
         }
 
         int N = params.size;
-        
-        // Prebuilt SiLU xclbin is fixed-size 8192 (Llama 1B/3B FFN).
-        if (N != kSiluKernelSize) {
-            std::cerr << "Error: SiLU NPU kernel is N=" << kSiluKernelSize
-                      << " but model requested N=" << N << "\n";
-            last_status_ = Status::INVALID_PARAM;
-            return last_status_;
-        }
 
         std::string cache_key = "silu_" + std::to_string(N) + "_" + profile_str_;
 
@@ -1691,6 +1743,45 @@ private:
         }
     }
 
+    // Load or compile the RoPE kernel
+    bool ensure_rope_kernel(int n_dims, int N, const std::string& cache_key) {
+        if (cache_->has_xclbin(cache_key)) {
+            std::string cached_path = cache_->get_xclbin_path(cache_key);
+            return load_rope_kernel_for_shape(cached_path, n_dims, N, cache_key);
+        }
+
+        // Try JIT compilation (required for non-standard sizes)
+        if (detail::jit_compilation_available()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_rope(N, npu_profile_);
+            if (!xclbin_data.empty()) {
+                cache_->store_xclbin(cache_key, xclbin_data);
+                return load_rope_kernel_for_shape(cache_->get_xclbin_path(cache_key), n_dims, N, cache_key);
+            }
+        }
+
+        return false;
+    }
+
+    bool load_rope_kernel_for_shape(const std::string& path, int n_dims, int N, const std::string& cache_key) {
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) return false;
+
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);
+
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
+            xrt::run run(krnl);
+
+            CachedRopeKernel cached{run, krnl, {}, 0, n_dims, N};
+            rope_kernels_[n_dims] = std::move(cached);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load rope kernel: " << e.what() << "\n";
+            return false;
+        }
+    }
+
     // Load or compile the flash_attn xclbin
     bool load_flash_attn_xclbin() {
         std::string xclbin_name = "flash_attn_" + profile_str_ + ".xclbin";
@@ -1793,6 +1884,10 @@ private:
     std::vector<uint8_t> xclbin_data_silu_;
     xrt::hw_context hw_ctx_silu_;
 
+    std::vector<uint8_t> xclbin_data_rope_;
+    xrt::hw_context hw_ctx_rope_;
+    std::string rope_xclbin_name_;
+
     std::vector<uint8_t> xclbin_data_fa_;
     xrt::hw_context hw_ctx_fa_;
 
@@ -1816,11 +1911,15 @@ private:
     std::shared_ptr<XrtBuffer> buf_fa_v_;
     std::shared_ptr<XrtBuffer> buf_fa_out_;
 
+    std::shared_ptr<XrtBuffer> buf_rope_bf16_in_;
+    std::shared_ptr<XrtBuffer> buf_rope_bf16_out_;
+
     std::unordered_map<std::string, CachedMatmulKernel> matmul_kernels_;
     std::unordered_map<int, CachedRmsNormKernel> rmsnorm_kernels_;
     std::unordered_map<std::pair<int, int>, CachedSoftmaxKernel, PairHash> softmax_kernels_;
     std::unordered_map<int, CachedSiluKernel> silu_kernels_;
     std::unordered_map<std::tuple<int, int, int64_t>, CachedFlashAttnKernel, TupleHash> flash_attn_kernels_;
+    std::unordered_map<int, CachedRopeKernel> rope_kernels_;
 
     int npu_profile_ = 6;
     std::string profile_str_ = "npu6";

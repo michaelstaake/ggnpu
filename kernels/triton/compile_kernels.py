@@ -66,10 +66,6 @@ KERNELS = {
         "params": ["N", "dims"],
         "defaults": {"N": 2048, "dims": 64},
         "transform": "rope_aie2p.mlir",
-        "experimental": (
-            "rope uses gather loads (pair shuffles) and integer index math that the "
-            "Triton-XDNA elementwise transform recipes cannot lower yet"
-        ),
     },
     "flash_attn": {
         "description": "FlashAttention v1 (online softmax; elementwise decomposition)",
