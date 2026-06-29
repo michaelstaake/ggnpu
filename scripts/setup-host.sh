@@ -86,6 +86,8 @@ fi
 echo ""
 echo "=== Setup Complete ==="
 echo ""
+echo "Tip: ./setup.sh automates the install/build/kernel/verify steps below."
+echo ""
 echo "Next steps (native host):"
 echo "  1. Install build deps: sudo apt install build-essential cmake git libxrt2 libxrt-npu2 libxrt-dev"
 echo "  2. Add to render group: sudo usermod -aG render \$USER  (re-login)"

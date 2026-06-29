@@ -29,6 +29,25 @@ BIOS: NPU/IPU enabled. Boot: `amd_iommu=on`.
 
 ### Full installation
 
+**One command** — installs host prerequisites, builds ggnpu, optionally builds the
+NPU kernels, and verifies. It drives the scripts below, is interactive and safe to
+re-run (finished work is skipped):
+
+```bash
+git clone https://github.com/michaelstaake/ggnpu.git
+cd ggnpu
+./setup.sh
+```
+
+`./setup.sh` asks before any privileged action. Useful flags: `--yes`
+(non-interactive), `--cpu` (CPU-only build, no NPU/driver), `--kernels-here`,
+`--kernels-separate`, `--no-kernels`, `--skip-install`, `--skip-build`.
+After it runs, **log out and back in (or reboot)** if it added you to the `render`
+group or changed memlock limits.
+
+<details>
+<summary>Manual alternative (what <code>setup.sh</code> automates)</summary>
+
 ```bash
 # 1. Core build tools
 sudo apt update
@@ -53,18 +72,22 @@ bash scripts/setup-host.sh
 bash scripts/verify-npu.sh
 ```
 
+Steps 1–4 are performed by `scripts/install-host.sh`; the build by `scripts/build.sh`.
+
+</details>
+
 ### Quick start
 
 ```bash
 git clone https://github.com/michaelstaake/ggnpu.git
 cd ggnpu
 
-# Build ggnpu with the NPU backend
-cmake -S . -B build-npu \
-  -DGGNPU_NPU_BACKEND=ON \
-  -DGGNPU_TEST_CPU=OFF \
-  -DGGNPU_BUILD_TESTS=ON
-cmake --build build-npu -j2
+# Build ggnpu with the NPU backend (wrapper; or run the cmake commands below directly)
+./scripts/build.sh
+# Equivalent:
+#   cmake -S . -B build-npu \
+#     -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
+#   cmake --build build-npu -j2
 
 # Smoke test
 ./build-npu/ggnpu bench-matmul
