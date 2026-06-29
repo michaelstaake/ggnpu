@@ -429,10 +429,12 @@ public:
         size_t tile_bytes_in = static_cast<size_t>(T) * T;                  // int8
         size_t tile_bytes_out = static_cast<size_t>(T) * T * sizeof(int32_t);
 
-        // Batch size: number of tiles to submit before waiting.
-        // Reduces synchronization overhead from N tiles → N/batch_size waits.
-        // Configurable via GGNPU_MATMUL_BATCH_SIZE env var (default 8).
-        int batch_size = 8;
+        // Batch size: number of tiles to submit before waiting. Deeper batches
+        // let the device overlap kernel execution with host packing/DMA of later
+        // tiles, which hides the per-tile driver round-trips. Measured sweet spot
+        // on npu6 is ~24 (≈8% over 8; 48 regressed — diminishing overlap, more
+        // staging memory). Override via GGNPU_MATMUL_BATCH_SIZE.
+        int batch_size = 24;
         const char* batch_env = std::getenv("GGNPU_MATMUL_BATCH_SIZE");
         if (batch_env && *batch_env) {
             batch_size = std::atoi(batch_env);

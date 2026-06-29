@@ -595,6 +595,31 @@ unchanged). Remaining runtime is the INT8 matmul path (per-tile driver
 round-trips at the fixed 256³ kernel granularity — see attention note re: no
 in-repo bigger-tile generator).
 
+#### Matmul driver round-trips are already hidden — it's device-kernel-bound
+
+Investigated whether the per-tile host↔driver round-trips (~14.8k tiles/token,
+each pack A + DMA A/B + start + wait + DMA C) are the matmul floor. **They are
+not** — they're already overlapped by the batched submission pipeline, so
+removing them yields ~0 net. Two attempts, both measured on hardware:
+
+- **`xrt::runlist` (one execute/wait ioctl per batch instead of one start/wait
+  per tile).** *Regressed badly:* `execute()` cost ~4.4 ms **per call** (it
+  rebuilds the command chain on every reset+re-add) and serialized kernels
+  (kernel-wait 8.5 → 80 µs/tile). runlist is for build-once/run-many, not the
+  rapid-reconfigure pattern here. Reverted.
+- **Persistent device weight BOs** (pack each weight tile once, bind the resident
+  BO on later tokens — kills the redundant per-tile weight memcpy+sync). Worked
+  and dropped dmaB 9 → 0.1 µs/tile, but steady-state total only 70.8 → 69.6
+  µs/tile (~2%): the freed time reappeared in the wait phase because the weight
+  DMA was already hidden behind device-kernel execution. Not worth ~1 GB of
+  pinned BOs + 19k allocations. Reverted.
+
+**Conclusion:** steady-state matmul (~70 µs/tile, batch 24) is bounded by the
+256³ INT8 **device kernel**, not host/driver overhead. The only real lever is
+fewer/bigger launches — a larger-K or matvec (M=1) kernel — which needs a new
+xclbin, and there is **no in-repo generator** (same wall as the attention note).
+Kept the one free win: default `GGNPU_MATMUL_BATCH_SIZE` 8 → 24 (~8%).
+
 #### Recently fixed (kernels / layer bench)
 
 | Fix | File |
