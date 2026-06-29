@@ -962,6 +962,117 @@ public:
         return Status::OK;
     }
 
+    // Batched RoPE: pack multiple heads' even+odd halves into each kernel launch.
+    // The kernel is a pure vector-add of pad_len elements; one launch handles
+    // G = pad_len / (2*n_pairs) heads (8 for n_pairs=32 -> 512-elem kernel), so
+    // 32 q-heads need 4 launches instead of 64 single-head/half launches.
+    Status rope_batched(const RopeBatchedParams& params) override {
+        if (!params.data || params.rope_dims <= 0 || params.n_dims <= 0 ||
+            params.n_heads <= 0) {
+            last_status_ = Status::INVALID_PARAM;
+            return last_status_;
+        }
+
+        int n_dims  = static_cast<int>(params.rope_dims);
+        int n_pairs = n_dims / 2;
+        std::string cache_key = "rope_" + std::to_string(n_dims) + "_" + profile_str_;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = rope_kernels_.find(n_dims);
+        if (it == rope_kernels_.end()) {
+            if (!ensure_rope_kernel(n_dims, n_dims, cache_key)) {
+                last_status_ = Status::NPU_UNAVAILABLE;
+                return last_status_;
+            }
+            it = rope_kernels_.find(n_dims);
+        }
+        auto& kernel = it->second;
+
+        int pad_len = std::max(512, ((n_pairs + 255) / 256) * 256 * 2);
+        size_t buf_bytes = static_cast<size_t>(pad_len) * sizeof(uint16_t);
+        if (!buf_rope_t1_       || buf_rope_t1_->size()       < buf_bytes)
+            buf_rope_t1_       = buf_mgr_->alloc(buf_bytes, true);
+        if (!buf_rope_t2_       || buf_rope_t2_->size()       < buf_bytes)
+            buf_rope_t2_       = buf_mgr_->alloc(buf_bytes, true);
+        if (!buf_rope_bf16_out_ || buf_rope_bf16_out_->size() < buf_bytes)
+            buf_rope_bf16_out_ = buf_mgr_->alloc(buf_bytes, true);
+
+        // cos/sin shared across heads (depend only on offset and pair index).
+        std::vector<float> cos_vals(n_pairs), sin_vals(n_pairs);
+        if (params.cos_table && params.sin_table) {
+            std::memcpy(cos_vals.data(), params.cos_table, n_pairs * sizeof(float));
+            std::memcpy(sin_vals.data(), params.sin_table, n_pairs * sizeof(float));
+        } else {
+            for (int i = 0; i < n_pairs; i++) {
+                float ratio = 1.0f / std::pow(params.freq_base,
+                                  (2.0f * i) / static_cast<float>(n_dims));
+                float angle = static_cast<float>(params.offset) * ratio * params.freq_scale;
+                cos_vals[i] = std::cos(angle);
+                sin_vals[i] = std::sin(angle);
+            }
+        }
+
+        const int heads_per_launch = pad_len / (2 * n_pairs);  // >= 1
+
+        std::vector<float> t1_pad(pad_len), t2_pad(pad_len);
+        std::vector<uint8_t> bf16_out(buf_bytes);
+
+        for (int h0 = 0; h0 < params.n_heads; h0 += heads_per_launch) {
+            int g_cur = std::min(heads_per_launch, params.n_heads - h0);
+            std::fill(t1_pad.begin(), t1_pad.end(), 0.0f);
+            std::fill(t2_pad.begin(), t2_pad.end(), 0.0f);
+
+            // Pack: [even (g_cur*n_pairs)] then [odd (g_cur*n_pairs)].
+            //   t1 = [x_e*cos | x_e*sin],  t2 = [-x_o*sin | x_o*cos]
+            //   out = t1+t2 = [out_e | out_o]
+            for (int g = 0; g < g_cur; g++) {
+                const float* hd = params.data + static_cast<size_t>(h0 + g) * n_dims;
+                int even = g * n_pairs;
+                int odd  = g_cur * n_pairs + g * n_pairs;
+                for (int i = 0; i < n_pairs; i++) {
+                    float xe = hd[2 * i];
+                    float xo = hd[2 * i + 1];
+                    t1_pad[even + i] =  xe * cos_vals[i];
+                    t2_pad[even + i] = -xo * sin_vals[i];
+                    t1_pad[odd  + i] =  xe * sin_vals[i];
+                    t2_pad[odd  + i] =  xo * cos_vals[i];
+                }
+            }
+
+            auto bf16_t1 = convert_f32_to_bf16(t1_pad.data(), pad_len);
+            auto bf16_t2 = convert_f32_to_bf16(t2_pad.data(), pad_len);
+            buf_mgr_->copy_to(*buf_rope_t1_, bf16_t1.data(), buf_bytes);
+            buf_mgr_->copy_to(*buf_rope_t2_, bf16_t2.data(), buf_bytes);
+            try {
+                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                           buf_rope_t1_->handle(), buf_rope_t2_->handle(),
+                           buf_rope_bf16_out_->handle());
+                kernel.run.wait();
+            } catch (const std::exception& e) {
+                std::cerr << "Error: batched RoPE kernel execution failed: " << e.what() << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
+            }
+            buf_mgr_->copy_from(*buf_rope_bf16_out_, bf16_out.data(), buf_bytes);
+            auto out = convert_bf16_to_f32(bf16_out.data(), pad_len);
+
+            // Unpack + reinterleave back into params.data.
+            for (int g = 0; g < g_cur; g++) {
+                float* hd = params.data + static_cast<size_t>(h0 + g) * n_dims;
+                int even = g * n_pairs;
+                int odd  = g_cur * n_pairs + g * n_pairs;
+                for (int i = 0; i < n_pairs; i++) {
+                    hd[2 * i]     = out[even + i];
+                    hd[2 * i + 1] = out[odd  + i];
+                }
+            }
+        }
+
+        last_status_ = Status::OK;
+        return last_status_;
+    }
+
     Status softmax(const SoftmaxParams& params) override {
         if (!params.input || !params.output || params.rows <= 0 || params.cols <= 0) {
             last_status_ = Status::INVALID_PARAM;

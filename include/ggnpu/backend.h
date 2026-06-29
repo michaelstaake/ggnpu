@@ -55,6 +55,21 @@ struct RopeParams {
     const float* sin_table = nullptr;
 };
 
+// Batched RoPE: apply rotary embedding to all heads of one token at once.
+// data layout is [n_heads][n_dims] interleaved (2i, 2i+1 pairs), rotated in place.
+// cos/sin tables are shared across heads (depend only on offset and pair index).
+struct RopeBatchedParams {
+    float* data;
+    int n_heads;
+    int n_dims;
+    int64_t offset;
+    float freq_scale;
+    float freq_base;
+    int64_t rope_dims;
+    const float* cos_table = nullptr;  // [rope_dims/2]
+    const float* sin_table = nullptr;  // [rope_dims/2]
+};
+
 struct SoftmaxParams {
     const float* input;
     float* output;
@@ -88,6 +103,26 @@ public:
     virtual Status mul_mat_q(const MulMatParams& params) = 0;
     virtual Status rms_norm(const RmsNormParams& params) = 0;
     virtual Status rope(const RopeParams& params) = 0;
+
+    // Apply RoPE to all heads of a token. Default loops single-head rope();
+    // backends may override to batch the work into fewer kernel launches.
+    virtual Status rope_batched(const RopeBatchedParams& params) {
+        for (int h = 0; h < params.n_heads; h++) {
+            RopeParams rp;
+            rp.data = params.data + static_cast<size_t>(h) * params.n_dims;
+            rp.n_dims = params.n_dims;
+            rp.rope_dims = params.rope_dims;
+            rp.offset = params.offset;
+            rp.freq_scale = params.freq_scale;
+            rp.freq_base = params.freq_base;
+            rp.cos_table = params.cos_table;
+            rp.sin_table = params.sin_table;
+            Status s = rope(rp);
+            if (s != Status::OK) return s;
+        }
+        return Status::OK;
+    }
+
     virtual Status softmax(const SoftmaxParams& params) = 0;
     virtual Status silu(const SiluParams& params) = 0;
     virtual Status flash_attn(const AttnParams& params) = 0;

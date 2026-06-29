@@ -947,27 +947,25 @@ int main(int argc, char* argv[]) {
         }
     };
 
-    // NPU RoPE: one backend->rope() launch per head, in-place on the output slice.
-    // cos/sin tables from rope_cache are identical across heads at a given offset
-    // and already fold in freq_factors. Opt-in via GGNPU_NPU_ROPE=1 (per-head
-    // launches with pad-to-512 are correct but not yet perf-tuned).
+    // NPU RoPE: a single backend->rope_batched() launch packs many heads per
+    // kernel launch (8 heads / 512-elem kernel for head_dim=64). cos/sin tables
+    // from rope_cache are identical across heads at a given offset and already
+    // fold in freq_factors. Opt-in via GGNPU_NPU_ROPE=1.
     const bool npu_rope_enabled =
         (backend->name() == "amd_xdna") && std::getenv("GGNPU_NPU_ROPE") != nullptr;
     auto apply_rope_npu = [&](float* out, const float* inp, int n_heads, int64_t offset, int n_dims) -> bool {
         std::memcpy(out, inp, static_cast<size_t>(n_heads) * n_dims * sizeof(float));
-        for (int h = 0; h < n_heads; h++) {
-            RopeParams rp;
-            rp.data = out + static_cast<size_t>(h) * n_dims;
-            rp.n_dims = n_dims;
-            rp.rope_dims = n_dims;
-            rp.offset = offset;
-            rp.freq_scale = rope_freq_scale;
-            rp.freq_base = rope_freq_base;
-            rp.cos_table = rope_cache.cos_ptr(offset, 0);
-            rp.sin_table = rope_cache.sin_ptr(offset, 0);
-            if (backend->rope(rp) != Status::OK) return false;
-        }
-        return true;
+        RopeBatchedParams rp;
+        rp.data = out;
+        rp.n_heads = n_heads;
+        rp.n_dims = n_dims;
+        rp.rope_dims = n_dims;
+        rp.offset = offset;
+        rp.freq_scale = rope_freq_scale;
+        rp.freq_base = rope_freq_base;
+        rp.cos_table = rope_cache.cos_ptr(offset, 0);
+        rp.sin_table = rope_cache.sin_ptr(offset, 0);
+        return backend->rope_batched(rp) == Status::OK;
     };
 
     // Dispatch: NPU when enabled (fall back to CPU on any failure), else CPU.
@@ -1195,6 +1193,44 @@ int main(int argc, char* argv[]) {
                 auto cmp = compare_vectors(cpu_rope.data(), npu_rope.data(), head_dim, 0.05f);
                 std::string rope_label = "RoPE (head_dim=" + std::to_string(head_dim) + ")";
                 if (!report_compare(rope_label.c_str(), cmp, head_dim, 0.1f, 0.2f, 0.05f)) return 1;
+            }
+
+            // Test 0g2: batched RoPE — multi-head, nonzero offset (forces >1 launch
+            // and exercises the head-packing math, which offset=0 identity hides).
+            const int rb_heads = 10;            // > 8 heads/launch -> 2 launches
+            const int64_t rb_off = 5;
+            std::vector<float> rb_in(static_cast<size_t>(rb_heads) * head_dim);
+            for (size_t i = 0; i < rb_in.size(); i++)
+                rb_in[i] = std::sin(0.017f * static_cast<float>(i)) * 0.5f;
+
+            std::vector<float> rb_npu = rb_in;
+            RopeBatchedParams rbp;
+            rbp.data = rb_npu.data();
+            rbp.n_heads = rb_heads;
+            rbp.n_dims = head_dim;
+            rbp.rope_dims = head_dim;
+            rbp.offset = rb_off;
+            rbp.freq_scale = 1.0f;
+            rbp.freq_base = 10000.0f;
+            st = npu_backend->rope_batched(rbp);
+            npu_backend->sync();
+            if (st == Status::OK) {
+                std::vector<float> rb_cpu = rb_in;
+                for (int h = 0; h < rb_heads; h++) {
+                    for (int i = 0; i < head_dim / 2; i++) {
+                        float ang = static_cast<float>(rb_off) *
+                            (1.0f / std::pow(10000.0f, 2.0f * static_cast<float>(i) / static_cast<float>(head_dim)));
+                        float c = std::cos(ang), s = std::sin(ang);
+                        float* hd = rb_cpu.data() + static_cast<size_t>(h) * head_dim;
+                        float v0 = rb_in[static_cast<size_t>(h) * head_dim + 2 * i];
+                        float v1 = rb_in[static_cast<size_t>(h) * head_dim + 2 * i + 1];
+                        hd[2 * i]     = v0 * c - v1 * s;
+                        hd[2 * i + 1] = v0 * s + v1 * c;
+                    }
+                }
+                int n = rb_heads * head_dim;
+                auto cmp2 = compare_vectors(rb_cpu.data(), rb_npu.data(), n, 0.05f);
+                if (!report_compare("RoPE batched (10 heads, off=5)", cmp2, n, 0.1f, 0.2f, 0.05f)) return 1;
             }
         }
 
