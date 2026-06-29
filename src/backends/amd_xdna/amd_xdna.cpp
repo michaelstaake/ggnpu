@@ -589,7 +589,11 @@ public:
 
                 auto t_dma_a_start = do_timing ? std::chrono::high_resolution_clock::now()
                                                : std::chrono::high_resolution_clock::time_point{};
-                buf_mgr_->copy_to(*slot.buf_a, a_tile.data(), tile_bytes_in);
+                // DMA only the real M rows of A. Rows [mc, T) in the device buffer
+                // hold stale data and produce output rows we never read back, so
+                // skipping them is safe and saves up to T/mc (256x for decode).
+                buf_mgr_->copy_to(*slot.buf_a, a_tile.data(),
+                                  static_cast<size_t>(work.mc) * T);
                 if (do_timing) {
                     total_dma_a_ms += std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t_dma_a_start).count();
@@ -636,7 +640,9 @@ public:
 
                 auto t_dma_c_start = do_timing ? std::chrono::high_resolution_clock::now()
                                                : std::chrono::high_resolution_clock::time_point{};
-                buf_mgr_->copy_from(*slot.buf_c, c_tile.data(), tile_bytes_out);
+                // Read back only the real M rows of C (rows [mc, T) are ignored).
+                buf_mgr_->copy_from(*slot.buf_c, c_tile.data(),
+                                    static_cast<size_t>(work.mc) * T * sizeof(int32_t));
                 if (do_timing) {
                     total_dma_c_ms += std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t_dma_c_start).count();
