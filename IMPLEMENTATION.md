@@ -673,12 +673,16 @@ converting the full 256² tile every launch. Per 256 launches the host overhead
 dropped ~207 → ~44 ms (pack 124 → 1.5 ms, 80×). Full-model NPU attention went
 from *not finishing in 300 s* to **~34.5 s for 6 tokens** (coherent output).
 
-The remaining cost is `run+wait` — the fixed **256³ kernel itself**, which still
-does 16 M MACs per launch when attention's degenerate dim (N=1 for QK, M=1 for
-AV) only needs a sliver. Next optimization (future, higher-risk): attention-shaped
-bf16 xclbins with a small N/M tile to cut both compute and launch count; the
-matmul transform's L1 tiling (`l1=64`, generator not in-repo) would need editing.
-Host f32 `flash_attn_decomposed()` stays the default production path.
+After the host fix, **NPU attention is at near-parity with the host path**: full
+model, 6 tokens, the same prompt → 32.7 s (host) vs 34.7 s (NPU attention), a
+~6 % difference. So attention is *not* the runtime bottleneck — model load plus
+the int8 projection/FFN matmuls dominate. The remaining `run+wait` waste (the
+fixed 256³ kernel doing 16 M MACs when the degenerate dim needs a sliver) is only
+~2 s, **not worth** the higher-risk attention-shaped-xclbin work (small N/M L1
+tile; the matmul transform generator isn't in-repo, so `matmul_bf16_aie2p.mlir`'s
+`l1=64` tiling would need hand-editing). NPU attention stays opt-in (bf16 vs the
+host's exact f32); host f32 `flash_attn_decomposed()` remains the default. If
+perf is pursued further, target the int8 matmul path, not attention.
 
 > Running a kernel directly on the NPU from Python (no C++) needs three env
 > fixes the build path doesn't set: `LD_PRELOAD=libuuid.so.1` (launcher needs
