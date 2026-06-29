@@ -59,18 +59,6 @@ void write_u64_le(std::vector<uint8_t>& buf, uint64_t v) {
     }
 }
 
-bool read_gguf_string(int fd, std::string& out) {
-    uint8_t len_buf[8];
-    if (::read(fd, len_buf, 8) != 8) return false;
-    uint64_t str_len = read_u64_le(len_buf);
-    if (str_len > 64 * 1024 * 1024) return false;
-    out.resize(str_len);
-    if (str_len > 0) {
-        if (::read(fd, &out[0], str_len) != static_cast<ssize_t>(str_len)) return false;
-    }
-    return true;
-}
-
 void append_gguf_string(std::vector<uint8_t>& buf, const std::string& s) {
     write_u64_le(buf, s.size());
     buf.insert(buf.end(), s.begin(), s.end());
@@ -83,6 +71,39 @@ GgufLoader::GgufLoader() : fd_(-1) {
 }
 
 GgufLoader::~GgufLoader() { unload(); }
+
+ssize_t GgufLoader::buffered_read(void* dst, size_t n) {
+    uint8_t* out = static_cast<uint8_t*>(dst);
+    size_t got = 0;
+    constexpr size_t kChunk = 1u << 20; // 1 MB
+    while (got < n) {
+        if (read_buf_pos_ >= read_buf_len_) {
+            if (read_buf_.size() < kChunk) read_buf_.resize(kChunk);
+            ssize_t r = ::read(fd_, read_buf_.data(), read_buf_.size());
+            if (r <= 0) break;
+            read_buf_len_ = static_cast<size_t>(r);
+            read_buf_pos_ = 0;
+        }
+        size_t take = std::min(read_buf_len_ - read_buf_pos_, n - got);
+        std::memcpy(out + got, read_buf_.data() + read_buf_pos_, take);
+        read_buf_pos_ += take;
+        got += take;
+    }
+    read_pos_ += got;
+    return static_cast<ssize_t>(got);
+}
+
+bool GgufLoader::read_string_buffered(std::string& out) {
+    uint8_t len_buf[8];
+    if (buffered_read(len_buf, 8) != 8) return false;
+    uint64_t str_len = read_u64_le(len_buf);
+    if (str_len > 64 * 1024 * 1024) return false;
+    out.resize(str_len);
+    if (str_len > 0) {
+        if (buffered_read(&out[0], str_len) != static_cast<ssize_t>(str_len)) return false;
+    }
+    return true;
+}
 
 bool GgufLoader::load(const std::string& path) {
     path_ = path;
@@ -116,7 +137,8 @@ void GgufLoader::unload() {
         ::close(fd_);
         fd_ = -1;
     }
-    tensor_data_.clear();
+    tensor_data_ptr_ = nullptr;
+    tensor_data_size_ = 0;
     kv_pairs_.clear();
     tensors_.clear();
     std::memset(&header_, 0, sizeof(header_));
@@ -124,7 +146,7 @@ void GgufLoader::unload() {
 
 bool GgufLoader::parse_header() {
     uint8_t buf[24];
-    ssize_t nread = ::read(fd_, buf, 24);
+    ssize_t nread = buffered_read(buf, 24);
     if (nread != 24) return false;
 
     uint32_t magic;
@@ -147,17 +169,17 @@ bool GgufLoader::parse_kv() {
     for (uint64_t i = 0; i < header_.kv_count; i++) {
         // Read key length
         uint8_t key_len_buf[8];
-        if (::read(fd_, key_len_buf, 8) != 8) return false;
+        if (buffered_read(key_len_buf, 8) != 8) return false;
         uint64_t key_len = read_u64_le(key_len_buf);
         if (key_len > 1024) return false;
 
         // Read key
         std::string key(key_len, '\0');
-        if (::read(fd_, &key[0], key_len) != static_cast<ssize_t>(key_len)) return false;
+        if (buffered_read(&key[0], key_len) != static_cast<ssize_t>(key_len)) return false;
 
         // Read value type
         uint8_t type_buf[4];
-        if (::read(fd_, type_buf, 4) != 4) return false;
+        if (buffered_read(type_buf, 4) != 4) return false;
         uint32_t type_val = read_u32_le(type_buf);
         GgufType value_type = static_cast<GgufType>(type_val);
 
@@ -168,22 +190,22 @@ bool GgufLoader::parse_kv() {
         switch (value_type) {
             case GgufType::STRING: {
                 uint8_t str_key_len_buf[8];
-                if (::read(fd_, str_key_len_buf, 8) != 8) return false;
+                if (buffered_read(str_key_len_buf, 8) != 8) return false;
                 uint64_t str_len = read_u64_le(str_key_len_buf);
                 if (str_len > 64 * 1024 * 1024) return false;
                 kv.string_value.resize(str_len);
-                if (::read(fd_, &kv.string_value[0], str_len) != static_cast<ssize_t>(str_len)) return false;
+                if (buffered_read(&kv.string_value[0], str_len) != static_cast<ssize_t>(str_len)) return false;
                 break;
             }
             case GgufType::ARRAY: {
                 // ARRAY has no data_len field - directly read array_type and array_length
                 uint8_t arr_type_buf[4];
-                if (::read(fd_, arr_type_buf, 4) != 4) return false;
+                if (buffered_read(arr_type_buf, 4) != 4) return false;
                 uint32_t arr_type_val = read_u32_le(arr_type_buf);
                 GgufType arr_type = static_cast<GgufType>(arr_type_val);
 
                 uint8_t arr_count_buf[8];
-                if (::read(fd_, arr_count_buf, 8) != 8) return false;
+                if (buffered_read(arr_count_buf, 8) != 8) return false;
                 uint64_t arr_count = read_u64_le(arr_count_buf);
 
                 size_t elem_size = 4;
@@ -207,14 +229,14 @@ bool GgufLoader::parse_kv() {
                     write_u64_le(kv.data, arr_count);
                     for (uint64_t j = 0; j < arr_count; j++) {
                         std::string elem;
-                        if (!read_gguf_string(fd_, elem)) return false;
+                        if (!read_string_buffered(elem)) return false;
                         append_gguf_string(kv.data, elem);
                     }
                 } else {
                     uint64_t total_bytes = arr_count * elem_size;
                     kv.data.resize(total_bytes);
                     if (total_bytes > 0) {
-                        if (::read(fd_, kv.data.data(), total_bytes) != static_cast<ssize_t>(total_bytes)) return false;
+                        if (buffered_read(kv.data.data(), total_bytes) != static_cast<ssize_t>(total_bytes)) return false;
                     }
                 }
                 break;
@@ -228,7 +250,7 @@ bool GgufLoader::parse_kv() {
                     case GgufType::BOOL:
                         {
                             uint8_t v;
-                            if (::read(fd_, &v, 1) != 1) return false;
+                            if (buffered_read(&v, 1) != 1) return false;
                             kv.int_value = v;
                         }
                         break;
@@ -236,7 +258,7 @@ bool GgufLoader::parse_kv() {
                     case GgufType::INT16:
                         {
                             uint8_t buf[2];
-                            if (::read(fd_, buf, 2) != 2) return false;
+                            if (buffered_read(buf, 2) != 2) return false;
                             kv.int_value = static_cast<int64_t>(buf[0] | (buf[1] << 8));
                         }
                         break;
@@ -245,7 +267,7 @@ bool GgufLoader::parse_kv() {
                     case GgufType::FLOAT32:
                         {
                             uint8_t buf[4];
-                            if (::read(fd_, buf, 4) != 4) return false;
+                            if (buffered_read(buf, 4) != 4) return false;
                             if (value_type == GgufType::FLOAT32) {
                                 kv.float_value = static_cast<double>(read_f32_le(buf));
                             } else {
@@ -258,7 +280,7 @@ bool GgufLoader::parse_kv() {
                     case GgufType::FLOAT64:
                         {
                             uint8_t buf[8];
-                            if (::read(fd_, buf, 8) != 8) return false;
+                            if (buffered_read(buf, 8) != 8) return false;
                             if (value_type == GgufType::FLOAT64) {
                                 kv.float_value = read_f64_le(buf);
                             } else {
@@ -288,7 +310,7 @@ bool GgufLoader::parse_tensors() {
 
         // Read name length
         uint8_t name_key_len_buf[8];
-        if (::read(fd_, name_key_len_buf, 8) != 8) {
+        if (buffered_read(name_key_len_buf, 8) != 8) {
             return false;
         }
         uint64_t name_len = read_u64_le(name_key_len_buf);
@@ -296,12 +318,12 @@ bool GgufLoader::parse_tensors() {
 
         // Read name
         std::string name(name_len, '\0');
-        if (::read(fd_, &name[0], name_len) != static_cast<ssize_t>(name_len)) return false;
+        if (buffered_read(&name[0], name_len) != static_cast<ssize_t>(name_len)) return false;
         info.name = name;
 
         // Read number of dimensions
         uint8_t ndim_buf[4];
-        if (::read(fd_, ndim_buf, 4) != 4) return false;
+        if (buffered_read(ndim_buf, 4) != 4) return false;
         uint32_t ndim = read_u32_le(ndim_buf);
         info.n_dims = static_cast<int32_t>(ndim);
 
@@ -309,19 +331,19 @@ bool GgufLoader::parse_tensors() {
         info.dims.resize(ndim);
         for (uint32_t j = 0; j < ndim; j++) {
             uint8_t dim_buf[8];
-            if (::read(fd_, dim_buf, 8) != 8) return false;
+            if (buffered_read(dim_buf, 8) != 8) return false;
             info.dims[j] = read_u64_le(dim_buf);
         }
 
         // Read type
         uint8_t type_buf[4];
-        if (::read(fd_, type_buf, 4) != 4) return false;
+        if (buffered_read(type_buf, 4) != 4) return false;
         uint32_t type_val = read_u32_le(type_buf);
         info.type = static_cast<GgmlType>(type_val);
 
         // Read data offset (8 bytes)
         uint8_t data_off_buf[8];
-        if (::read(fd_, data_off_buf, 8) != 8) return false;
+        if (buffered_read(data_off_buf, 8) != 8) return false;
         info.data_offset = read_u64_le(data_off_buf);
 
         // Calculate tensor data size
@@ -332,8 +354,9 @@ bool GgufLoader::parse_tensors() {
         tensors_.push_back(std::move(info));
     }
 
-    off_t pos = lseek(fd_, 0, SEEK_CUR);
-    header_end_offset_ = pos > 0 ? static_cast<size_t>(pos) : 0;
+    // Logical bytes consumed by buffered_read == file offset where tensor data
+    // begins (the fd's real position is ahead by the buffered remainder).
+    header_end_offset_ = read_pos_;
 
     return true;
 }
@@ -360,9 +383,13 @@ bool GgufLoader::map_tensor_data() {
     // Tensor offsets in the header are relative to the data section start
     // (already alignment-padded by the writer) — keep them relative, since
     // consumers index from tensor_data().data().
-
-    tensor_data_.assign(mapped_data_ + static_cast<size_t>(data_offset),
-                        mapped_data_ + file_size_);
+    //
+    // Point a view directly into the mmap rather than copying the ~GB of
+    // tensor data onto the heap. The previous std::vector::assign here forced
+    // every page through a memcpy on load (~16 s for Llama 1B), defeating the
+    // whole purpose of the mmap. Pages now fault in lazily on first access.
+    tensor_data_ptr_ = mapped_data_ + static_cast<size_t>(data_offset);
+    tensor_data_size_ = file_size_ - static_cast<size_t>(data_offset);
 
     return true;
 }

@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <span>
 #include <cstdint>
 #include <memory>
 #include "tensor.h"
@@ -63,7 +64,11 @@ public:
     const GgufHeader& header() const { return header_; }
     const std::map<std::string, GgufKV>& kv_pairs() const { return kv_pairs_; }
     const std::vector<GgufTensorInfo>& tensors() const { return tensors_; }
-    const std::vector<uint8_t>& tensor_data() const { return tensor_data_; }
+    // Zero-copy view over the tensor-data region of the mmap'd file. Valid
+    // until unload(); never owns or copies the ~GB of weights.
+    std::span<const uint8_t> tensor_data() const {
+        return {tensor_data_ptr_, tensor_data_size_};
+    }
 
     std::string arch() const;
     std::string architecture() const;
@@ -90,15 +95,28 @@ private:
     bool parse_tensors();
     bool map_tensor_data();
 
+    // Buffered metadata reader. The GGUF header/KV/tensor-info section is parsed
+    // with thousands of tiny fields (e.g. a 128k-entry tokenizer array), so one
+    // ::read syscall per field cost ~16 s on load. These batch fd_ into a
+    // userspace buffer; read_pos_ tracks the logical offset for header_end.
+    ssize_t buffered_read(void* dst, size_t n);
+    bool read_string_buffered(std::string& out);
+
     GgufHeader header_;
     std::map<std::string, GgufKV> kv_pairs_;
     std::vector<GgufTensorInfo> tensors_;
-    std::vector<uint8_t> tensor_data_;
+    const uint8_t* tensor_data_ptr_ = nullptr;  // view into mapped_data_, no copy
+    size_t tensor_data_size_ = 0;
     uint8_t* mapped_data_ = nullptr;
     int fd_ = -1;
     size_t file_size_ = 0;
     size_t header_end_offset_ = 0; // file offset right after tensor metadata
     std::string path_;
+
+    std::vector<uint8_t> read_buf_;   // userspace read buffer for metadata
+    size_t read_buf_pos_ = 0;         // consumed bytes within read_buf_
+    size_t read_buf_len_ = 0;         // valid bytes in read_buf_
+    size_t read_pos_ = 0;             // logical file offset of next byte
 };
 
 } // namespace ggnpu

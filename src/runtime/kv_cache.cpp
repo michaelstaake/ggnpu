@@ -22,7 +22,9 @@ void KVCache::resize(uint64_t n_layers, uint64_t n_ctx, uint64_t n_head_kv, uint
     head_dim_ = head_dim;
     current_pos_ = 0;
 
-    size_t total = n_layers * 2 * n_ctx * n_head_kv * head_dim;
+    // K and V live in separate vectors (keys_/values_), so each holds exactly
+    // one cache's worth — the previous `2 *` here over-allocated both by 2x.
+    size_t total = n_layers * n_ctx * n_head_kv * head_dim;
     keys_.resize(total, 0.0f);
     values_.resize(total, 0.0f);
 }

@@ -8,6 +8,11 @@ namespace ggnpu {
 
 namespace {
 
+// Default KV-cache context when no explicit size is requested. Mirrors the cap
+// main.cpp applies for display; keeps load() from allocating the model's full
+// (e.g. 131072) context up front.
+constexpr uint64_t kDefaultCtxCap = 2048;
+
 TensorRole parse_tensor_role(const std::string& name) {
     if (name.find("token_embd") != std::string::npos) return TensorRole::EMBEDDING;
     if (name.find("attn_q") != std::string::npos) return TensorRole::ATTN_Q;
@@ -35,7 +40,13 @@ bool Model::load(const std::string& path) {
     if (!parse_hparams()) return false;
     if (!build_tensor_map()) return false;
     if (!prepare_tensors()) return false;
-    if (!init_kv_cache(0)) return false;
+    // Don't pre-allocate the model's full context here. Llama 3.2 reports 131072,
+    // which would allocate ~8 GB of KV up front (and swap-thrashed for ~13 s)
+    // only to be discarded when the CLI recaps. Allocate a sane default; the CLI
+    // raises it via reinit_kv_cache(ctx_size) when -c requests more.
+    uint64_t load_ctx = hparams_.context_length;
+    if (load_ctx == 0 || load_ctx > kDefaultCtxCap) load_ctx = kDefaultCtxCap;
+    if (!init_kv_cache(static_cast<int64_t>(load_ctx))) return false;
 
     loaded_ = true;
     return true;
@@ -134,10 +145,20 @@ void Model::set_backend(std::shared_ptr<Backend> backend) {
 bool Model::init_kv_cache(int64_t ctx_override) {
     uint64_t ctx = hparams_.context_length;
     if (ctx_override > 0) ctx = static_cast<uint64_t>(ctx_override);
-    if (ctx == 0) ctx = 2048;
+    if (ctx == 0) ctx = kDefaultCtxCap;
 
     uint64_t head_dim = hparams_.rope_dimension_count;
     if (head_dim == 0) {
+        // Falls back to embedding/heads. Guard against zero head count (e.g. a
+        // non-llama arch whose metadata uses a different key prefix) so we fail
+        // cleanly instead of raising SIGFPE.
+        if (hparams_.attention_head_count == 0 || hparams_.embedding_length == 0) {
+            std::cerr << "Error: model hparams missing (head_count="
+                      << hparams_.attention_head_count << ", embedding_length="
+                      << hparams_.embedding_length
+                      << ") — only the llama.* metadata layout is supported\n";
+            return false;
+        }
         head_dim = hparams_.embedding_length / hparams_.attention_head_count;
     }
 

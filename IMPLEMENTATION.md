@@ -574,6 +574,27 @@ Production commands use the **native host build** (§9). NPU ops (matmul, rmsnor
 | `attach_kquant_scales` validates scale count | `src/cli/main.cpp` |
 | France prompt golden tokens in `test_tokenizer` | `tests/test_tokenizer.cpp` |
 
+#### Recently fixed (startup / load perf)
+
+Model load + startup was **~16 s** before first token (dominated everything;
+`bench-layer`/inference profiling showed matmul as 85% of *compute*, but wall
+clock was mostly load). Three independent issues, all host-side:
+
+| Fix | File | Win |
+|-----|------|-----|
+| **KV cache allocated at full model context.** `init_kv_cache(0)` during `load()` used the model's reported context (Llama 3.2 = **131072**) → ~8 GB per buffer; combined with the bug below this tried to allocate **17 GB** on a 16 GB host and swap-thrashed for ~13 s, only to be discarded when the CLI recaps to 2048. `load()` now allocates a capped default (`kDefaultCtxCap=2048`); `-c` still raises it via `reinit_kv_cache()`. | `src/arch/llama/llama.cpp` | **13.4 s → 85 ms** |
+| **KV cache `2×` double-count.** `keys_`/`values_` are *separate* vectors but `total` carried a `2 *` factor, so each was sized 2× too large. | `src/runtime/kv_cache.cpp` | halves KV memory |
+| **GGUF metadata parsed one `::read` syscall per field.** The 128k-entry tokenizer array drove ~**818k** read syscalls. Now batched through a 1 MB userspace buffer (`buffered_read`); `header_end_offset_` tracked logically instead of via `lseek`. | `src/gguf/gguf.cpp`, `include/ggnpu/gguf.h` | KV/parse ~0.2 s |
+| **GGUF tensor data was memcpy'd off the mmap.** `map_tensor_data()` did `tensor_data_.assign(mmap…)`, copying the ~0.7 GB weight region onto the heap on every load. `tensor_data()` now returns a `std::span` view into the mmap (zero-copy; pages fault lazily). | `src/gguf/gguf.cpp`, `include/ggnpu/gguf.h` | no ~0.7 GB copy |
+| **Clean error for non-llama metadata.** Non-`llama.*` GGUFs (e.g. qwen2 uses `qwen2.*` keys) read head_count=0 and **SIGFPE'd** on `embedding/heads`; now errors cleanly. (Full qwen support still needs arch-prefix-aware metadata reading.) | `src/arch/llama/llama.cpp` | no core dump |
+
+**Result:** Llama 3.2 1B end-to-end wall **~31 s → ~14 s** (n≈5); time-to-first
+output dominated by the first-token weight decode + B-tile pack (~6 s), not load.
+Steady-state decode ~0.84 s/token. `test_e2e_logits` still passes (top-1
+unchanged). Remaining runtime is the INT8 matmul path (per-tile driver
+round-trips at the fixed 256³ kernel granularity — see attention note re: no
+in-repo bigger-tile generator).
+
 #### Recently fixed (kernels / layer bench)
 
 | Fix | File |
