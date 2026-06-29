@@ -555,7 +555,7 @@ Production commands use the **native host build** (§9). NPU ops (matmul, rmsnor
 | RMSNorm xclbin staleness | `build-kernels.sh`, `rmsnorm_aie2p.mlir` | Old `rmsnorm_2048` xclbins (~8% error) must be rebuilt after mlir fix |
 | SiLU FFN=8192 on NPU | `amd_xdna.cpp` | **Works** when `silu_npu6.xclbin` present |
 | Matmul perf: host-side tiling | `amd_xdna.cpp` | Host weight-tile cache; per-tile DMA (device persist deferred) |
-| RoPE on CPU | `main.cpp` | Correct Llama 3 math; not on NPU yet |
+| RoPE | `main.cpp`, `amd_xdna.cpp` | NPU batched kernel (`rope_batched`, opt-in `GGNPU_NPU_ROPE=1`) + CPU default; correct Llama 3 math |
 | Logits projection | `main.cpp` | NPU INT8 mul_mat_q with WeightCache decode (Q4_K/Q6_K); CPU fallback for F32 weights |
 | Residual adds on CPU | `main.cpp` | Cheap; acceptable for MVP |
 | `execute_layer_graph()` unused | `main.cpp` | Already removed |
