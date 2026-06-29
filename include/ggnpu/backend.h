@@ -123,6 +123,16 @@ public:
         return Status::OK;
     }
 
+    // BF16 GEMM: C[M,N] = A[M,K] @ B[K,N], f32 host buffers, bf16 NPU compute.
+    // Building block for decomposed NPU attention (QK / AV). Default: unavailable
+    // (only the NPU backend implements it). M/N/K need not be multiples of the
+    // 256 tile — the backend zero-pads internally.
+    virtual Status matmul_bf16(const float* A, const float* B, float* C,
+                               int M, int N, int K) {
+        (void)A; (void)B; (void)C; (void)M; (void)N; (void)K;
+        return Status::NPU_UNAVAILABLE;
+    }
+
     virtual Status softmax(const SoftmaxParams& params) = 0;
     virtual Status silu(const SiluParams& params) = 0;
     virtual Status flash_attn(const AttnParams& params) = 0;

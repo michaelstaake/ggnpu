@@ -1172,6 +1172,56 @@ int main(int argc, char* argv[]) {
                     hidden_size, hidden_size, hidden_size)) return 1;
         }
 
+        // Test 0e2: bf16 matmul — NPU vs CPU f32 (decomposed-attention building block).
+        // Includes a QK-shaped case (M=ctx, N=1, K=head_dim) to exercise edge padding.
+        std::cout << "Testing bf16 matmul (Phase 6)...\n";
+        {
+            struct Shape { int M, N, K; const char* label; };
+            std::vector<Shape> shapes = {
+                {256, 256, 256, "256x256x256"},
+                {64, 64, 128,   "64x64x128 (partial tile)"},
+                {256, 1, 64,    "QK-shaped 256x1x64"},
+            };
+            for (auto s : shapes) {
+                // Pseudo-random inputs (LCG) — avoid systematic cancellation that
+                // would drive the reference near zero and make rel error meaningless.
+                std::vector<float> A(static_cast<size_t>(s.M) * s.K);
+                std::vector<float> B(static_cast<size_t>(s.K) * s.N);
+                uint32_t st_a = 0x12345u, st_b = 0x6789au;
+                auto nxt = [](uint32_t& st) {
+                    st = st * 1103515245u + 12345u;
+                    return (static_cast<float>((st >> 16) & 0x7fff) / 32768.0f - 0.5f);
+                };
+                for (size_t i = 0; i < A.size(); i++) A[i] = nxt(st_a);
+                for (size_t i = 0; i < B.size(); i++) B[i] = nxt(st_b);
+
+                std::vector<float> C_npu(static_cast<size_t>(s.M) * s.N, 0.0f);
+                Status mst = npu_backend->matmul_bf16(A.data(), B.data(), C_npu.data(), s.M, s.N, s.K);
+                npu_backend->sync();
+                if (mst != Status::OK) {
+                    std::cout << "  bf16 matmul " << s.label << ": SKIPPED (status="
+                              << status_name(mst) << ")\n";
+                    continue;
+                }
+                // CPU reference: bf16-roundtrip A,B to match the NPU compute path.
+                std::vector<float> Aq(A.size()), Bq(B.size());
+                bf16_roundtrip_vector(A.data(), Aq.data(), static_cast<int>(A.size()));
+                bf16_roundtrip_vector(B.data(), Bq.data(), static_cast<int>(B.size()));
+                std::vector<float> C_cpu(static_cast<size_t>(s.M) * s.N, 0.0f);
+                for (int m = 0; m < s.M; m++)
+                    for (int n = 0; n < s.N; n++) {
+                        float acc = 0.0f;
+                        for (int k = 0; k < s.K; k++)
+                            acc += Aq[static_cast<size_t>(m) * s.K + k] * Bq[static_cast<size_t>(k) * s.N + n];
+                        C_cpu[static_cast<size_t>(m) * s.N + n] = acc;
+                    }
+                int n_elem = s.M * s.N;
+                auto cmp = compare_vectors(C_cpu.data(), C_npu.data(), n_elem, 0.05f);
+                std::string lbl = std::string("bf16 matmul ") + s.label;
+                if (!report_compare(lbl.c_str(), cmp, n_elem, 0.03f, 0.05f, 0.05f)) return 1;
+            }
+        }
+
         // Test 0f: flash attention — NPU vs CPU (Phase 4, single head, ctx=1)
         std::cout << "Testing flash attention (Phase 4)...\n";
         {

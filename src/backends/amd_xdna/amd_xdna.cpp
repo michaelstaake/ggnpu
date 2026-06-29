@@ -183,6 +183,15 @@ struct CachedMatmulKernel {
     GgmlType B_type;
 };
 
+// Cached BF16 matmul kernel (fixed 256x256x256 tile; host tiles larger problems).
+struct CachedMatmulBf16Kernel {
+    xrt::run run;
+    xrt::kernel krnl;
+    xrt::bo bo_instr;
+    size_t instr_words = 0;
+    bool loaded = false;
+};
+
 // Per-tile pipeline slot for overlapped matmul submission.
 struct MatmulPipelineSlot {
     std::shared_ptr<XrtBuffer> buf_a;
@@ -848,6 +857,95 @@ public:
         }
 
         return Status::OK;
+    }
+
+    // BF16 GEMM C[M,N] = A[M,K] @ B[K,N] via the fixed 256^3 matmul_bf16 kernel.
+    // Host tiles M/N/K into 256-blocks and zero-pads the edges; K-blocks are
+    // accumulated in f32 on the host. Building block for decomposed NPU attention.
+    Status matmul_bf16(const float* A, const float* B, float* C,
+                       int M, int N, int K) override {
+        if (!A || !B || !C || M <= 0 || N <= 0 || K <= 0) {
+            last_status_ = Status::INVALID_PARAM;
+            return last_status_;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!ensure_matmul_bf16_kernel()) {
+            std::cerr << "Error: no NPU matmul_bf16 kernel.\n"
+                      << "  Build: GGNPU_EXPERIMENTAL=1 ./scripts/build-kernels.sh npu6 matmul_bf16\n";
+            last_status_ = Status::NPU_UNAVAILABLE;
+            return last_status_;
+        }
+        auto& kernel = matmul_bf16_kernel_;
+
+        constexpr int T = kMatmulTile;            // 256
+        const size_t in_bytes  = static_cast<size_t>(T) * T * sizeof(uint16_t);
+        const size_t out_bytes = static_cast<size_t>(T) * T * sizeof(float);
+        if (!buf_mmbf16_a_ || buf_mmbf16_a_->size() < in_bytes)
+            buf_mmbf16_a_ = buf_mgr_->alloc(in_bytes, true);
+        if (!buf_mmbf16_b_ || buf_mmbf16_b_->size() < in_bytes)
+            buf_mmbf16_b_ = buf_mgr_->alloc(in_bytes, true);
+        if (!buf_mmbf16_c_ || buf_mmbf16_c_->size() < out_bytes)
+            buf_mmbf16_c_ = buf_mgr_->alloc(out_bytes, true);
+
+        const int Mt = (M + T - 1) / T;
+        const int Nt = (N + T - 1) / T;
+        const int Kt = (K + T - 1) / T;
+
+        std::vector<float> a_tile(static_cast<size_t>(T) * T);
+        std::vector<float> b_tile(static_cast<size_t>(T) * T);
+        std::vector<float> c_acc(static_cast<size_t>(T) * T);
+
+        for (int mi = 0; mi < Mt; mi++) {
+            for (int ni = 0; ni < Nt; ni++) {
+                std::fill(c_acc.begin(), c_acc.end(), 0.0f);
+                for (int ki = 0; ki < Kt; ki++) {
+                    // Pack A tile [T,T] (zero-padded at the edges).
+                    std::fill(a_tile.begin(), a_tile.end(), 0.0f);
+                    for (int r = 0; r < T && mi * T + r < M; r++) {
+                        const float* arow = A + static_cast<size_t>(mi * T + r) * K + ki * T;
+                        int kc = std::min(T, K - ki * T);
+                        std::memcpy(&a_tile[static_cast<size_t>(r) * T], arow, kc * sizeof(float));
+                    }
+                    // Pack B tile [T,T] (B is [K,N] row-major).
+                    std::fill(b_tile.begin(), b_tile.end(), 0.0f);
+                    for (int r = 0; r < T && ki * T + r < K; r++) {
+                        const float* brow = B + static_cast<size_t>(ki * T + r) * N + ni * T;
+                        int nc = std::min(T, N - ni * T);
+                        std::memcpy(&b_tile[static_cast<size_t>(r) * T], brow, nc * sizeof(float));
+                    }
+
+                    auto a_bf16 = convert_f32_to_bf16(a_tile.data(), static_cast<size_t>(T) * T);
+                    auto b_bf16 = convert_f32_to_bf16(b_tile.data(), static_cast<size_t>(T) * T);
+                    buf_mgr_->copy_to(*buf_mmbf16_a_, a_bf16.data(), in_bytes);
+                    buf_mgr_->copy_to(*buf_mmbf16_b_, b_bf16.data(), in_bytes);
+                    try {
+                        kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                                   buf_mmbf16_a_->handle(), buf_mmbf16_b_->handle(),
+                                   buf_mmbf16_c_->handle());
+                        kernel.run.wait();
+                    } catch (const std::exception& e) {
+                        std::cerr << "Error: matmul_bf16 kernel execution failed: " << e.what() << "\n";
+                        last_status_ = Status::ERROR;
+                        return last_status_;
+                    }
+                    std::vector<uint8_t> c_raw(out_bytes);
+                    buf_mgr_->copy_from(*buf_mmbf16_c_, c_raw.data(), out_bytes);
+                    const float* c_f32 = reinterpret_cast<const float*>(c_raw.data());
+                    for (size_t i = 0; i < static_cast<size_t>(T) * T; i++)
+                        c_acc[i] += c_f32[i];
+                }
+                // Write the in-bounds portion of this output tile.
+                for (int r = 0; r < T && mi * T + r < M; r++) {
+                    int nc = std::min(T, N - ni * T);
+                    std::memcpy(C + static_cast<size_t>(mi * T + r) * N + ni * T,
+                                &c_acc[static_cast<size_t>(r) * T], nc * sizeof(float));
+                }
+            }
+        }
+
+        last_status_ = Status::OK;
+        return last_status_;
     }
 
     Status rope(const RopeParams& params) override {
@@ -1550,6 +1648,37 @@ private:
         }
     }
 
+    // Lazily load the fixed 256^3 bf16 matmul xclbin (matmul_bf16_<profile>.xclbin).
+    bool ensure_matmul_bf16_kernel() {
+        if (matmul_bf16_kernel_.loaded) return true;
+        std::string name = "matmul_bf16_" + profile_str_ + ".xclbin";
+        std::string path = detail::find_prebuilt_xclbin(name, cache_dir_);
+        if (path.empty() && cache_->has_xclbin(name)) path = cache_->get_xclbin_path(name);
+        if (path.empty()) return false;
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) return false;
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);  // keep context alive
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
+            xrt::run run(krnl);
+            CachedMatmulBf16Kernel cached{run, krnl, {}, 0, true};
+            std::string seq = detail::find_prebuilt_sequence(name, cache_dir_);
+            if (!seq.empty()) {
+                load_instr_bo(*device_, krnl, cached.bo_instr, cached.instr_words, seq);
+            }
+            if (!cached.bo_instr || cached.instr_words == 0) {
+                std::cerr << "Error: matmul_bf16 xclbin missing instruction sequence\n";
+                return false;
+            }
+            matmul_bf16_kernel_ = std::move(cached);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load matmul_bf16 kernel: " << e.what() << "\n";
+            return false;
+        }
+    }
+
     // Load or compile the rmsnorm xclbin (prefer Llama-shaped rmsnorm_2048 when present).
     bool load_rmsnorm_xclbin() {
         std::string shaped_name = "rmsnorm_2048_" + profile_str_ + ".xclbin";
@@ -2108,6 +2237,12 @@ private:
     xrt::hw_context hw_ctx_matmul_;
     bool matmul_hw_ready_ = false;
     std::vector<xrt::hw_context> matmul_shape_ctxs_;  // keeps per-shape contexts alive
+
+    // BF16 matmul (decomposed NPU attention building block)
+    CachedMatmulBf16Kernel matmul_bf16_kernel_;
+    std::shared_ptr<XrtBuffer> buf_mmbf16_a_;
+    std::shared_ptr<XrtBuffer> buf_mmbf16_b_;
+    std::shared_ptr<XrtBuffer> buf_mmbf16_c_;
 
     std::vector<uint8_t> xclbin_data_rmsnorm_;
     xrt::hw_context hw_ctx_rmsnorm_;
