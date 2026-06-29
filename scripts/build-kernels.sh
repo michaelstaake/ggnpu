@@ -219,8 +219,10 @@ Kernels=(
 
 # flash_attn blocked on Triton-XDNA multi-reduction lowering (3+ tl.sum ops).
 # Inference uses host f32 decomposed flash_attn until upstream support lands.
+# matmul_bf16: bf16 GEMM datapath probe toward decomposed NPU attention (QK/AV).
 if [ -n "${GGNPU_EXPERIMENTAL:-}" ]; then
     Kernels+=(
+        "matmul_bf16:--M 256 --N 256 --K 256"
         "flash_attn:--n_head 8 --head_dim 128 --ctx_len 2048"
         "flash_attn_32x64x2048:--n_head 32 --head_dim 64 --ctx_len 2048"
     )

@@ -633,18 +633,28 @@ padded AV terms vanish. Use bf16 (not the INT8 matmul kernel, which loses
 attention-logit coherence). This is a sizable feature (2 new matvec kernels +
 transforms + host orchestration + per-head loop), tracked as future work.
 
-**Progress (WIP):** the `attn_qk` kernel + dedicated `attn_qk_aie2p.mlir`
-(experimental) scaffold step 1. The transform now promotes **both** reduction
-inputs (Q broadcast + K) — fixing the `air-dma-to-channel` rejection — and
-reaches AIE herd placement, past the fused kernel's wall. The **remaining
-blocker is structural**: rmsnorm produces a 2-D elementwise output, but QK is a
-**matvec with a 1-D output** after the reduction. The rmsnorm pipeline (tile the
-2-D output generic, fuse the reduce backward; `[0,16]` vectorization) doesn't fit
-1-D output — with the scale generic the vectorization tile errors ("too many
-tiles"); without it the output-generic navigation fails ("could not find next
-producer to fuse"). **Next step:** a purpose-built GEMV transform, or rewrite QK
-as a bf16 `tl.dot` matmul reusing `matmul_aie2p.mlir` (QK = K[ctx,d] @ Q[d,1]).
-Then the same for AV, plus host orchestration. Host f32 stays production.
+**Progress (WIP).** Two approaches were explored:
+
+1. *rmsnorm-derived QK transform* (`attn_qk` + `attn_qk_aie2p.mlir`): promotes
+   both reduction inputs (Q broadcast + K), reaching AIE herd placement, but hits
+   a structural wall — rmsnorm produces a 2-D elementwise output while QK is a
+   **matvec with a 1-D output**, so the 2-D pipeline (output-generic navigation,
+   `[0,16]` vectorization) doesn't fit. Abandoned in favor of (2).
+
+2. **bf16 matmul datapath — WORKS.** `matmul_bf16` (`compile_kernels.py` +
+   `matmul_bf16_aie2p.mlir`) is the int8 matmul transform with the `vector.contract`
+   casts retargeted (`i16 → bf16` inputs, `i32 → f32` accumulator) — the int8 path
+   already widens to 16-bit i16, and bf16 is 16-bit, so the packing/tiling is
+   unchanged. It **compiles end-to-end** to a 67 KB xclbin; the AIR has bf16
+   contracts with f32 accumulation across 3 herds (verified). This is the
+   foundation for decomposed NPU attention: QK = K[ctx,d] @ Q[d,1] and AV =
+   P[1,ctx] @ V[ctx,d] become bf16 GEMMs. Build with
+   `GGNPU_EXPERIMENTAL=1 ./scripts/build-kernels.sh npu6 matmul_bf16`.
+
+**Next steps:** (a) validate `matmul_bf16` numerically on hardware vs a CPU ref;
+(b) shape QK/AV as bf16 GEMMs (pad the degenerate matvec dim to a 256 tile for
+decode; prefill is a natural GEMM); (c) host orchestration with ctx masking
+between QK → softmax → AV. Host f32 `flash_attn_decomposed()` stays production.
 
 #### Recently fixed
 
