@@ -12,7 +12,9 @@
 #
 # Kernels built:
 #   - matmul: INT8 matrix multiplication (core bottleneck)
-#   - rmsnorm: RMS normalization
+#   - rmsnorm: RMS normalization. Sized variants rmsnorm_<N> (N a power of 2,
+#     e.g. 2048, 4096). Non-pow2 hidden sizes pad up to the next power of 2 at
+#     runtime (1536 -> 2048 kernel), so only pow2 kernels need building.
 #   - softmax: Softmax activation
 #   - silu: SiLU/Swish activation
 #   - rope: Rotary positional embeddings (n_pairs=32, head_dim=64)
@@ -209,6 +211,7 @@ Kernels=(
     "matmul:--M 256 --N 256 --K 256"
     "rmsnorm:--M 32 --N 256"
     "rmsnorm_2048:--M 2 --N 2048"
+    "rmsnorm_4096:--M 2 --N 4096"
     "softmax:--rows 256 --cols 256"
     "silu:--N 8192"
     "rope:--n_pairs 32"
@@ -243,9 +246,10 @@ for kernel_def in "${Kernels[@]}"; do
     # Shape-specific kernels compile under base op name but install with shaped artifact names.
     compile_op="$kernel_name"
     shaped_install=""
-    if [ "$kernel_name" = "rmsnorm_2048" ]; then
+    # rmsnorm_<N> (any size) compiles under op "rmsnorm", installs shaped.
+    if [[ "$kernel_name" =~ ^rmsnorm_[0-9]+$ ]]; then
         compile_op="rmsnorm"
-        shaped_install="rmsnorm_2048"
+        shaped_install="$kernel_name"
     elif [ "$kernel_name" = "flash_attn_32x64x2048" ]; then
         compile_op="flash_attn"
         shaped_install="flash_attn_32x64x2048"

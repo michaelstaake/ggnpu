@@ -20,6 +20,7 @@
 #include <mutex>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <chrono>
 
 namespace ggnpu {
@@ -259,6 +260,14 @@ struct BTileKeyHash {
 static std::unordered_map<BTileKey, std::vector<int8_t>, BTileKeyHash>& get_global_b_tile_cache() {
     static std::unordered_map<BTileKey, std::vector<int8_t>, BTileKeyHash> cache;
     return cache;
+}
+
+// Smallest power of 2 >= n (n >= 1). RMSNorm kernels need BLOCK_N = power of 2
+// (Triton tl.arange constraint); non-pow2 hidden sizes pad up to this.
+static int next_pow2(int n) {
+    int p = 1;
+    while (p < n) p <<= 1;
+    return p;
 }
 
 static void rms_norm_cpu_ref(const RmsNormParams& params) {
@@ -711,47 +720,56 @@ public:
             npu_params.output = unweighted_out.data();
         }
 
-        std::string cache_key = "rmsnorm_" + std::to_string(N) + "_" + profile_str_;
+        // The BF16 kernel's BLOCK_N must be a power of 2 (Triton tl.arange). For
+        // non-pow2 hidden sizes (e.g. 1536) pad up to N_pad = next_pow2(N) and use
+        // the N_pad kernel. The kernel divides the sum-of-squares by N_pad, so its
+        // rstd is too large by sqrt(N_pad/N); correct it with a CONSTANT output
+        // factor c = sqrt(N/N_pad). Zero padding contributes nothing to the sum.
+        // The input is NOT scaled, so it stays on the same bf16 grid as the
+        // reference (full accuracy); the only approximation is that eps is
+        // effectively scaled by N_pad/N (~1e-6 relative, negligible). c == 1 for
+        // pow2 N, making this an exact no-op for hidden=2048.
+        const int N_pad = next_pow2(N);
+        const float rms_out_corr = std::sqrt(static_cast<float>(N) / static_cast<float>(N_pad));
+
+        std::string cache_key = "rmsnorm_" + std::to_string(N_pad) + "_" + profile_str_;
 
         std::lock_guard<std::mutex> lock(mutex_);
 
-        auto it = rmsnorm_kernels_.find(N);
+        auto it = rmsnorm_kernels_.find(N_pad);
         if (it == rmsnorm_kernels_.end()) {
-            if (!ensure_rmsnorm_kernel(N, cache_key)) {
-                std::cerr << "Error: no NPU rmsnorm kernel for N=" << N << "\n";
-                if (N == kRmsnormKernelHidden) {
-                    std::cerr << "  Build: ./scripts/build-kernels.sh npu6 rmsnorm_2048\n";
-                    std::cerr << "  Expect: " << cache_dir_ << "/xclbin/rmsnorm_2048_"
-                              << profile_str_ << ".xclbin\n";
+            if (!ensure_rmsnorm_kernel(N_pad, cache_key)) {
+                std::cerr << "Error: no NPU rmsnorm kernel for N=" << N
+                          << " (padded to " << N_pad << ")\n";
+                if (detail::jit_compilation_available()) {
+                    std::cerr << "  JIT compilation failed — check Triton-XDNA environment.\n";
                 } else {
-                    std::cerr << "  Prebuilt xclbin not found for N=" << N << ".\n";
-                    if (detail::jit_compilation_available()) {
-                        std::cerr << "  JIT compilation failed — check Triton-XDNA environment.\n";
-                    } else {
-                        std::cerr << "  Install Triton-XDNA for JIT: pip install triton-xdna\n";
-                        std::cerr << "  Or build prebuilt: ./scripts/build-kernels.sh npu6 rmsnorm_"
-                                  << N << "\n";
-                    }
+                    std::cerr << "  Install Triton-XDNA for JIT: pip install triton-xdna\n";
+                    std::cerr << "  Or build prebuilt: ./scripts/build-kernels.sh npu6 rmsnorm_"
+                              << N_pad << "\n";
                 }
                 last_status_ = Status::NPU_UNAVAILABLE;
                 return last_status_;
             }
-            it = rmsnorm_kernels_.find(N);
+            it = rmsnorm_kernels_.find(N_pad);
         }
 
         auto& kernel = it->second;
         const float* input_ptr = npu_params.input;
         float* output_ptr = npu_params.output;
 
-        // RMSNorm kernels are BF16 — convert f32 input → bf16 for DMA.
-        // Llama hidden=2048 uses M=2,N=2048 bf16 kernel; duplicate row 0 into both rows.
-        const int npu_rows = (N == kRmsnormKernelHidden) ? kRmsnormHiddenPadRows : 1;
-        const size_t row_bf16_bytes = static_cast<size_t>(N) * sizeof(uint16_t);
+        // RMSNorm kernels are BF16 — convert f32 input → bf16 for DMA. The pow2
+        // kernels are compiled M=2 (M=1 won't compile); duplicate row 0 into both.
+        const int npu_rows = (N_pad >= 512) ? kRmsnormHiddenPadRows : 1;
+        const size_t row_bf16_bytes = static_cast<size_t>(N_pad) * sizeof(uint16_t);
         const size_t bf16_bytes = static_cast<size_t>(npu_rows) * row_bf16_bytes;
         std::vector<uint8_t> bf16_input;
 
         if (kernel.bo_instr && kernel.instr_words > 0) {
-            std::vector<uint8_t> row_bf16 = convert_f32_to_bf16(input_ptr, N);
+            // Zero-padded f32 row of N_pad cols (input unscaled), then bf16.
+            std::vector<float> padded_row(static_cast<size_t>(N_pad), 0.0f);
+            for (int i = 0; i < N; i++) padded_row[i] = input_ptr[i];
+            std::vector<uint8_t> row_bf16 = convert_f32_to_bf16(padded_row.data(), N_pad);
             bf16_input.resize(bf16_bytes);
             for (int r = 0; r < npu_rows; r++) {
                 std::memcpy(bf16_input.data() + static_cast<size_t>(r) * row_bf16_bytes,
@@ -779,14 +797,15 @@ public:
 
             std::vector<uint8_t> bf16_out_data(bf16_bytes);
             buf_mgr_->copy_from(*buf_rmsnorm_bf16_out_, bf16_out_data.data(), bf16_bytes);
-            auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
-            std::memcpy(output_ptr, f32_result.data(), N * sizeof(float));
+            auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N_pad);
+            for (int i = 0; i < N; i++) output_ptr[i] = f32_result[i] * rms_out_corr;
 
-            if (N == kRmsnormKernelHidden && !rmsnorm_hidden_npu_checked_) {
-                rmsnorm_hidden_npu_checked_ = true;
+            if (rmsnorm_validated_.find(N) == rmsnorm_validated_.end()) {
+                rmsnorm_validated_.insert(N);
                 if (!rmsnorm_npu_matches_cpu(input_ptr, output_ptr, N, npu_params.eps)) {
-                    std::cerr << "Error: rmsnorm_2048 NPU kernel failed bf16-aware validation\n";
-                    std::cerr << "  Rebuild: ./scripts/build-kernels.sh npu6 rmsnorm_2048\n";
+                    std::cerr << "Error: rmsnorm NPU kernel failed bf16-aware validation for N="
+                              << N << " (padded to " << N_pad << ")\n";
+                    std::cerr << "  Rebuild: ./scripts/build-kernels.sh npu6 rmsnorm_" << N_pad << "\n";
                     last_status_ = Status::ERROR;
                     return last_status_;
                 }
@@ -2144,7 +2163,7 @@ private:
 
     Status last_status_;
     mutable std::mutex mutex_;
-    bool rmsnorm_hidden_npu_checked_ = false;
+    std::unordered_set<int> rmsnorm_validated_;  // hidden sizes validated vs CPU ref
 };
 
 std::shared_ptr<Backend> create_amd_xdna_backend(int device_id) {

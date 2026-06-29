@@ -1109,6 +1109,43 @@ int main(int argc, char* argv[]) {
             if (!report_compare("RMSNorm", cmp, hidden_size, 0.01f, 0.05f, 0.01f)) return 1;
         }
 
+        // Test 0a2: RMSNorm at non-pow2 / large hidden sizes (pad-to-pow2 path).
+        // 1536 (Qwen/Gemma) pads to the existing 2048 kernel; 3072 (future 3B)
+        // needs a 4096 kernel. Synthetic data, independent of the loaded model.
+        std::cout << "Testing RMSNorm extra sizes (Phase 6)...\n";
+        for (int test_n : {1536, 3072}) {
+            std::vector<float> in(static_cast<size_t>(test_n));
+            for (int i = 0; i < test_n; i++)
+                in[i] = std::sin(0.013f * static_cast<float>(i)) * 1.3f;
+
+            std::vector<float> npu_out(static_cast<size_t>(test_n));
+            RmsNormParams np;
+            np.input = in.data(); np.output = npu_out.data();
+            np.size = test_n; np.eps = rms_eps;
+            Status rst = npu_backend->rms_norm(np);
+            npu_backend->sync();
+            if (rst != Status::OK) {
+                std::cout << "  RMSNorm N=" << test_n
+                          << ": SKIPPED (status=" << status_name(rst) << ")\n";
+                continue;
+            }
+            // bf16-aware CPU reference (matches NPU's bf16 marshaling).
+            std::vector<float> qin(static_cast<size_t>(test_n));
+            bf16_roundtrip_vector(in.data(), qin.data(), test_n);
+            std::vector<float> cpu_out(static_cast<size_t>(test_n));
+            RmsNormParams cp;
+            cp.input = qin.data(); cp.output = cpu_out.data();
+            cp.size = test_n; cp.eps = rms_eps;
+            cpu_backend->rms_norm(cp);
+            // Padded-pow2 path carries more bf16 noise than the exact 2048 path
+            // (wider reduction + output correction factor), so use the production
+            // validator's tolerance (atol 0.02, rtol 0.013) rather than the strict
+            // 0.01 used for the native-size test.
+            auto cmp = compare_vectors(cpu_out.data(), npu_out.data(), test_n, 0.02f);
+            std::string lbl = "RMSNorm N=" + std::to_string(test_n);
+            if (!report_compare(lbl.c_str(), cmp, test_n, 0.013f, 0.05f, 0.02f)) return 1;
+        }
+
         // Test 0b–0e: attention matmuls — NPU vs CPU (Phase 4)
         const int kv_dim = num_kv_heads * head_dim;
         std::cout << "Testing attention matmuls (Phase 4)...\n";
