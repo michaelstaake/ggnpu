@@ -832,15 +832,20 @@ public:
     }
 
     Status rope(const RopeParams& params) override {
-        // RoPE on NPU: 3-buffer BF16 kernel (x_pairs, cs_table, out).
-        // Host deinterleaves x → [even|odd], packs [cos|sin], runs NPU,
-        // then reinterleaves [out_e|out_o] back into params.data.
+        // RoPE on NPU: binary vector-add kernel called TWICE per head.
+        // Host precomputes the element-wise products; NPU adds them:
+        //   even call: in=[x_e*cos | -x_o*sin] → out_e = x_e*cos - x_o*sin
+        //   odd  call: in=[x_e*sin |  x_o*cos] → out_o = x_e*sin + x_o*cos
+        //
+        // 2-buffer protocol: in_ptr=[t1|t2] (2*n_pairs BF16), out_ptr=n_pairs BF16.
+        // Kernel computes out[i] = t1[i] + t2[i]. Pure binary add → standard
+        // @pad_and_promote_binary_bf16 transform → single AIR herd → xclbin.
         if (!params.data || params.rope_dims <= 0 || params.n_dims <= 0) {
             last_status_ = Status::INVALID_PARAM;
             return last_status_;
         }
 
-        int n_dims  = static_cast<int>(params.rope_dims);  // elements to rotate (= head_dim)
+        int n_dims  = static_cast<int>(params.rope_dims);
         int n_pairs = n_dims / 2;
         std::string cache_key = "rope_" + std::to_string(n_dims) + "_" + profile_str_;
 
@@ -860,61 +865,98 @@ public:
 
         auto& kernel = it->second;
 
-        // Each buffer holds 2*n_pairs BF16 elements (even+odd or cos+sin or out_e+out_o)
-        size_t buf_bytes = static_cast<size_t>(n_pairs * 2) * sizeof(uint16_t);
+        // Three distinct buffers: t1, t2 inputs + out, each pad_len BF16. Matches
+        // the kernel's three pointer args (in1_ptr, in2_ptr, out_ptr) → three shim
+        // DMA flows, like the proven matmul (A, B, C) pattern.
+        //
+        // The kernel is compiled for a PADDED length so flatten_tile_forall yields
+        // a multi-core herd of standard 256-element tiles (see rope_aie2p.mlir).
+        // This must match rope_pad in compile_kernels.py. Only the first n_pairs
+        // elements are meaningful; the rest are zero-padded.
+        int pad_len = std::max(512, ((n_pairs + 255) / 256) * 256 * 2);
+        size_t buf_bytes = static_cast<size_t>(pad_len) * sizeof(uint16_t);
 
-        if (!buf_rope_bf16_in_ || buf_rope_bf16_in_->size() < buf_bytes)
-            buf_rope_bf16_in_  = buf_mgr_->alloc(buf_bytes, false);
-        if (!buf_rope_cs_table_ || buf_rope_cs_table_->size() < buf_bytes)
-            buf_rope_cs_table_ = buf_mgr_->alloc(buf_bytes, false);
+        if (!buf_rope_t1_       || buf_rope_t1_->size()       < buf_bytes)
+            buf_rope_t1_       = buf_mgr_->alloc(buf_bytes, true);
+        if (!buf_rope_t2_       || buf_rope_t2_->size()       < buf_bytes)
+            buf_rope_t2_       = buf_mgr_->alloc(buf_bytes, true);
         if (!buf_rope_bf16_out_ || buf_rope_bf16_out_->size() < buf_bytes)
-            buf_rope_bf16_out_ = buf_mgr_->alloc(buf_bytes, false);
+            buf_rope_bf16_out_ = buf_mgr_->alloc(buf_bytes, true);
 
-        // Deinterleave x into separate even/odd arrays
-        std::vector<float> x_packed(n_pairs * 2);
+        // Deinterleave x: x_e = data[2i], x_o = data[2i+1]
+        std::vector<float> x_e(n_pairs), x_o(n_pairs);
+        std::vector<float> cos_vals(n_pairs), sin_vals(n_pairs);
         for (int i = 0; i < n_pairs; i++) {
-            x_packed[i]          = params.data[2 * i];      // even
-            x_packed[n_pairs + i] = params.data[2 * i + 1]; // odd
+            x_e[i] = params.data[2 * i];
+            x_o[i] = params.data[2 * i + 1];
         }
 
-        // Build cos/sin tables [cos[0..n-1] | sin[0..n-1]]
-        std::vector<float> cs_packed(n_pairs * 2);
         if (params.cos_table && params.sin_table) {
-            std::memcpy(cs_packed.data(),           params.cos_table, n_pairs * sizeof(float));
-            std::memcpy(cs_packed.data() + n_pairs, params.sin_table, n_pairs * sizeof(float));
+            std::memcpy(cos_vals.data(), params.cos_table, n_pairs * sizeof(float));
+            std::memcpy(sin_vals.data(), params.sin_table, n_pairs * sizeof(float));
         } else {
             for (int i = 0; i < n_pairs; i++) {
                 float ratio = 1.0f / std::pow(params.freq_base,
                                   (2.0f * i) / static_cast<float>(n_dims));
                 float angle = static_cast<float>(params.offset) * ratio * params.freq_scale;
-                cs_packed[i]           = std::cos(angle);
-                cs_packed[n_pairs + i] = std::sin(angle);
+                cos_vals[i] = std::cos(angle);
+                sin_vals[i] = std::sin(angle);
             }
         }
 
-        auto bf16_x  = convert_f32_to_bf16(x_packed.data(),  n_pairs * 2);
-        auto bf16_cs = convert_f32_to_bf16(cs_packed.data(), n_pairs * 2);
-        buf_mgr_->copy_to(*buf_rope_bf16_in_,  bf16_x.data(),  buf_bytes);
-        buf_mgr_->copy_to(*buf_rope_cs_table_, bf16_cs.data(), buf_bytes);
+        // Run kernel with separate t1, t2 buffers (zero-padded to pad_len); read
+        // back only the first n_pairs meaningful outputs.
+        auto run_half = [&](std::vector<float>& t1, std::vector<float>& t2, float* dst) -> bool {
+            std::vector<float> t1_pad(pad_len, 0.0f), t2_pad(pad_len, 0.0f);
+            std::memcpy(t1_pad.data(), t1.data(), n_pairs * sizeof(float));
+            std::memcpy(t2_pad.data(), t2.data(), n_pairs * sizeof(float));
+            auto bf16_t1 = convert_f32_to_bf16(t1_pad.data(), pad_len);
+            auto bf16_t2 = convert_f32_to_bf16(t2_pad.data(), pad_len);
+            buf_mgr_->copy_to(*buf_rope_t1_, bf16_t1.data(), buf_bytes);
+            buf_mgr_->copy_to(*buf_rope_t2_, bf16_t2.data(), buf_bytes);
+            try {
+                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                           buf_rope_t1_->handle(), buf_rope_t2_->handle(),
+                           buf_rope_bf16_out_->handle());
+                kernel.run.wait();
+            } catch (const std::exception& e) {
+                std::cerr << "Error: RoPE kernel execution failed: " << e.what() << "\n";
+                return false;
+            }
+            std::vector<uint8_t> bf16_out(buf_bytes);
+            buf_mgr_->copy_from(*buf_rope_bf16_out_, bf16_out.data(), buf_bytes);
+            auto f32_out = convert_bf16_to_f32(bf16_out.data(), pad_len);
+            std::memcpy(dst, f32_out.data(), n_pairs * sizeof(float));
+            return true;
+        };
 
-        try {
-            kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
-                       buf_rope_bf16_in_->handle(), buf_rope_cs_table_->handle(),
-                       buf_rope_bf16_out_->handle());
-            kernel.run.wait();
-        } catch (const std::exception& e) {
-            std::cerr << "Error: RoPE kernel execution failed: " << e.what() << "\n";
+        // even: t1 = x_e*cos, t2 = -x_o*sin → out_e = t1+t2 = x_e*cos - x_o*sin
+        std::vector<float> t1_e(n_pairs), t2_e(n_pairs);
+        for (int i = 0; i < n_pairs; i++) {
+            t1_e[i] =  x_e[i] * cos_vals[i];
+            t2_e[i] = -x_o[i] * sin_vals[i];
+        }
+        std::vector<float> out_e(n_pairs), out_o(n_pairs);
+        if (!run_half(t1_e, t2_e, out_e.data())) {
             last_status_ = Status::ERROR;
             return last_status_;
         }
 
-        // Reinterleave [out_e | out_o] back into params.data
-        std::vector<uint8_t> bf16_out(buf_bytes);
-        buf_mgr_->copy_from(*buf_rope_bf16_out_, bf16_out.data(), buf_bytes);
-        auto f32_out = convert_bf16_to_f32(bf16_out.data(), n_pairs * 2);
+        // odd: t1 = x_e*sin, t2 = x_o*cos → out_o = t1+t2 = x_e*sin + x_o*cos
+        std::vector<float> t1_o(n_pairs), t2_o(n_pairs);
         for (int i = 0; i < n_pairs; i++) {
-            params.data[2 * i]     = f32_out[i];             // out_e
-            params.data[2 * i + 1] = f32_out[n_pairs + i];  // out_o
+            t1_o[i] = x_e[i] * sin_vals[i];
+            t2_o[i] = x_o[i] * cos_vals[i];
+        }
+        if (!run_half(t1_o, t2_o, out_o.data())) {
+            last_status_ = Status::ERROR;
+            return last_status_;
+        }
+
+        // Reinterleave into params.data
+        for (int i = 0; i < n_pairs; i++) {
+            params.data[2 * i]     = out_e[i];
+            params.data[2 * i + 1] = out_o[i];
         }
 
         return Status::OK;
@@ -1974,9 +2016,9 @@ private:
     std::shared_ptr<XrtBuffer> buf_fa_v_;
     std::shared_ptr<XrtBuffer> buf_fa_out_;
 
-    std::shared_ptr<XrtBuffer> buf_rope_bf16_in_;   // [even | odd] packed BF16
-    std::shared_ptr<XrtBuffer> buf_rope_cs_table_;  // [cos  | sin] packed BF16
-    std::shared_ptr<XrtBuffer> buf_rope_bf16_out_;  // [out_e | out_o] packed BF16
+    std::shared_ptr<XrtBuffer> buf_rope_t1_;        // t1 input  (n_pairs BF16)
+    std::shared_ptr<XrtBuffer> buf_rope_t2_;        // t2 input  (n_pairs BF16)
+    std::shared_ptr<XrtBuffer> buf_rope_bf16_out_;  // out       (n_pairs BF16)
 
     std::unordered_map<std::string, CachedMatmulKernel> matmul_kernels_;
     std::unordered_map<int, CachedRmsNormKernel> rmsnorm_kernels_;

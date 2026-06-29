@@ -15,8 +15,8 @@
 #   - rmsnorm: RMS normalization
 #   - softmax: Softmax activation
 #   - silu: SiLU/Swish activation
-# Experimental (GGNPU_EXPERIMENTAL=1; no working transform recipe yet):
-#   - rope: Rotary positional embeddings
+#   - rope: Rotary positional embeddings (n_pairs=32, head_dim=64)
+# Experimental (GGNPU_EXPERIMENTAL=1; blocked on Triton-XDNA multi-reduction):
 #   - flash_attn / flash_attn_32x64x2048: fused attention (placeholder transform)
 #
 # After rmsnorm kernel changes, rebuild: rm ~/.cache/ggnpu/xclbin/rmsnorm_2048_npu6*
@@ -211,13 +211,13 @@ Kernels=(
     "rmsnorm_2048:--M 2 --N 2048"
     "softmax:--rows 256 --cols 256"
     "silu:--N 8192"
+    "rope:--n_pairs 32"
 )
 
-# rope / flash_attn have no working Triton-XDNA transform recipes yet.
-# Inference uses host f32 flash_attn (decomposed) until a fused kernel compiles.
+# flash_attn blocked on Triton-XDNA multi-reduction lowering (3+ tl.sum ops).
+# Inference uses host f32 decomposed flash_attn until upstream support lands.
 if [ -n "${GGNPU_EXPERIMENTAL:-}" ]; then
     Kernels+=(
-        "rope:--N 2048 --dims 64"
         "flash_attn:--n_head 8 --head_dim 128 --ctx_len 2048"
         "flash_attn_32x64x2048:--n_head 32 --head_dim 64 --ctx_len 2048"
     )
@@ -334,7 +334,7 @@ if [ "$TOTAL" -eq 0 ]; then
     if [ -n "${KERNEL_FILTER:-}" ]; then
         echo "  Unknown kernel filter: $KERNEL_FILTER"
         echo "  Valid kernels: matmul rmsnorm softmax silu"
-        echo "  Experimental (need GGNPU_EXPERIMENTAL=1): rope flash_attn"
+        echo "  Experimental (need GGNPU_EXPERIMENTAL=1): flash_attn"
     fi
     exit 1
 fi

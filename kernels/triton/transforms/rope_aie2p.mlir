@@ -3,15 +3,23 @@
 
 ////////////////////////////////////////////////////////////////////////////////
 // Transform Script for RoPE (AIE2P)
-// rope_kernel(x_ptr, cs_ptr, out_ptr, n_pairs):
-//   x_ptr:  [x_even[0..n-1] | x_odd[0..n-1]]   (2*n_pairs BF16, stride-1)
-//   cs_ptr: [cos[0..n-1]    | sin[0..n-1]]      (2*n_pairs BF16, stride-1)
-//   out_ptr:[out_e[0..n-1]  | out_o[0..n-1]]    (2*n_pairs BF16, stride-1)
+// rope_kernel(in1_ptr, in2_ptr, out_ptr, n):
+//   in1_ptr: [t1[0..n-1]]   (n BF16, own buffer)
+//   in2_ptr: [t2[0..n-1]]   (n BF16, own buffer)
+//   out_ptr: [out[0..n-1]]  (n BF16)
+//   out[i] = t1[i] + t2[i]
 //
-// Binary op (x_ptr + cs_ptr → out_ptr). Fuse elementwise first to collapse
-// 4 slice-loads into one linalg.generic, then apply binary BF16 promotion.
-// Vec tile = 16 (BF16 x 32 = 512-bit AIE2P vector width).
-// Uses shared library sequences from transform_library.mlir (auto-injected).
+// HOST precomputes the per-element products:
+//   even call: t1 = x_e*cos, t2 = -x_o*sin  → out_e = x_e*cos - x_o*sin
+//   odd  call: t1 = x_e*sin, t2 =  x_o*cos  → out_o = x_e*sin + x_o*cos
+//
+// This is the SAME pipeline the proven silu kernel uses (the only difference is
+// @pad_and_promote_binary_bf16 vs unary, because rope is a 2-input add). The
+// host pads the real n_pairs (=32) up to ROPE_PAD (=512) so flatten_tile_forall
+// (tile_sizes=[256]) yields 512/256 = 2 trips → a 2-core herd, each core working
+// a standard 256-element vectorized tile. The earlier inline tile_sizes=[16]
+// produced 16-element tiles that the npu6 firmware rejected at execution
+// ("unexpected command state").
 ////////////////////////////////////////////////////////////////////////////////
 
 module attributes {transform.with_named_sequence} {

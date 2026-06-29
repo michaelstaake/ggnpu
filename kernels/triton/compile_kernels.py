@@ -578,36 +578,54 @@ def build_kernel_script(op: str, params: dict) -> str:
 
     elif op == "rope":
         n_pairs = p.get("n_pairs", 32)
-        block_size = min(n_pairs, 32)
+        # Pad the real n_pairs up to ROPE_PAD so flatten_tile_forall (tile 256)
+        # yields >=2 trips -> a multi-core herd of standard 256-element tiles,
+        # matching the proven silu structure. Tiny (16-elem) tiles were rejected
+        # by the npu6 firmware at execution. Host zero-pads inputs to this size.
+        rope_pad = max(512, ((n_pairs + 255) // 256) * 256 * 2)
+        n_pairs = rope_pad
+        block_size = rope_pad
         launch = textwrap.dedent(f"""
             n_pairs = {n_pairs}
-            # x_ptr:  [even[0..n_pairs-1] | odd[0..n_pairs-1]]  (2*n_pairs BF16)
-            # cs_ptr: [cos[0..n_pairs-1]  | sin[0..n_pairs-1]]  (2*n_pairs BF16)
-            # out:    [out_e[0..n_pairs-1] | out_o[0..n_pairs-1]] (2*n_pairs BF16)
-            x_ptr = torch.randn(n_pairs * 2, dtype=torch.bfloat16)
-            cs_ptr = torch.randn(n_pairs * 2, dtype=torch.bfloat16)
-            out = torch.empty(n_pairs * 2, dtype=torch.bfloat16)
+            # in1_ptr: [t1[0..n_pairs-1]]   (n_pairs BF16)  — own buffer object
+            # in2_ptr: [t2[0..n_pairs-1]]   (n_pairs BF16)  — own buffer object
+            # out_ptr: [out[0..n_pairs-1]]  (n_pairs BF16)
+            # out[i] = t1[i] + t2[i]
+            #
+            # HOST precomputes the products; NPU does the final addition:
+            #   even call: t1 = x_e*cos,  t2 = -x_o*sin  → out_e = t1+t2 = x_e*cos - x_o*sin
+            #   odd  call: t1 = x_e*sin,  t2 =  x_o*cos  → out_o = t1+t2 = x_e*sin + x_o*cos
+            #
+            # Three DISTINCT pointer args → three distinct buffer objects → three shim
+            # DMA flows, exactly like the proven matmul (A, B, C) pattern. The earlier
+            # single-buffer-with-offset form bound ONE bo to TWO shim input channels,
+            # which the npu6 firmware rejected ("unexpected command state").
+            #
+            # Pure binary vector-add: ONE linalg.generic (2 inputs + 1 output = 3 DPS
+            # operands) → @pad_and_promote_binary_bf16 matches exactly → single AIR herd.
+            in1_ptr = torch.randn(n_pairs, dtype=torch.bfloat16)
+            in2_ptr = torch.randn(n_pairs, dtype=torch.bfloat16)
+            out_ptr = torch.empty(n_pairs, dtype=torch.bfloat16)
             grid = lambda META: (triton.cdiv(n_pairs, META["BLOCK_SIZE"]),)
-            compiled = rope_kernel[grid](x_ptr, cs_ptr, out, n_pairs, BLOCK_SIZE={block_size})
+            compiled = rope_kernel[grid](in1_ptr, in2_ptr, out_ptr, n_pairs, BLOCK_SIZE={block_size})
         """)
         kernel_src = textwrap.dedent("""
             @triton.jit
-            def rope_kernel(x_ptr, cs_ptr, out_ptr, n_pairs: tl.constexpr, BLOCK_SIZE: tl.constexpr):
-                # x_ptr:  [x_even[0..n_pairs-1] | x_odd[0..n_pairs-1]]
-                # cs_ptr: [cos[0..n_pairs-1]    | sin[0..n_pairs-1]]
-                # out_ptr:[out_e[0..n_pairs-1]  | out_o[0..n_pairs-1]]
-                # All arrays BF16, all accesses stride-1.
+            def rope_kernel(in1_ptr, in2_ptr, out_ptr, n_pairs: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                # in1_ptr: [t1[0..n_pairs-1]]   (own buffer)
+                # in2_ptr: [t2[0..n_pairs-1]]   (own buffer)
+                # out_ptr: [out[0..n_pairs-1]]
+                # out[i] = t1[i] + t2[i]  (host precomputed t1 = x1*c1, t2 = x2*c2)
+                #
+                # No mask: BLOCK_SIZE == n_pairs (both constexpr), so offs < n_pairs
+                # is always-true. Using a mask generates dynamic DMA sizes which
+                # cause air-shrink-memref-sizes-by-access to crash.
                 pid = tl.program_id(0)
                 offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-                mask = offs < n_pairs
-                x_e   = tl.load(x_ptr  + offs,          mask=mask, other=0.0)
-                x_o   = tl.load(x_ptr  + n_pairs + offs, mask=mask, other=0.0)
-                cos_v = tl.load(cs_ptr + offs,          mask=mask, other=1.0)
-                sin_v = tl.load(cs_ptr + n_pairs + offs, mask=mask, other=0.0)
-                out_e = x_e * cos_v - x_o * sin_v
-                out_o = x_e * sin_v + x_o * cos_v
-                tl.store(out_ptr + offs,           out_e, mask=mask)
-                tl.store(out_ptr + n_pairs + offs, out_o, mask=mask)
+                t1 = tl.load(in1_ptr + offs)
+                t2 = tl.load(in2_ptr + offs)
+                out = t1 + t2
+                tl.store(out_ptr + offs, out)
         """)
 
     elif op == "flash_attn":
@@ -866,6 +884,7 @@ def main():
     parser.add_argument("--rows", type=int)
     parser.add_argument("--cols", type=int)
     parser.add_argument("--dims", type=int)
+    parser.add_argument("--n_pairs", type=int)
     parser.add_argument("--n_head", type=int)
     parser.add_argument("--head_dim", type=int)
     parser.add_argument("--ctx_len", type=int)
