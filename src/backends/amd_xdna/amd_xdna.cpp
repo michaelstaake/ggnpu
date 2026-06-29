@@ -892,33 +892,71 @@ public:
         const int Nt = (N + T - 1) / T;
         const int Kt = (K + T - 1) / T;
 
-        std::vector<float> a_tile(static_cast<size_t>(T) * T);
-        std::vector<float> b_tile(static_cast<size_t>(T) * T);
-        std::vector<float> c_acc(static_cast<size_t>(T) * T);
+        // Optional phase profiling (GGNPU_NPU_ATTN_TIMING=1): accumulate across
+        // all calls, print a summary every 256 launches.
+        static const bool do_timing = std::getenv("GGNPU_NPU_ATTN_TIMING") != nullptr;
+        static long g_launches = 0;
+        static double g_pack = 0, g_dma_in = 0, g_run = 0, g_dma_out = 0;
+        using clk = std::chrono::high_resolution_clock;
+        auto ms_since = [](clk::time_point t) {
+            return std::chrono::duration<double, std::milli>(clk::now() - t).count();
+        };
+
+        // Persistent staging (zeroed once on alloc, padding stays zero across
+        // calls): only the real sub-region of each tile is converted/written, so
+        // packing cost scales with the real data (ctx*head_dim), not the 256^2 tile.
+        const size_t tile_elems = static_cast<size_t>(T) * T;
+        if (mmbf16_stage_a_.size() != tile_elems) {
+            mmbf16_stage_a_.assign(tile_elems, 0);  // bf16 stored as uint16_t
+            mmbf16_stage_b_.assign(tile_elems, 0);
+            mmbf16_cacc_.assign(tile_elems, 0.0f);
+            mmbf16_craw_.assign(out_bytes, 0);
+            // Staging is all-zero; no prior real region to clear.
+            mmbf16_pa_rows_ = mmbf16_pa_cols_ = mmbf16_pb_rows_ = mmbf16_pb_cols_ = 0;
+        }
+        uint16_t* stage_a = mmbf16_stage_a_.data();
+        uint16_t* stage_b = mmbf16_stage_b_.data();
+        std::vector<float>& c_acc = mmbf16_cacc_;
+        std::vector<uint8_t>& c_raw = mmbf16_craw_;
+        // prev_* (persistent members) track the last-written real extent of each
+        // stage so we only re-zero the padding border that shrank — across calls.
+        int& prev_arows = mmbf16_pa_rows_; int& prev_acols = mmbf16_pa_cols_;
+        int& prev_brows = mmbf16_pb_rows_; int& prev_bcols = mmbf16_pb_cols_;
 
         for (int mi = 0; mi < Mt; mi++) {
+            const int rm = std::min(T, M - mi * T);   // real A rows
             for (int ni = 0; ni < Nt; ni++) {
-                std::fill(c_acc.begin(), c_acc.end(), 0.0f);
+                const int nc = std::min(T, N - ni * T);  // real B/out cols
+                const bool accumulate = (Kt > 1);
+                if (accumulate)
+                    for (int r = 0; r < rm; r++)
+                        std::fill_n(&c_acc[static_cast<size_t>(r) * T], nc, 0.0f);
                 for (int ki = 0; ki < Kt; ki++) {
-                    // Pack A tile [T,T] (zero-padded at the edges).
-                    std::fill(a_tile.begin(), a_tile.end(), 0.0f);
-                    for (int r = 0; r < T && mi * T + r < M; r++) {
-                        const float* arow = A + static_cast<size_t>(mi * T + r) * K + ki * T;
-                        int kc = std::min(T, K - ki * T);
-                        std::memcpy(&a_tile[static_cast<size_t>(r) * T], arow, kc * sizeof(float));
-                    }
-                    // Pack B tile [T,T] (B is [K,N] row-major).
-                    std::fill(b_tile.begin(), b_tile.end(), 0.0f);
-                    for (int r = 0; r < T && ki * T + r < K; r++) {
-                        const float* brow = B + static_cast<size_t>(ki * T + r) * N + ni * T;
-                        int nc = std::min(T, N - ni * T);
-                        std::memcpy(&b_tile[static_cast<size_t>(r) * T], brow, nc * sizeof(float));
-                    }
+                    const int kc = std::min(T, K - ki * T);  // real A cols / B rows
+                    auto t0 = do_timing ? clk::now() : clk::time_point{};
 
-                    auto a_bf16 = convert_f32_to_bf16(a_tile.data(), static_cast<size_t>(T) * T);
-                    auto b_bf16 = convert_f32_to_bf16(b_tile.data(), static_cast<size_t>(T) * T);
-                    buf_mgr_->copy_to(*buf_mmbf16_a_, a_bf16.data(), in_bytes);
-                    buf_mgr_->copy_to(*buf_mmbf16_b_, b_bf16.data(), in_bytes);
+                    // Pack A real region [rm,kc] -> stage_a (bf16), padding stays 0.
+                    clear_stage_border(stage_a, prev_arows, prev_acols, rm, kc, T);
+                    for (int r = 0; r < rm; r++) {
+                        const float* arow = A + static_cast<size_t>(mi * T + r) * K + ki * T;
+                        auto row = convert_f32_to_bf16(arow, static_cast<size_t>(kc));
+                        std::memcpy(&stage_a[static_cast<size_t>(r) * T], row.data(), kc * sizeof(uint16_t));
+                    }
+                    prev_arows = rm; prev_acols = kc;
+                    // Pack B real region [kc,nc] -> stage_b.
+                    clear_stage_border(stage_b, prev_brows, prev_bcols, kc, nc, T);
+                    for (int r = 0; r < kc; r++) {
+                        const float* brow = B + static_cast<size_t>(ki * T + r) * N + ni * T;
+                        auto row = convert_f32_to_bf16(brow, static_cast<size_t>(nc));
+                        std::memcpy(&stage_b[static_cast<size_t>(r) * T], row.data(), nc * sizeof(uint16_t));
+                    }
+                    prev_brows = kc; prev_bcols = nc;
+                    if (do_timing) { g_pack += ms_since(t0); t0 = clk::now(); }
+
+                    buf_mgr_->copy_to(*buf_mmbf16_a_, stage_a, in_bytes);
+                    buf_mgr_->copy_to(*buf_mmbf16_b_, stage_b, in_bytes);
+                    if (do_timing) { g_dma_in += ms_since(t0); t0 = clk::now(); }
+
                     try {
                         kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
                                    buf_mmbf16_a_->handle(), buf_mmbf16_b_->handle(),
@@ -929,23 +967,50 @@ public:
                         last_status_ = Status::ERROR;
                         return last_status_;
                     }
-                    std::vector<uint8_t> c_raw(out_bytes);
+                    if (do_timing) { g_run += ms_since(t0); t0 = clk::now(); }
+
                     buf_mgr_->copy_from(*buf_mmbf16_c_, c_raw.data(), out_bytes);
-                    const float* c_f32 = reinterpret_cast<const float*>(c_raw.data());
-                    for (size_t i = 0; i < static_cast<size_t>(T) * T; i++)
-                        c_acc[i] += c_f32[i];
+                    if (accumulate) {
+                        const float* c_f32 = reinterpret_cast<const float*>(c_raw.data());
+                        for (int r = 0; r < rm; r++)
+                            for (int c = 0; c < nc; c++)
+                                c_acc[static_cast<size_t>(r) * T + c] += c_f32[static_cast<size_t>(r) * T + c];
+                    }
+                    if (do_timing) {
+                        g_dma_out += ms_since(t0);
+                        if (++g_launches % 256 == 0)
+                            std::cerr << "[mmbf16] launches=" << g_launches
+                                      << " pack=" << g_pack << "ms dma_in=" << g_dma_in
+                                      << "ms run+wait=" << g_run << "ms dma_out=" << g_dma_out << "ms\n";
+                    }
                 }
-                // Write the in-bounds portion of this output tile.
-                for (int r = 0; r < T && mi * T + r < M; r++) {
-                    int nc = std::min(T, N - ni * T);
+                // Write the in-bounds portion of this output tile. Single K-tile:
+                // read straight from the device buffer; else from the accumulator.
+                const float* src = accumulate
+                    ? c_acc.data()
+                    : reinterpret_cast<const float*>(c_raw.data());
+                for (int r = 0; r < rm; r++)
                     std::memcpy(C + static_cast<size_t>(mi * T + r) * N + ni * T,
-                                &c_acc[static_cast<size_t>(r) * T], nc * sizeof(float));
-                }
+                                &src[static_cast<size_t>(r) * T], nc * sizeof(float));
             }
         }
 
         last_status_ = Status::OK;
         return last_status_;
+    }
+
+    // Zero the padding border of a [T,T] bf16 stage so that the region outside the
+    // current real [rows,cols] is 0, given the previous real extent. Only the rows
+    // and columns that shrank need clearing (the real region is overwritten anyway).
+    static void clear_stage_border(uint16_t* stage, int prev_rows, int prev_cols,
+                                   int rows, int cols, int T) {
+        // Columns [cols, prev_cols) of the rows we will write [0, rows).
+        if (prev_cols > cols)
+            for (int r = 0; r < rows; r++)
+                std::fill_n(&stage[static_cast<size_t>(r) * T + cols], prev_cols - cols, uint16_t{0});
+        // Whole rows [rows, prev_rows) (their full real-col extent from last time).
+        for (int r = rows; r < prev_rows; r++)
+            std::fill_n(&stage[static_cast<size_t>(r) * T], std::max(cols, prev_cols), uint16_t{0});
     }
 
     Status rope(const RopeParams& params) override {
@@ -2299,6 +2364,14 @@ private:
     std::shared_ptr<XrtBuffer> buf_mmbf16_a_;
     std::shared_ptr<XrtBuffer> buf_mmbf16_b_;
     std::shared_ptr<XrtBuffer> buf_mmbf16_c_;
+    // Persistent host staging for matmul_bf16 packing (padding kept zero across
+    // calls; prev_* track the last real extent written into each stage).
+    std::vector<uint16_t> mmbf16_stage_a_;
+    std::vector<uint16_t> mmbf16_stage_b_;
+    std::vector<float> mmbf16_cacc_;
+    std::vector<uint8_t> mmbf16_craw_;
+    int mmbf16_pa_rows_ = 0, mmbf16_pa_cols_ = 0;
+    int mmbf16_pb_rows_ = 0, mmbf16_pb_cols_ = 0;
 
     std::vector<uint8_t> xclbin_data_rmsnorm_;
     xrt::hw_context hw_ctx_rmsnorm_;
