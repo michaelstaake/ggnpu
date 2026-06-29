@@ -77,11 +77,13 @@ KERNELS = {
         "description": "Attention QK^T scores (single-reduction matvec) [WIP]",
         "params": ["ctx_len", "head_dim"],
         "defaults": {"ctx_len": 256, "head_dim": 64},
-        "transform": "rmsnorm_aie2p.mlir",
+        "transform": "attn_qk_aie2p.mlir",
         "experimental": (
-            "WIP toward decomposed NPU attention. Reaches herd placement but "
-            "air-dma-to-channel rejects the two-input broadcast DMA; needs a "
-            "dedicated transform (rmsnorm handles only one reduction input)."
+            "WIP toward decomposed NPU attention (QK matvec -> softmax -> AV). "
+            "Dedicated transform promotes both reduction inputs (Q broadcast + K) "
+            "and reaches AIE herd placement, but QK's 1-D matvec output does not "
+            "fit the rmsnorm-derived 2-D pipeline. Needs a GEMV transform or a "
+            "bf16 tl.dot matmul. See §7.1 of IMPLEMENTATION.md."
         ),
     },
     "flash_attn": {
@@ -652,6 +654,13 @@ def build_kernel_script(op: str, params: dict) -> str:
         # an output elementwise (scale) like rmsnorm's y = x*rstd.
         ctx_len = p.get("ctx_len", 256)
         head_dim = p.get("head_dim", 64)
+        # Scale (1/sqrt(d)) is applied in-kernel as the post-reduce elementwise so
+        # the transform has an output generic to anchor on (mirrors rmsnorm's
+        # y = x*rstd). NOTE (WIP): this reaches AIE herd placement but the
+        # rmsnorm-derived transform can't finish — QK's output is 1-D (a matvec),
+        # so the 2-D-output assumptions (output-generic navigation, [0,16]
+        # vectorization tiling) don't hold. A dedicated GEMV transform (or a
+        # bf16 tl.dot matmul reusing matmul_aie2p.mlir) is the real path.
         launch = textwrap.dedent(f"""
             CTX, D = {ctx_len}, {head_dim}
             scale = 1.0 / (D ** 0.5)

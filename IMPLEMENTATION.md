@@ -633,13 +633,18 @@ padded AV terms vanish. Use bf16 (not the INT8 matmul kernel, which loses
 attention-logit coherence). This is a sizable feature (2 new matvec kernels +
 transforms + host orchestration + per-head loop), tracked as future work.
 
-**Progress (WIP):** the `attn_qk` kernel (`compile_kernels.py`, experimental)
-scaffolds step 1. With the rmsnorm transform it already **reaches AIE herd
-placement** — past the fused kernel's wall — and fails later in
-`air-dma-to-channel` on the two-input (Q broadcast + K) DMA. The rmsnorm
-transform promotes only one reduction input; QK needs a dedicated transform that
-promotes both `Q` and `K`. That transform tuning (à la the rope bring-up) is the
-next concrete step, followed by the AV matvec and host orchestration.
+**Progress (WIP):** the `attn_qk` kernel + dedicated `attn_qk_aie2p.mlir`
+(experimental) scaffold step 1. The transform now promotes **both** reduction
+inputs (Q broadcast + K) — fixing the `air-dma-to-channel` rejection — and
+reaches AIE herd placement, past the fused kernel's wall. The **remaining
+blocker is structural**: rmsnorm produces a 2-D elementwise output, but QK is a
+**matvec with a 1-D output** after the reduction. The rmsnorm pipeline (tile the
+2-D output generic, fuse the reduce backward; `[0,16]` vectorization) doesn't fit
+1-D output — with the scale generic the vectorization tile errors ("too many
+tiles"); without it the output-generic navigation fails ("could not find next
+producer to fuse"). **Next step:** a purpose-built GEMV transform, or rewrite QK
+as a bf16 `tl.dot` matmul reusing `matmul_aie2p.mlir` (QK = K[ctx,d] @ Q[d,1]).
+Then the same for AV, plus host orchestration. Host f32 stays production.
 
 #### Recently fixed
 
