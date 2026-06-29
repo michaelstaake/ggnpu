@@ -653,10 +653,20 @@ transforms + host orchestration + per-head loop), tracked as future work.
    V[ctx,d] as bf16 GEMMs (far better than int8 for attention-logit coherence).
    Build with `GGNPU_EXPERIMENTAL=1 ./scripts/build-kernels.sh npu6 matmul_bf16`.
 
-**Next steps:** (a) shape QK/AV as bf16 GEMMs (pad the degenerate matvec dim to a
-256 tile for decode; prefill is a natural GEMM); (b) wire a bf16 matmul backend
-method in `amd_xdna.cpp`; (c) host orchestration with ctx masking between
-QK → softmax → AV. Host f32 `flash_attn_decomposed()` stays production.
+**Done:** `Backend::matmul_bf16(A, B, C, M, N, K)` (`amd_xdna.cpp`) — f32 host
+buffers, bf16 NPU compute; the host tiles M/N/K into 256-blocks, zero-pads the
+edges, accumulates K-blocks in f32. `bench-layer` test 0e2 validates it on
+hardware: 256³ (rel 0.0061), a partial tile 64×64×128 (0.0058), and the
+**QK shape 256×1×64** (0.0071) — QK = K[ctx,d] @ Q[d,1] maps directly, with the
+degenerate N=1 and K=head_dim zero-padded to the tile.
+
+**Next steps:** (a) AV = P[1,ctx] @ V[ctx,d] via the same method; (b) host
+orchestration — per head: `matmul_bf16` QK → host scale + causal/pad mask →
+softmax (host or `softmax` kernel) → `matmul_bf16` AV; wire behind an opt-in env
+flag with a CPU fallback (like RoPE). Perf note: the 256³ tile wastes compute on
+the degenerate decode dim (N=1 padded to 256); fine for correctness, optimize
+later (e.g. a QK-shaped xclbin, or batch heads into the tile). Host f32
+`flash_attn_decomposed()` stays production.
 
 > Running a kernel directly on the NPU from Python (no C++) needs three env
 > fixes the build path doesn't set: `LD_PRELOAD=libuuid.so.1` (launcher needs
