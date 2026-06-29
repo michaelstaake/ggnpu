@@ -4,7 +4,7 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Repository:** https://github.com/michaelstaake/ggnpu  
 **License:** GPL-3.0  
-**Current state:** **Phases 1–5 MVP passed** on hardware. NPU path: INT8 matmul (incl. logits via mul_mat_q), RMSNorm N=2048, SiLU N=8192. RoPE precomputed at startup. Flash attention uses **host f32** (fused NPU kernel blocked on Triton-XDNA multi-reduction lowering). E2E regression passes: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check` (France prompt → Paris). Next focus: fused flash_attn / RoPE on NPU, matmul perf, Phase 6 polish. See **§7.1**.
+**Current state:** **Phases 1–5 MVP passed** on hardware; Phase 6 in progress. NPU path: INT8 matmul (incl. logits via mul_mat_q), RMSNorm (any hidden via pad-to-pow2), SiLU N=8192, RoPE (batched kernel, opt-in `GGNPU_NPU_ROPE=1`). Flash attention uses **host f32** (fused NPU kernel blocked on Triton-XDNA multi-reduction lowering). E2E regression passes: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check` (France prompt → Paris). Next focus: fused flash_attn on NPU, RoPE perf tuning, matmul perf. See **§7.1**.
 
 **Verdict:** The supported path is host-native: install host prerequisites, build `ggnpu` locally, and provide local `.xclbin` + `*_sequence.bin` kernels under `~/.cache/ggnpu/xclbin/`.
 
@@ -69,7 +69,7 @@ See **§9** and `docs/host-setup-guide.md`.
 
 If NPU initialization fails, `ggnpu` must **exit with an error**. No silent fallback to CPU or GPU.
 
-Ops marked **NPU** in §2.1 must run on the NPU or **fail with an error**. Ops marked **CPU** are intentional host tensor math (flash_attn today, RoPE). No silent fallback from a failed NPU op to CPU for the same op.
+Ops marked **NPU** in §2.1 must run on the NPU or **fail with an error**. Ops marked **CPU** are intentional host tensor math (flash_attn today). RoPE is the one explicit exception: it has both paths and an intentional CPU fallback (NPU is opt-in via `GGNPU_NPU_ROPE=1`). Otherwise no silent fallback from a failed NPU op to CPU for the same op.
 
 ### 2.1 CPU vs NPU operation map
 
@@ -86,9 +86,9 @@ Ops marked **NPU** in §2.1 must run on the NPU or **fail with an error**. Ops m
 | Per-token embedding dequant | Host | Host | `dequant_tensor_row()` in `main.cpp` |
 | Activation quantize (f32 → INT8 tiles) | Host | Host | `amd_xdna.cpp` matmul path |
 | **INT8 matmul** (Q/K/V/O, FFN gate/up/down) | NPU | **NPU** | `matmul_npu6.xclbin` (256³ tiles); host tiling/quant; no CPU fallback |
-| **RMSNorm** (hidden=2048) | NPU | **NPU** | `rmsnorm_2048_npu6.xclbin` (M=2, N=2048 bf16); f32 reductions in `rmsnorm_aie2p.mlir`; first-call bf16-aware validation (<1% typical, <1.2% max rel) — no CPU fallback |
+| **RMSNorm** (any hidden) | NPU | **NPU** | pow2 kernels (`rmsnorm_2048`/`rmsnorm_4096`); non-pow2 N pads to next pow2 + constant output correction in `amd_xdna.cpp` (1536→2048: rel 0.0072). f32 reductions in `rmsnorm_aie2p.mlir`; per-N bf16-aware validation — no CPU fallback |
 | RMSNorm learned weights (`γ`) | Host | Host | O(N) multiply after unweighted NPU norm in `amd_xdna.cpp` |
-| **RoPE** (Q, K) | Host | **CPU** | `apply_rope()` in `main.cpp`; NPU kernel not wired |
+| **RoPE** (Q, K) | NPU | **NPU** (opt-in) | `rope_npu6.xclbin` binary-add kernel; `rope_batched()` packs ~8 heads/launch. Wired via `apply_rope()` in `main.cpp` when `GGNPU_NPU_ROPE=1` (default CPU; opt-in pending perf tuning), CPU fallback on failure |
 | KV cache write | Host | Host | `kv_cache.cpp` |
 | GQA KV expand (repeat KV heads) | Host | Host | memcpy loops in `main.cpp` |
 | **Flash attention** (32×64, ctx≤2048) | Host | **CPU** | Host f32 decomposed path (`flash_attn_decomposed` in `amd_xdna.cpp`); matches `cpu_ref`. Fused NPU only with `GGNPU_FLASH_ATTN_FUSED=1` + experimental xclbin build |
@@ -104,11 +104,11 @@ Ops marked **NPU** in §2.1 must run on the NPU or **fail with an error**. Ops m
 | Kernel | Artifact | Llama 1B shape |
 |--------|----------|----------------|
 | matmul | `matmul_npu6.xclbin` | 256³ INT8 tiles |
-| rmsnorm | `rmsnorm_2048_npu6.xclbin` | M=2, N=2048 bf16 (rebuild after mlir changes; see below) |
+| rmsnorm | `rmsnorm_2048_npu6.xclbin`, `rmsnorm_4096_npu6.xclbin` | M=2, N=pow2 bf16; non-pow2 hidden pads up at runtime (rebuild after mlir changes; see below) |
 | silu | `silu_npu6.xclbin` | N=8192 bf16 |
 | softmax | `softmax_npu6.xclbin` | 256×256 (not used in decoder loop today) |
 | flash_attn | — (experimental) | `GGNPU_EXPERIMENTAL=1 ./scripts/build-kernels.sh npu6 flash_attn_32x64x2048` — placeholder transform; not used in default inference |
-| rope | — (experimental) | not wired in inference |
+| rope | `rope_npu6.xclbin` | binary-add kernel (n_pairs=32, pad 512); `rope_batched()` packs heads. Opt-in via `GGNPU_NPU_ROPE=1` |
 
 Build: `./scripts/build-kernels.sh npu6 [kernel_name]`
 
@@ -327,9 +327,9 @@ The NPU backend consists of two code paths that must never mix:
 
 **Known gap:** Flash attention is host f32 decomposed (accurate; INT8 NPU matmul QK/AV loses logits coherence). Fused NPU kernel blocked on mlir transform (`flash_attn_aie2p.mlir` is a placeholder).
 
-**Known gap:** RoPE runs on CPU only (`main.cpp`); NPU kernel infrastructure exists but is not wired.
+**RoPE:** NPU kernel (`rope_npu6.xclbin`) is wired via `rope_batched()` (packs ~8 heads/launch). Defaults to CPU; enable the NPU path with `GGNPU_NPU_ROPE=1` (opt-in pending perf tuning vs the per-token launch overhead), with CPU fallback on failure.
 
-**Known gap:** RMSNorm sizes other than 256 (bench) / 2048 (Llama) need a shaped xclbin or JIT — hard error if missing.
+**RMSNorm:** any hidden size works — non-pow2 N (e.g. 1536) pads to the next power of 2 at runtime and applies a constant output correction. Only pow2 kernels need building (`rmsnorm_2048`, `rmsnorm_4096`); a missing pow2 kernel is a hard error (no CPU fallback).
 
 **Kernel compile cache key:** `(op, M, N, K, dtype, npu_profile)`
 
@@ -425,7 +425,7 @@ Work through these in order. Do not skip ahead.
 | 3 Q4_K weight path | Decode + one E2E matmul | **Done** — `bench-layer` FFN gate/up/down PASS vs CPU ref |
 | 4 Full decoder layer | One layer vs CPU ref | **Done** — NPU matmuls + RMSNorm N=2048 + SiLU; flash_attn on host f32 |
 | 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Done** — France prompt → Paris; `bench-logits` + `test_e2e_logits` regression |
-| 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; Llama 1B E2E validated on NPU; fused flash_attn / RoPE on NPU remain |
+| 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; Llama 1B E2E validated on NPU; RMSNorm generalized to any hidden (1536/3072 via pad-to-pow2; 4096 kernel triggers AIR L2 split); batched RoPE on NPU (opt-in). Remaining: fused flash_attn, RoPE perf, 3B model validation |
 | 7 Intel stub | Interface research | **Not started** |
 
 ### Phase 0 — Scaffold
@@ -474,9 +474,9 @@ Work through these in order. Do not skip ahead.
 - [x] Load all prebuilt xclbins at backend init (matmul, rmsnorm, softmax, silu)
 - [x] All matmuls in one layer on NPU (gate/up/down + attn_q/k/v/output benched)
 - [x] Full single-layer forward CPU vs NPU (`bench-layer` test 4)
-- [x] RMSNorm N=2048 on NPU — **works** (`rmsnorm_aie2p.mlir` keeps reductions in f32; rebuild xclbin after mlir changes)
+- [x] RMSNorm on NPU, any hidden size — **works** (`rmsnorm_aie2p.mlir` keeps reductions in f32; non-pow2 N pads to next pow2 + constant correction; rebuild xclbin after mlir changes)
 - [x] SiLU N=8192 on NPU — **works**
-- [~] RoPE on CPU (correct Llama 3 NORMAL pairing + `rope_freqs` freq factors)
+- [x] RoPE on NPU (batched kernel, opt-in `GGNPU_NPU_ROPE=1`) + CPU path (correct Llama 3 NORMAL pairing + `rope_freqs` freq factors)
 - [x] KV cache write + causal attention E2E in inference loop
 
 **Done when:** one-layer forward matches CPU reference. **Gate passed** via `bench-layer`.
@@ -537,12 +537,12 @@ Assessment of whether the project can run a model on the NPU **today**.
 
 | Check | Status | Notes |
 |-------|--------|-------|
-| `.xclbin` in `~/.cache/ggnpu/xclbin` | **Present** | matmul, rmsnorm, softmax, silu (npu6) + `*_sequence.bin` each |
+| `.xclbin` in `~/.cache/ggnpu/xclbin` | **Present** | matmul, rmsnorm (2048/4096), softmax, silu, rope (npu6) + `*_sequence.bin` each |
 | `bench-matmul` E2E | **Passes** | Validated correct output on hardware |
-| rmsnorm/softmax/silu on NPU | **Works** | bf16 kernels + host f32↔bf16 marshaling in `amd_xdna.cpp` |
-| flash_attn / rope xclbins | Not in default build | flash_attn: host f32 inference; rope: CPU in `main.cpp`; experimental builds need `GGNPU_EXPERIMENTAL=1` |
+| rmsnorm/softmax/silu/rope on NPU | **Works** | bf16 kernels + host f32↔bf16 marshaling in `amd_xdna.cpp` |
+| flash_attn xclbin | Not in default build | host f32 inference; experimental fused build needs `GGNPU_EXPERIMENTAL=1` |
 | Full inference E2E | **Validated** | France prompt → Paris on `build-npu/ggnpu`; `test_e2e_logits`, `compare_logits.py --check` |
-| NPU utilization | **Moderate** | Matmul + RMSNorm + SiLU on NPU; flash_attn, RoPE, logits, residuals on host |
+| NPU utilization | **Moderate** | Matmul + RMSNorm + SiLU on NPU (RoPE opt-in); flash_attn, logits, residuals on host |
 
 Production commands use the **native host build** (§9). NPU ops (matmul, rmsnorm, silu) **fail with an error** if the xclbin is missing, mis-built, or fails first-call validation — no silent CPU fallback for those ops. Flash attention is **intentionally** host f32 until a fused NPU kernel ships.
 
@@ -957,10 +957,10 @@ When generating NPU kernel code (`kernels/triton/`), **always** apply the four g
 - **No branches:** Zero `if/else`/`switch`/`while` in hot loops. Predication or lookup tables only.
 - **Two layers:** Control code (IRON API, DMA setup) never contains tensor math. Kernel code (Triton-XDNA compiled) never handles DMA or launch.
 
-**Start here:** Phases 1–5 MVP passed on hardware. NPU: matmul (incl. logits INT8), RMSNorm N=2048 + SiLU. Host: flash_attn, RoPE. Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next work, in order:
+**Start here:** Phases 1–5 MVP passed on hardware; Phase 6 in progress. NPU: matmul (incl. logits INT8), RMSNorm (any hidden, pad-to-pow2) + SiLU + RoPE (batched, opt-in `GGNPU_NPU_ROPE=1`). Host: flash_attn. Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next work, in order:
 
 1. **Fused flash attention on NPU** — **blocked** on Triton-XDNA multi-reduction kernel lowering (see §7.1 Known limitation). Kernel with 3+ `tl.sum` ops fails: `requires exactly one producer_op handle (got N)`. See `flash_attn_aie2p.mlir` for attempted transform; host f32 decomposed path is production.
-2. **RoPE on NPU** — experimental transform recipe.
+2. **RoPE on NPU perf** — wired and validated (`rope_batched`, ~8 heads/launch); opt-in until per-token launch overhead is tuned to beat CPU.
 3. **Matmul perf:** batch tiles, weight-tile persistence, larger xclbins.
 4. **Phase 6:** 3B, L2 tiling, production polish; keep `README.md`, `docs/host-setup-guide.md`, and §9–§10 aligned.
 5. **Hygiene:** rebuild `rmsnorm_2048` after mlir changes; clear `~/.cache/ggnpu/weights/` after Q4_K/Q6_K decoder changes.
