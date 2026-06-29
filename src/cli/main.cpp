@@ -931,7 +931,7 @@ int main(int argc, char* argv[]) {
 
     // Llama uses GGML_ROPE_TYPE_NORMAL: rotate adjacent pairs (2i, 2i+1), not NeoX halves.
     // Uses precomputed rope_cache (built above) — no per-call sin/cos.
-    auto apply_rope = [&](float* out, const float* inp, int n_heads, int64_t offset, int n_dims) {
+    auto apply_rope_cpu = [&](float* out, const float* inp, int n_heads, int64_t offset, int n_dims) {
         for (int h = 0; h < n_heads; h++) {
             for (int i = 0; i < n_dims / 2; i++) {
                 const float cos_val = *rope_cache.cos_ptr(offset, i);
@@ -945,6 +945,38 @@ int main(int argc, char* argv[]) {
                 out[i1] = v0 * sin_val + v1 * cos_val;
             }
         }
+    };
+
+    // NPU RoPE: one backend->rope() launch per head, in-place on the output slice.
+    // cos/sin tables from rope_cache are identical across heads at a given offset
+    // and already fold in freq_factors. Opt-in via GGNPU_NPU_ROPE=1 (per-head
+    // launches with pad-to-512 are correct but not yet perf-tuned).
+    const bool npu_rope_enabled =
+        (backend->name() == "amd_xdna") && std::getenv("GGNPU_NPU_ROPE") != nullptr;
+    auto apply_rope_npu = [&](float* out, const float* inp, int n_heads, int64_t offset, int n_dims) -> bool {
+        std::memcpy(out, inp, static_cast<size_t>(n_heads) * n_dims * sizeof(float));
+        for (int h = 0; h < n_heads; h++) {
+            RopeParams rp;
+            rp.data = out + static_cast<size_t>(h) * n_dims;
+            rp.n_dims = n_dims;
+            rp.rope_dims = n_dims;
+            rp.offset = offset;
+            rp.freq_scale = rope_freq_scale;
+            rp.freq_base = rope_freq_base;
+            rp.cos_table = rope_cache.cos_ptr(offset, 0);
+            rp.sin_table = rope_cache.sin_ptr(offset, 0);
+            if (backend->rope(rp) != Status::OK) return false;
+        }
+        return true;
+    };
+
+    // Dispatch: NPU when enabled (fall back to CPU on any failure), else CPU.
+    auto apply_rope = [&](float* out, const float* inp, int n_heads, int64_t offset, int n_dims) {
+        if (npu_rope_enabled) {
+            if (apply_rope_npu(out, inp, n_heads, offset, n_dims)) return;
+            std::cerr << "Warning: NPU RoPE failed; falling back to CPU for this step\n";
+        }
+        apply_rope_cpu(out, inp, n_heads, offset, n_dims);
     };
 
     auto rms_norm = [&](float* out, const float* inp, int n_rows, int row_size, float eps,
@@ -1563,9 +1595,8 @@ int main(int argc, char* argv[]) {
 
             {
                 ScopedTimer t(step_timings.rope_ms);
-                // RoPE on CPU — intentional per §2.1 until NPU kernel is validated.
-                // NPU rope kernel requires a pre-deinterleaved even/odd buffer design
-                // to avoid gather loads that Triton-XDNA cannot lower (Phase 6 work).
+                // RoPE: NPU when GGNPU_NPU_ROPE=1 (validated, see bench-layer 0g),
+                // else CPU. apply_rope dispatches and falls back to CPU on failure.
                 apply_rope(q_rope.data(), q_proj.data(), num_heads, pos, head_dim);
                 apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos, head_dim);
             }
