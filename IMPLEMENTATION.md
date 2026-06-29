@@ -91,7 +91,7 @@ Ops marked **NPU** in §2.1 must run on the NPU or **fail with an error**. Ops m
 | **RoPE** (Q, K) | NPU | **NPU** (opt-in) | `rope_npu6.xclbin` binary-add kernel; `rope_batched()` packs ~8 heads/launch. Wired via `apply_rope()` in `main.cpp` when `GGNPU_NPU_ROPE=1` (default CPU; opt-in pending perf tuning), CPU fallback on failure |
 | KV cache write | Host | Host | `kv_cache.cpp` |
 | GQA KV expand (repeat KV heads) | Host | Host | memcpy loops in `main.cpp` |
-| **Flash attention** (32×64, ctx≤2048) | Host | **CPU** | Host f32 decomposed path (`flash_attn_decomposed` in `amd_xdna.cpp`); matches `cpu_ref`. Fused NPU only with `GGNPU_FLASH_ATTN_FUSED=1` + experimental xclbin build |
+| **Flash attention** (32×64, ctx≤2048) | Host | **CPU** (NPU opt-in) | Default host f32 decomposed path (`flash_attn_decomposed`); matches `cpu_ref`. `GGNPU_NPU_ATTN=1` runs QK/AV as bf16 GEMMs on the NPU + host softmax (`flash_attn_npu`, validated but slow — opt-in). Fused NPU blocked (§7.1) |
 | **SiLU** (FFN gate, N=8192) | NPU | **NPU** | `silu_npu6.xclbin`; errors if xclbin missing — no CPU fallback |
 | **Softmax** | NPU | **NPU** | `softmax_npu6.xclbin`; wired in backend, not used in decoder loop today |
 | SwiGLU `silu(gate) * up` multiply | Host | Host | elementwise after NPU SiLU |
@@ -653,20 +653,25 @@ transforms + host orchestration + per-head loop), tracked as future work.
    V[ctx,d] as bf16 GEMMs (far better than int8 for attention-logit coherence).
    Build with `GGNPU_EXPERIMENTAL=1 ./scripts/build-kernels.sh npu6 matmul_bf16`.
 
-**Done:** `Backend::matmul_bf16(A, B, C, M, N, K)` (`amd_xdna.cpp`) — f32 host
-buffers, bf16 NPU compute; the host tiles M/N/K into 256-blocks, zero-pads the
-edges, accumulates K-blocks in f32. `bench-layer` test 0e2 validates it on
-hardware: 256³ (rel 0.0061), a partial tile 64×64×128 (0.0058), and the
-**QK shape 256×1×64** (0.0071) — QK = K[ctx,d] @ Q[d,1] maps directly, with the
-degenerate N=1 and K=head_dim zero-padded to the tile.
+**Done — decomposed NPU attention works end-to-end (opt-in `GGNPU_NPU_ATTN=1`).**
+- `Backend::matmul_bf16(A, B, C, M, N, K)` (`amd_xdna.cpp`): f32 host buffers,
+  bf16 NPU compute; host tiles M/N/K into 256-blocks, zero-pads edges,
+  accumulates K-blocks in f32.
+- `flash_attn_npu()`: per head, QK = `Kh[cl,hd] @ Qh[hd,1]` and AV =
+  `w[1,cl] @ Vh[cl,hd]` run via `matmul_bf16`; scale + causal mask + softmax on
+  the host between them. Dispatched from `flash_attn()` behind `GGNPU_NPU_ATTN`,
+  CPU fallback on failure (same pattern as RoPE).
+- `bench-layer` validates on hardware: bf16 matmul 256³/partial/QK-shape (rel
+  0.006–0.007); flash_attn 1-head ctx=1 (0.0026) and **4-head ctx=40 causal**
+  (0.0062, full QK→softmax→AV). End-to-end (reduced layers) matches the host
+  baseline.
 
-**Next steps:** (a) AV = P[1,ctx] @ V[ctx,d] via the same method; (b) host
-orchestration — per head: `matmul_bf16` QK → host scale + causal/pad mask →
-softmax (host or `softmax` kernel) → `matmul_bf16` AV; wire behind an opt-in env
-flag with a CPU fallback (like RoPE). Perf note: the 256³ tile wastes compute on
-the degenerate decode dim (N=1 padded to 256); fine for correctness, optimize
-later (e.g. a QK-shaped xclbin, or batch heads into the tile). Host f32
-`flash_attn_decomposed()` stays production.
+**Perf caveat (why it stays opt-in):** the fixed 256³ tile wastes compute on
+attention's degenerate dims (N=1 for QK, M=1 for AV, both padded to 256) →
+~1000 kernel launches per token, far too slow for production. Optimization is
+future work: QK/AV-shaped bf16 xclbins (avoid the 256 padding), batch heads into
+the tile, or move softmax onto the `softmax` kernel. Host f32
+`flash_attn_decomposed()` stays the default production path.
 
 > Running a kernel directly on the NPU from Python (no C++) needs three env
 > fixes the build path doesn't set: `LD_PRELOAD=libuuid.so.1` (launcher needs
@@ -1021,7 +1026,7 @@ When generating NPU kernel code (`kernels/triton/`), **always** apply the four g
 
 **Start here:** Phases 1–5 MVP passed on hardware; Phase 6 in progress. NPU: matmul (incl. logits INT8), RMSNorm (any hidden, pad-to-pow2) + SiLU + RoPE (batched, opt-in `GGNPU_NPU_ROPE=1`). Host: flash_attn. Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next work, in order:
 
-1. **Fused flash attention on NPU** — **blocked**: the 4-reduction kernel lowers to AIR with no `air.herd` (compute stuck at L2), so `airrt-to-npu` fails (see §7.1 Known limitation). Recommended fix: decompose into 3 single-reduction NPU kernels (QK matvec → softmax → AV matvec) with host-side ctx masking. Host f32 decomposed path is production.
+1. **NPU attention** — decomposed path **works, opt-in** (`GGNPU_NPU_ATTN=1`): QK/AV as bf16 GEMMs (`matmul_bf16`) + host softmax (`flash_attn_npu`). Validated, but slow due to 256³ tile padding on attention's degenerate dims — next is perf (QK/AV-shaped xclbins, head batching) before it can replace the host f32 default. Fused single-kernel attention remains blocked (§7.1 Known limitation, no `air.herd`).
 2. **RoPE on NPU perf** — wired and validated (`rope_batched`, ~8 heads/launch); opt-in until per-token launch overhead is tuned to beat CPU.
 3. **Matmul perf:** batch tiles, weight-tile persistence, larger xclbins.
 4. **Phase 6:** 3B, L2 tiling, production polish; keep `README.md`, `docs/host-setup-guide.md`, and §9–§10 aligned.
