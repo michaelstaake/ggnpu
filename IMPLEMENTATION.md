@@ -550,7 +550,7 @@ Production commands use the **native host build** (§9). NPU ops (matmul, rmsnor
 
 | Gap | File | Impact |
 |-----|------|--------|
-| Fused flash attention on NPU | `flash_attn_aie2p.mlir`, `compile_kernels.py` | **Blocked**: Triton-XDNA default pipeline fails on kernels with multiple `tl.sum` reductions. Error: `requires exactly one producer_op handle (got N)`. Kernel IR produces 4 `linalg.reduce` ops that the transform dialect can't lower. Workaround: use host f32 decomposed path. See **Known limitation** below. |
+| Fused flash attention on NPU | `flash_attn_aie2p.mlir`, `compile_kernels.py` | **Blocked**: the 4-reduction kernel compiles to AIR with **no `air.herd`** (compute stuck at L2), so `airrt-to-npu` fails to legalize `airrt.dma_memcpy_nd`/`airrt.segment_load`. Recommended fix: decompose into 3 single-reduction NPU kernels (QK matvec → softmax → AV matvec) with host-side ctx masking. Workaround: host f32 decomposed path. See **Known limitation** below. |
 | Flash attention fused opt-in | `amd_xdna.cpp` | `GGNPU_FLASH_ATTN_FUSED=1` + experimental xclbin; default is host f32 |
 | RMSNorm xclbin staleness | `build-kernels.sh`, `rmsnorm_aie2p.mlir` | Old `rmsnorm_2048` xclbins (~8% error) must be rebuilt after mlir fix |
 | SiLU FFN=8192 on NPU | `amd_xdna.cpp` | **Works** when `silu_npu6.xclbin` present |
@@ -591,26 +591,47 @@ Production commands use the **native host build** (§9). NPU ops (matmul, rmsnor
 | **KV cache override:** `reinit_kv_cache()` public method added; CLI `-c/--ctx-size` now reinitializes KV cache | `model.h`, `llama.cpp`, `main.cpp` |
 | **RMSNorm arbitrary sizes:** JIT compilation path for sizes != 256/2048; hard error if JIT unavailable | `src/backends/amd_xdna/amd_xdna.cpp` |
 
-#### Known limitation: Triton-XDNA multi-reduction kernel lowering
+#### Known limitation: fused flash attention does not map to an AIE herd
 
-**Issue:** Triton-XDNA's default compilation pipeline (without custom transform scripts) fails on kernels with multiple `tl.sum` operations. The error is:
+**Issue (verified 2026-06):** the fused flash-attention kernel compiles through
+the custom transform (`flash_attn_aie2p.mlir`) and produces valid AIR, but
+**that AIR contains no `air.herd`** — all four reductions and both matmuls stay
+at the `air.segment` (L2) level and are never tiled onto AIE cores. The build
+then fails in the final `airrt-to-npu` lowering:
 ```
-loc("-":17:27): error: requires exactly one producer_op handle (got N)
+error: failed to legalize operation 'airrt.dma_memcpy_nd' ... explicitly marked illegal
+error: failed to legalize operation 'airrt.segment_load' ... explicitly marked illegal
 ```
+(The older "requires exactly one producer_op handle (got N)" error is stale — it
+came from `split_handle` expecting 2 reduces when softmax decomposition adds
+`max` + `sum` = 4. The current transform gets past that; the herd-mapping is the
+real wall.)
 
-**Root cause:** Each `tl.sum(axis=N)` lowers to a `linalg.reduce` operation. Triton-XDNA's default transform pipeline expects at most one reduction per kernel. Kernels with 2+ reductions (like flash attention with QK^T sum, softmax sum, and AV sum = 3 reductions) fail during the handle resolution phase before any custom transform runs.
+**Root cause:** the transform tiles a single `forall [1]` over head_dim and tries
+to fuse all four reduction chains (QK sum, softmax max, softmax sum, AV sum) into
+it. The fusion does not produce an AIE-core herd for a 4-reduction dependency
+graph, so the work is left on the memtile. Confirmed by `grep air.herd
+asm_air_output.mlir` → 0 (working rmsnorm/rope kernels → 1). This is a transform
+/ AIR mapping limitation for multi-reduction kernels, not a single missing pass.
 
-**Workaround:** Production inference uses host f32 decomposed flash attention (`flash_attn_decomposed()` in `amd_xdna.cpp`). This path:
-- Matches CPU reference output exactly
-- No xclbin required
-- Opt-in via `GGNPU_FLASH_ATTN_FUSED=1` when Triton-XDNA support improves
+**Workaround (production):** host f32 decomposed flash attention
+(`flash_attn_decomposed()` in `amd_xdna.cpp`). Matches CPU reference; no xclbin.
 
-**Path to fix:** Either:
-1. Wait for upstream Triton-XDNA to support multi-reduction kernels
-2. Restructure flash attention kernel to use a single reduction (e.g., accumulate all attention weights into a larger output tensor and reduce once at the end)
-3. Use `tl.dot` for QK^T and AV matmuls instead of `tl.sum(elementwise_mul)` — but this requires pack/unpack transforms that don't compose well with elementwise softmax ops
+**Recommended path forward — decompose, don't fuse.** Each attention sub-step is
+a *single*-reduction op that the proven rmsnorm-style transform already maps to a
+herd, so run them as three NPU kernels orchestrated by the host:
+1. **QK matvec** `scores[j] = Σ_d Q[d]·K[j,d]` — per-row reduce over head_dim
+   (identical shape to rmsnorm's reduction).
+2. **softmax** — existing `softmax_npu6.xclbin`.
+3. **AV matvec** `out[d] = Σ_j w[j]·V[j,d]` — per-row reduce over ctx (the
+   transpose+reduce already present in the AIR).
 
-**Files:** `flash_attn_aie2p.mlir` contains a working transform script structure (follows rmsnorm/softmax patterns), but the kernel IR itself fails before the transform even runs. The issue is in Triton-XDNA's compiler, not the transform script.
+Variable ctx is handled **on the host between fixed-size kernels** (no in-kernel
+masking → no dynamic DMA): pad K/V to a fixed `N_pad`; padded QK scores are 0;
+the host sets scores[j≥ctx] = -inf before softmax; padded softmax weights ≈ 0 so
+padded AV terms vanish. Use bf16 (not the INT8 matmul kernel, which loses
+attention-logit coherence). This is a sizable feature (2 new matvec kernels +
+transforms + host orchestration + per-head loop), tracked as future work.
 
 #### Recently fixed
 
@@ -696,7 +717,7 @@ python3 scripts/compare_logits.py --check --ref  # + logit vs llama-cpp-python
 
 #### What does not work today
 
-- **Fused NPU flash attention** — blocked on Triton-XDNA multi-reduction kernel lowering (§7.1 Known limitation). Kernel with 3+ `tl.sum` ops fails in default pipeline: `requires exactly one producer_op handle (got N)`. Host f32 decomposed path is production.
+- **Fused NPU flash attention** — blocked: 4-reduction kernel maps to AIR with no `air.herd`, so `airrt-to-npu` rejects it (§7.1 Known limitation). Recommended fix: decompose into 3 single-reduction NPU kernels (QK → softmax → AV). Host f32 decomposed path is production.
 - **NPU RoPE** — gather/index math not lowered by Triton-XDNA transforms yet.
 - **High NPU utilization** — flash_attn, RoPE, residuals still on host; matmul (incl. logits INT8) and norms/activations on NPU.
 - **Stale rmsnorm xclbins** — pre-fix `rmsnorm_2048_npu6.xclbin` artifacts give ~8% error; delete and rebuild (see §2.1).
@@ -959,7 +980,7 @@ When generating NPU kernel code (`kernels/triton/`), **always** apply the four g
 
 **Start here:** Phases 1–5 MVP passed on hardware; Phase 6 in progress. NPU: matmul (incl. logits INT8), RMSNorm (any hidden, pad-to-pow2) + SiLU + RoPE (batched, opt-in `GGNPU_NPU_ROPE=1`). Host: flash_attn. Regression: `ctest -R test_e2e_logits`, `python3 scripts/compare_logits.py --check`. Next work, in order:
 
-1. **Fused flash attention on NPU** — **blocked** on Triton-XDNA multi-reduction kernel lowering (see §7.1 Known limitation). Kernel with 3+ `tl.sum` ops fails: `requires exactly one producer_op handle (got N)`. See `flash_attn_aie2p.mlir` for attempted transform; host f32 decomposed path is production.
+1. **Fused flash attention on NPU** — **blocked**: the 4-reduction kernel lowers to AIR with no `air.herd` (compute stuck at L2), so `airrt-to-npu` fails (see §7.1 Known limitation). Recommended fix: decompose into 3 single-reduction NPU kernels (QK matvec → softmax → AV matvec) with host-side ctx masking. Host f32 decomposed path is production.
 2. **RoPE on NPU perf** — wired and validated (`rope_batched`, ~8 heads/launch); opt-in until per-token launch overhead is tuned to beat CPU.
 3. **Matmul perf:** batch tiles, weight-tile persistence, larger xclbins.
 4. **Phase 6:** 3B, L2 tiling, production polish; keep `README.md`, `docs/host-setup-guide.md`, and §9–§10 aligned.
