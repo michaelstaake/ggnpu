@@ -49,6 +49,10 @@ struct RopeParams {
     float freq_scale;
     float freq_base;
     int64_t rope_dims;
+    // Optional precomputed tables for the NPU path (each [rope_dims/2] floats).
+    // When null the backend derives angles from offset/freq_base/freq_scale.
+    const float* cos_table = nullptr;
+    const float* sin_table = nullptr;
 };
 
 struct SoftmaxParams {

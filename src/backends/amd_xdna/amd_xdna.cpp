@@ -40,6 +40,7 @@ constexpr int kRmsnormHiddenPadRows = 2;  // M=2,N=2048 (row 0 duplicated; M=1 w
 constexpr int kSiluKernelSize = 8192;  // prebuilt silu xclbin default N
 constexpr int kSoftmaxKernelRows = 256;  // prebuilt softmax xclbin is 256x256 bf16
 constexpr int kSoftmaxKernelCols = 256;
+constexpr int kRopePairs = 32;          // prebuilt rope xclbin: n_pairs=32 (head_dim=64, Llama 1B/3B)
 constexpr int kFlashAttnHeads = 8;      // prebuilt flash_attn: 8 heads, 128 head_dim, 2048 ctx
 constexpr int kFlashAttnHeadDim = 128;
 constexpr int64_t kFlashAttnCtxLen = 2048;
@@ -359,6 +360,7 @@ public:
         any_kernel_loaded = load_rmsnorm_xclbin() || any_kernel_loaded;
         any_kernel_loaded = load_softmax_xclbin() || any_kernel_loaded;
         any_kernel_loaded = load_silu_xclbin() || any_kernel_loaded;
+        load_rope_xclbin();  // optional — rope is Phase 6; no warning if absent
         if (!any_kernel_loaded) {
             std::cerr << "Warning: no NPU kernels available. Prebuilt xclbins not found.\n";
             std::cerr << "  Run with --dump-tensors to test GGUF parsing without NPU.\n";
@@ -830,23 +832,24 @@ public:
     }
 
     Status rope(const RopeParams& params) override {
-        // RoPE on NPU: elementwise BF16 kernel with gather loads for pair shuffles.
-        // Converts f32 input → bf16 for DMA, runs NPU kernel, converts bf16 output → f32.
+        // RoPE on NPU: 3-buffer BF16 kernel (x_pairs, cs_table, out).
+        // Host deinterleaves x → [even|odd], packs [cos|sin], runs NPU,
+        // then reinterleaves [out_e|out_o] back into params.data.
         if (!params.data || params.rope_dims <= 0 || params.n_dims <= 0) {
             last_status_ = Status::INVALID_PARAM;
             return last_status_;
         }
 
-        int N = params.rope_dims;
-        int n_dims = params.n_dims;
-        std::string cache_key = "rope_" + std::to_string(N) + "x" + std::to_string(n_dims) + "_" + profile_str_;
+        int n_dims  = static_cast<int>(params.rope_dims);  // elements to rotate (= head_dim)
+        int n_pairs = n_dims / 2;
+        std::string cache_key = "rope_" + std::to_string(n_dims) + "_" + profile_str_;
 
         std::lock_guard<std::mutex> lock(mutex_);
 
         auto it = rope_kernels_.find(n_dims);
         if (it == rope_kernels_.end()) {
-            if (!ensure_rope_kernel(n_dims, N, cache_key)) {
-                std::cerr << "Error: no NPU RoPE kernel for dims=" << n_dims << " N=" << N << "\n";
+            if (!ensure_rope_kernel(n_dims, n_dims, cache_key)) {
+                std::cerr << "Error: no NPU RoPE kernel for dims=" << n_dims << " N=" << n_dims << "\n";
                 std::cerr << "  Install Triton-XDNA for JIT: pip install triton-xdna\n";
                 std::cerr << "  Or build prebuilt: ./scripts/build-kernels.sh npu6 rope\n";
                 last_status_ = Status::NPU_UNAVAILABLE;
@@ -857,26 +860,47 @@ public:
 
         auto& kernel = it->second;
 
-        // RoPE kernel is BF16 — convert f32 input → bf16 for DMA
-        size_t bf16_bytes = static_cast<size_t>(N) * sizeof(uint16_t);
-        std::vector<uint8_t> bf16_input = convert_f32_to_bf16(params.data, N);
+        // Each buffer holds 2*n_pairs BF16 elements (even+odd or cos+sin or out_e+out_o)
+        size_t buf_bytes = static_cast<size_t>(n_pairs * 2) * sizeof(uint16_t);
 
-        if (!buf_rope_bf16_in_ || buf_rope_bf16_in_->size() < bf16_bytes) {
-            buf_rope_bf16_in_ = buf_mgr_->alloc(bf16_bytes, true);
-        }
-        if (!buf_rope_bf16_out_ || buf_rope_bf16_out_->size() < bf16_bytes) {
-            buf_rope_bf16_out_ = buf_mgr_->alloc(bf16_bytes, true);
+        if (!buf_rope_bf16_in_ || buf_rope_bf16_in_->size() < buf_bytes)
+            buf_rope_bf16_in_  = buf_mgr_->alloc(buf_bytes, false);
+        if (!buf_rope_cs_table_ || buf_rope_cs_table_->size() < buf_bytes)
+            buf_rope_cs_table_ = buf_mgr_->alloc(buf_bytes, false);
+        if (!buf_rope_bf16_out_ || buf_rope_bf16_out_->size() < buf_bytes)
+            buf_rope_bf16_out_ = buf_mgr_->alloc(buf_bytes, false);
+
+        // Deinterleave x into separate even/odd arrays
+        std::vector<float> x_packed(n_pairs * 2);
+        for (int i = 0; i < n_pairs; i++) {
+            x_packed[i]          = params.data[2 * i];      // even
+            x_packed[n_pairs + i] = params.data[2 * i + 1]; // odd
         }
 
-        buf_mgr_->copy_to(*buf_rope_bf16_in_, bf16_input.data(), bf16_bytes);
+        // Build cos/sin tables [cos[0..n-1] | sin[0..n-1]]
+        std::vector<float> cs_packed(n_pairs * 2);
+        if (params.cos_table && params.sin_table) {
+            std::memcpy(cs_packed.data(),           params.cos_table, n_pairs * sizeof(float));
+            std::memcpy(cs_packed.data() + n_pairs, params.sin_table, n_pairs * sizeof(float));
+        } else {
+            for (int i = 0; i < n_pairs; i++) {
+                float ratio = 1.0f / std::pow(params.freq_base,
+                                  (2.0f * i) / static_cast<float>(n_dims));
+                float angle = static_cast<float>(params.offset) * ratio * params.freq_scale;
+                cs_packed[i]           = std::cos(angle);
+                cs_packed[n_pairs + i] = std::sin(angle);
+            }
+        }
+
+        auto bf16_x  = convert_f32_to_bf16(x_packed.data(),  n_pairs * 2);
+        auto bf16_cs = convert_f32_to_bf16(cs_packed.data(), n_pairs * 2);
+        buf_mgr_->copy_to(*buf_rope_bf16_in_,  bf16_x.data(),  buf_bytes);
+        buf_mgr_->copy_to(*buf_rope_cs_table_, bf16_cs.data(), buf_bytes);
 
         try {
-            if (kernel.bo_instr && kernel.instr_words > 0) {
-                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
-                           buf_rope_bf16_in_->handle(), buf_rope_bf16_out_->handle());
-            } else {
-                kernel.run(buf_rope_bf16_in_->handle(), buf_rope_bf16_out_->handle());
-            }
+            kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                       buf_rope_bf16_in_->handle(), buf_rope_cs_table_->handle(),
+                       buf_rope_bf16_out_->handle());
             kernel.run.wait();
         } catch (const std::exception& e) {
             std::cerr << "Error: RoPE kernel execution failed: " << e.what() << "\n";
@@ -884,11 +908,14 @@ public:
             return last_status_;
         }
 
-        // Convert bf16 output → f32
-        std::vector<uint8_t> bf16_out_data(bf16_bytes);
-        buf_mgr_->copy_from(*buf_rope_bf16_out_, bf16_out_data.data(), bf16_bytes);
-        auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
-        std::memcpy(params.data, f32_result.data(), N * sizeof(float));
+        // Reinterleave [out_e | out_o] back into params.data
+        std::vector<uint8_t> bf16_out(buf_bytes);
+        buf_mgr_->copy_from(*buf_rope_bf16_out_, bf16_out.data(), buf_bytes);
+        auto f32_out = convert_bf16_to_f32(bf16_out.data(), n_pairs * 2);
+        for (int i = 0; i < n_pairs; i++) {
+            params.data[2 * i]     = f32_out[i];             // out_e
+            params.data[2 * i + 1] = f32_out[n_pairs + i];  // out_o
+        }
 
         return Status::OK;
     }
@@ -1732,11 +1759,15 @@ private:
     // Load or compile the RoPE kernel
     bool ensure_rope_kernel(int n_dims, int N, const std::string& cache_key) {
         if (cache_->has_xclbin(cache_key)) {
-            std::string cached_path = cache_->get_xclbin_path(cache_key);
-            return load_rope_kernel_for_shape(cached_path, n_dims, N, cache_key);
+            return load_rope_kernel_for_shape(cache_->get_xclbin_path(cache_key), n_dims, N, cache_key);
         }
 
-        // Try JIT compilation (required for non-standard sizes)
+        // Reuse preloaded xclbin for the default shape (n_pairs=kRopePairs → n_dims=64)
+        if (n_dims == kRopePairs * 2 && hw_ctx_rope_) {
+            return create_rope_kernel_from_loaded_xclbin(n_dims, cache_key);
+        }
+
+        // Try JIT compilation for non-standard shapes
         if (detail::jit_compilation_available()) {
             std::vector<uint8_t> xclbin_data = detail::jit_compile_rope(N, npu_profile_);
             if (!xclbin_data.empty()) {
@@ -1760,10 +1791,55 @@ private:
             xrt::run run(krnl);
 
             CachedRopeKernel cached{run, krnl, {}, 0, n_dims, N};
+            std::string seq_path = detail::find_prebuilt_sequence("rope_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                load_instr_bo(*device_, krnl, cached.bo_instr, cached.instr_words, seq_path);
+            }
             rope_kernels_[n_dims] = std::move(cached);
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Warning: failed to load rope kernel: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool create_rope_kernel_from_loaded_xclbin(int n_dims, const std::string& cache_key) {
+        try {
+            xrt::kernel krnl(hw_ctx_rope_, kTritonXdnaKernelName);
+            xrt::run run(krnl);
+
+            CachedRopeKernel cached{run, krnl, {}, 0, n_dims, n_dims};
+            std::string seq_path = detail::find_prebuilt_sequence("rope_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                load_instr_bo(*device_, krnl, cached.bo_instr, cached.instr_words, seq_path);
+            }
+            rope_kernels_[n_dims] = std::move(cached);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to create rope kernel from loaded xclbin: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool load_rope_xclbin() {
+        std::string xclbin_name = "rope_" + profile_str_ + ".xclbin";
+        std::string xclbin_path = detail::find_prebuilt_xclbin(xclbin_name, cache_dir_);
+
+        if (xclbin_path.empty() && cache_->has_xclbin(xclbin_name)) {
+            xclbin_path = cache_->get_xclbin_path(xclbin_name);
+        }
+
+        if (xclbin_path.empty()) return false;
+
+        try {
+            xclbin_data_rope_ = detail::load_xclbin_file(xclbin_path);
+            if (xclbin_data_rope_.empty()) return false;
+
+            hw_ctx_rope_ = register_xclbin_from_data(*device_, xclbin_data_rope_);
+            std::cout << "Loaded rope xclbin: " << xclbin_path << "\n";
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error: failed to load rope xclbin: " << e.what() << "\n";
             return false;
         }
     }
@@ -1898,8 +1974,9 @@ private:
     std::shared_ptr<XrtBuffer> buf_fa_v_;
     std::shared_ptr<XrtBuffer> buf_fa_out_;
 
-    std::shared_ptr<XrtBuffer> buf_rope_bf16_in_;
-    std::shared_ptr<XrtBuffer> buf_rope_bf16_out_;
+    std::shared_ptr<XrtBuffer> buf_rope_bf16_in_;   // [even | odd] packed BF16
+    std::shared_ptr<XrtBuffer> buf_rope_cs_table_;  // [cos  | sin] packed BF16
+    std::shared_ptr<XrtBuffer> buf_rope_bf16_out_;  // [out_e | out_o] packed BF16
 
     std::unordered_map<std::string, CachedMatmulKernel> matmul_kernels_;
     std::unordered_map<int, CachedRmsNormKernel> rmsnorm_kernels_;

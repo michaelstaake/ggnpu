@@ -62,9 +62,9 @@ KERNELS = {
         "transform": "silu_aie2p.mlir",
     },
     "rope": {
-        "description": "Rotary positional embeddings",
-        "params": ["N", "dims"],
-        "defaults": {"N": 2048, "dims": 64},
+        "description": "Rotary positional embeddings (pre-deinterleaved even/odd + precomputed cos/sin)",
+        "params": ["n_pairs"],
+        "defaults": {"n_pairs": 32},
         "transform": "rope_aie2p.mlir",
     },
     "flash_attn": {
@@ -577,31 +577,37 @@ def build_kernel_script(op: str, params: dict) -> str:
         """)
 
     elif op == "rope":
+        n_pairs = p.get("n_pairs", 32)
+        block_size = min(n_pairs, 32)
         launch = textwrap.dedent(f"""
-            N, dims = {p.get("N", 2048)}, {p.get("dims", 64)}
-            x = torch.randn(N, dtype=torch.float32)
-            y = torch.empty(N, dtype=torch.float32)
-            grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
-            compiled = rope_kernel[grid](x, y, N, dims, 0, 10000.0, 1.0, BLOCK_SIZE=1024)
+            n_pairs = {n_pairs}
+            # x_ptr:  [even[0..n_pairs-1] | odd[0..n_pairs-1]]  (2*n_pairs BF16)
+            # cs_ptr: [cos[0..n_pairs-1]  | sin[0..n_pairs-1]]  (2*n_pairs BF16)
+            # out:    [out_e[0..n_pairs-1] | out_o[0..n_pairs-1]] (2*n_pairs BF16)
+            x_ptr = torch.randn(n_pairs * 2, dtype=torch.bfloat16)
+            cs_ptr = torch.randn(n_pairs * 2, dtype=torch.bfloat16)
+            out = torch.empty(n_pairs * 2, dtype=torch.bfloat16)
+            grid = lambda META: (triton.cdiv(n_pairs, META["BLOCK_SIZE"]),)
+            compiled = rope_kernel[grid](x_ptr, cs_ptr, out, n_pairs, BLOCK_SIZE={block_size})
         """)
         kernel_src = textwrap.dedent("""
             @triton.jit
-            def rope_kernel(input_ptr, output_ptr, N: tl.constexpr, dims: tl.constexpr,
-                offset: tl.constexpr, freq_base: tl.constexpr, freq_scale: tl.constexpr,
-                BLOCK_SIZE: tl.constexpr):
+            def rope_kernel(x_ptr, cs_ptr, out_ptr, n_pairs: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                # x_ptr:  [x_even[0..n_pairs-1] | x_odd[0..n_pairs-1]]
+                # cs_ptr: [cos[0..n_pairs-1]    | sin[0..n_pairs-1]]
+                # out_ptr:[out_e[0..n_pairs-1]  | out_o[0..n_pairs-1]]
+                # All arrays BF16, all accesses stride-1.
                 pid = tl.program_id(0)
-                idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-                mask = idx < N
-                x = tl.load(input_ptr + idx, mask=mask, other=0.0)
-                pair_idx = idx // 2
-                is_odd = (idx % 2) != 0
-                ratio = 1.0 / tl.exp2((2.0 * pair_idx.to(tl.float32)) * (3.32192809489 / dims))
-                angle = offset * ratio * freq_scale
-                cos_val = tl.cos(angle)
-                sin_val = tl.sin(angle)
-                x_pair = tl.load(input_ptr + (pair_idx * 2 + (1 - is_odd.to(tl.int32))), mask=mask, other=0.0)
-                out = tl.where(is_odd, x * cos_val + x_pair * sin_val, x * cos_val - x_pair * sin_val)
-                tl.store(output_ptr + idx, out, mask=mask)
+                offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                mask = offs < n_pairs
+                x_e   = tl.load(x_ptr  + offs,          mask=mask, other=0.0)
+                x_o   = tl.load(x_ptr  + n_pairs + offs, mask=mask, other=0.0)
+                cos_v = tl.load(cs_ptr + offs,          mask=mask, other=1.0)
+                sin_v = tl.load(cs_ptr + n_pairs + offs, mask=mask, other=0.0)
+                out_e = x_e * cos_v - x_o * sin_v
+                out_o = x_e * sin_v + x_o * cos_v
+                tl.store(out_ptr + offs,           out_e, mask=mask)
+                tl.store(out_ptr + n_pairs + offs, out_o, mask=mask)
         """)
 
     elif op == "flash_attn":
