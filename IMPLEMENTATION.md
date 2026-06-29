@@ -641,20 +641,28 @@ transforms + host orchestration + per-head loop), tracked as future work.
    **matvec with a 1-D output**, so the 2-D pipeline (output-generic navigation,
    `[0,16]` vectorization) doesn't fit. Abandoned in favor of (2).
 
-2. **bf16 matmul datapath — WORKS.** `matmul_bf16` (`compile_kernels.py` +
-   `matmul_bf16_aie2p.mlir`) is the int8 matmul transform with the `vector.contract`
-   casts retargeted (`i16 → bf16` inputs, `i32 → f32` accumulator) — the int8 path
-   already widens to 16-bit i16, and bf16 is 16-bit, so the packing/tiling is
-   unchanged. It **compiles end-to-end** to a 67 KB xclbin; the AIR has bf16
-   contracts with f32 accumulation across 3 herds (verified). This is the
-   foundation for decomposed NPU attention: QK = K[ctx,d] @ Q[d,1] and AV =
-   P[1,ctx] @ V[ctx,d] become bf16 GEMMs. Build with
-   `GGNPU_EXPERIMENTAL=1 ./scripts/build-kernels.sh npu6 matmul_bf16`.
+2. **bf16 matmul datapath — WORKS, hardware-validated.** `matmul_bf16`
+   (`compile_kernels.py` + `matmul_bf16_aie2p.mlir`) is the int8 matmul transform
+   with the `vector.contract` casts retargeted (`i16 → bf16` inputs, `i32 → f32`
+   accumulator) — the int8 path already widens to 16-bit i16, and bf16 is 16-bit,
+   so the `pack=[8,8,8]` tiling is unchanged. It **compiles end-to-end** to a
+   67 KB xclbin (AIR: bf16 contracts, f32 accumulation, 3 herds) and **runs
+   correctly on the NPU**: a 256³ GEMM vs a torch reference gives rel err 0.0099,
+   0/65536 mismatches (`scripts/validate-bf16-matmul.py`). This is the foundation
+   for decomposed NPU attention: QK = K[ctx,d] @ Q[d,1] and AV = P[1,ctx] @
+   V[ctx,d] as bf16 GEMMs (far better than int8 for attention-logit coherence).
+   Build with `GGNPU_EXPERIMENTAL=1 ./scripts/build-kernels.sh npu6 matmul_bf16`.
 
-**Next steps:** (a) validate `matmul_bf16` numerically on hardware vs a CPU ref;
-(b) shape QK/AV as bf16 GEMMs (pad the degenerate matvec dim to a 256 tile for
-decode; prefill is a natural GEMM); (c) host orchestration with ctx masking
-between QK → softmax → AV. Host f32 `flash_attn_decomposed()` stays production.
+**Next steps:** (a) shape QK/AV as bf16 GEMMs (pad the degenerate matvec dim to a
+256 tile for decode; prefill is a natural GEMM); (b) wire a bf16 matmul backend
+method in `amd_xdna.cpp`; (c) host orchestration with ctx masking between
+QK → softmax → AV. Host f32 `flash_attn_decomposed()` stays production.
+
+> Running a kernel directly on the NPU from Python (no C++) needs three env
+> fixes the build path doesn't set: `LD_PRELOAD=libuuid.so.1` (launcher needs
+> `uuid_unparse_lower`), the bundled boost lib on `LD_LIBRARY_PATH` (xclbinutil),
+> and the system XRT runtime (`libxrt_core.so.2` etc.) reachable under
+> `$XILINX_XRT/lib`. `scripts/validate-bf16-matmul.py` wraps all three.
 
 #### Recently fixed
 
