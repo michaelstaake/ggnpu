@@ -633,6 +633,14 @@ padded AV terms vanish. Use bf16 (not the INT8 matmul kernel, which loses
 attention-logit coherence). This is a sizable feature (2 new matvec kernels +
 transforms + host orchestration + per-head loop), tracked as future work.
 
+**Progress (WIP):** the `attn_qk` kernel (`compile_kernels.py`, experimental)
+scaffolds step 1. With the rmsnorm transform it already **reaches AIE herd
+placement** — past the fused kernel's wall — and fails later in
+`air-dma-to-channel` on the two-input (Q broadcast + K) DMA. The rmsnorm
+transform promotes only one reduction input; QK needs a dedicated transform that
+promotes both `Q` and `K`. That transform tuning (à la the rope bring-up) is the
+next concrete step, followed by the AV matvec and host orchestration.
+
 #### Recently fixed
 
 | Fix | File |

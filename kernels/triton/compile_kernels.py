@@ -67,6 +67,23 @@ KERNELS = {
         "defaults": {"n_pairs": 32},
         "transform": "rope_aie2p.mlir",
     },
+    "attn_qk": {
+        # QK^T scores: one reduction over head_dim (rmsnorm-shaped). First piece of
+        # the decomposed NPU attention (QK matvec -> softmax -> AV matvec) that
+        # replaces the un-herd-able fused flash_attn. WIP: with the rmsnorm
+        # transform this reaches AIE herd placement (the fused kernel's wall) but
+        # fails later in air-dma-to-channel on the two-input (Q broadcast + K) DMA
+        # pattern. Needs a dedicated transform handling both reduction operands.
+        "description": "Attention QK^T scores (single-reduction matvec) [WIP]",
+        "params": ["ctx_len", "head_dim"],
+        "defaults": {"ctx_len": 256, "head_dim": 64},
+        "transform": "rmsnorm_aie2p.mlir",
+        "experimental": (
+            "WIP toward decomposed NPU attention. Reaches herd placement but "
+            "air-dma-to-channel rejects the two-input broadcast DMA; needs a "
+            "dedicated transform (rmsnorm handles only one reduction input)."
+        ),
+    },
     "flash_attn": {
         "description": "FlashAttention v1 (online softmax; elementwise decomposition)",
         "params": ["n_head", "head_dim", "ctx_len"],
@@ -626,6 +643,36 @@ def build_kernel_script(op: str, params: dict) -> str:
                 t2 = tl.load(in2_ptr + offs)
                 out = t1 + t2
                 tl.store(out_ptr + offs, out)
+        """)
+
+    elif op == "attn_qk":
+        # QK^T scores for one head: scores[j] = scale * sum_d Q[d]*K[j,d].
+        # Mirrors the rmsnorm 2D-rows form (reduce over the inner dim) so the
+        # rmsnorm transform maps it to a herd: per-row reduce over head_dim, then
+        # an output elementwise (scale) like rmsnorm's y = x*rstd.
+        ctx_len = p.get("ctx_len", 256)
+        head_dim = p.get("head_dim", 64)
+        launch = textwrap.dedent(f"""
+            CTX, D = {ctx_len}, {head_dim}
+            scale = 1.0 / (D ** 0.5)
+            Q = torch.randn(D, dtype=torch.bfloat16)
+            K = torch.randn(CTX, D, dtype=torch.bfloat16)
+            S = torch.empty(CTX, dtype=torch.bfloat16)
+            grid = (1,)
+            compiled = attn_qk_kernel[grid](Q, K, S, scale, D, BLOCK_M=CTX, BLOCK_D=D)
+        """)
+        kernel_src = textwrap.dedent("""
+            @triton.jit
+            def attn_qk_kernel(Q, K, S, scale, head_dim: tl.constexpr,
+                BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr):
+                rows = tl.arange(0, BLOCK_M)            # K rows (ctx positions)
+                cols = tl.arange(0, BLOCK_D)            # head_dim
+                k = tl.load(K + rows[:, None] * head_dim + cols[None, :]).to(tl.float32)
+                q = tl.load(Q + cols).to(tl.float32)
+                prod = k * q[None, :]                   # [BLOCK_M, head_dim]
+                s = tl.sum(prod, axis=1)                # reduce over head_dim
+                s = s * scale                           # output elementwise (attention scale)
+                tl.store(S + rows, s.to(S.dtype.element_ty))
         """)
 
     elif op == "flash_attn":
