@@ -666,12 +666,19 @@ transforms + host orchestration + per-head loop), tracked as future work.
   (0.0062, full QK→softmax→AV). End-to-end (reduced layers) matches the host
   baseline.
 
-**Perf caveat (why it stays opt-in):** the fixed 256³ tile wastes compute on
-attention's degenerate dims (N=1 for QK, M=1 for AV, both padded to 256) →
-~1000 kernel launches per token, far too slow for production. Optimization is
-future work: QK/AV-shaped bf16 xclbins (avoid the 256 padding), batch heads into
-the tile, or move softmax onto the `softmax` kernel. Host f32
-`flash_attn_decomposed()` stays the default production path.
+**Perf (why it stays opt-in).** Profiling (`GGNPU_NPU_ATTN_TIMING=1`) drove a
+host-side fix: `matmul_bf16` now packs only the real `[rows,cols]` sub-region to
+bf16 (persistent staging, padding kept zero across calls) instead of zeroing +
+converting the full 256² tile every launch. Per 256 launches the host overhead
+dropped ~207 → ~44 ms (pack 124 → 1.5 ms, 80×). Full-model NPU attention went
+from *not finishing in 300 s* to **~34.5 s for 6 tokens** (coherent output).
+
+The remaining cost is `run+wait` — the fixed **256³ kernel itself**, which still
+does 16 M MACs per launch when attention's degenerate dim (N=1 for QK, M=1 for
+AV) only needs a sliver. Next optimization (future, higher-risk): attention-shaped
+bf16 xclbins with a small N/M tile to cut both compute and launch count; the
+matmul transform's L1 tiling (`l1=64`, generator not in-repo) would need editing.
+Host f32 `flash_attn_decomposed()` stays the default production path.
 
 > Running a kernel directly on the NPU from Python (no C++) needs three env
 > fixes the build path doesn't set: `LD_PRELOAD=libuuid.so.1` (launcher needs
