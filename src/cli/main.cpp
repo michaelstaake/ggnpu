@@ -1249,6 +1249,44 @@ int main(int argc, char* argv[]) {
             if (!report_compare("flash_attn (1 head, ctx=1)", cmp, head_dim, 0.1f, 0.2f, 0.05f)) return 1;
         }
 
+        // Test 0f2: flash attention — multi-head, ctx>1, causal (exercises full
+        // QK -> softmax -> AV). NPU vs host f32; only meaningful when the NPU
+        // decomposed path is on (GGNPU_NPU_ATTN), else both run the same host code.
+        std::cout << "Testing flash attention (multi-head, ctx>1)...\n";
+        {
+            const int nh = 4, cl = 40;
+            const int64_t qpos = cl - 1;
+            std::vector<float> Q(static_cast<size_t>(nh) * head_dim);
+            std::vector<float> K(static_cast<size_t>(nh) * cl * head_dim);
+            std::vector<float> V(static_cast<size_t>(nh) * cl * head_dim);
+            uint32_t st_r = 0xc0ffeeu;
+            auto rnd = [&]() {
+                st_r = st_r * 1103515245u + 12345u;
+                return static_cast<float>((st_r >> 16) & 0x7fff) / 32768.0f - 0.5f;
+            };
+            for (auto* v : {&Q, &K, &V}) for (auto& x : *v) x = rnd();
+
+            std::vector<float> cpu_fa(static_cast<size_t>(nh) * head_dim, 0.0f);
+            std::vector<float> npu_fa(static_cast<size_t>(nh) * head_dim, 0.0f);
+            AttnParams ap;
+            ap.Q = Q.data(); ap.K = K.data(); ap.V = V.data();
+            ap.n_head = nh; ap.head_dim = head_dim; ap.ctx_len = cl;
+            ap.query_pos = qpos; ap.batch_size = 1; ap.freq_factors = nullptr;
+
+            ap.output = cpu_fa.data();
+            cpu_backend->flash_attn(ap);
+            ap.output = npu_fa.data();
+            st = npu_backend->flash_attn(ap);
+            npu_backend->sync();
+            if (st != Status::OK) {
+                std::cerr << "Error: NPU flash_attn (multi-head) failed: " << status_name(st) << "\n";
+                return 1;
+            }
+            int n_elem = nh * head_dim;
+            auto cmp2 = compare_vectors(cpu_fa.data(), npu_fa.data(), n_elem, 0.05f);
+            if (!report_compare("flash_attn (4 heads, ctx=40)", cmp2, n_elem, 0.03f, 0.1f, 0.05f)) return 1;
+        }
+
         // Test 0g: RoPE — NPU kernel (Phase 6, pending pre-deinterleaved kernel design).
         std::cout << "Testing RoPE (Phase 6)...\n";
         {

@@ -1345,6 +1345,53 @@ public:
     // Fused flash_attn Triton kernel has no working mlir transform yet (scf.for +
     // online softmax). Host f32 decomposed attention matches cpu_ref; INT8 NPU matmul
     // QK/AV loses too much precision for coherent 16-layer inference.
+    // Decomposed attention on the NPU: QK and AV as bf16 GEMMs (matmul_bf16),
+    // softmax + causal mask on the host between them. Opt-in (GGNPU_NPU_ATTN);
+    // falls back to flash_attn_decomposed on any failure. Per head:
+    //   scores[cl] = Kh[cl,hd] @ Qh[hd,1]   (QK)
+    //   softmax(scale*scores, causal mask)   (host)
+    //   out[hd]    = w[1,cl] @ Vh[cl,hd]      (AV)
+    Status flash_attn_npu(const AttnParams& params) {
+        const int nh = params.n_head;
+        const int hd = params.head_dim;
+        const int64_t cl = params.ctx_len;
+        const int64_t qpos = params.query_pos >= 0 ? params.query_pos : cl - 1;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+
+        std::vector<float> scores(static_cast<size_t>(cl));
+        for (int h = 0; h < nh; h++) {
+            const float* Qh = params.Q + static_cast<int64_t>(h) * hd;
+            const float* Kh = params.K + static_cast<int64_t>(h) * cl * hd;
+            const float* Vh = params.V + static_cast<int64_t>(h) * cl * hd;
+            float* outh = params.output + static_cast<int64_t>(h) * hd;
+
+            // QK: scores[cl,1] = Kh[cl,hd] @ Qh[hd,1]
+            if (matmul_bf16(Kh, Qh, scores.data(), static_cast<int>(cl), 1, hd) != Status::OK)
+                return Status::ERROR;
+
+            // scale + causal mask + softmax (host, f32)
+            float sm_max = -INFINITY;
+            for (int64_t j = 0; j < cl; j++) {
+                if (j <= qpos) scores[static_cast<size_t>(j)] *= scale;
+                else           scores[static_cast<size_t>(j)] = -INFINITY;
+                sm_max = std::max(sm_max, scores[static_cast<size_t>(j)]);
+            }
+            float sm_sum = 0.0f;
+            for (int64_t j = 0; j < cl; j++) {
+                float e = std::exp(scores[static_cast<size_t>(j)] - sm_max);
+                scores[static_cast<size_t>(j)] = e;
+                sm_sum += e;
+            }
+            if (sm_sum > 0.0f)
+                for (int64_t j = 0; j < cl; j++) scores[static_cast<size_t>(j)] /= sm_sum;
+
+            // AV: out[1,hd] = weights[1,cl] @ Vh[cl,hd]
+            if (matmul_bf16(scores.data(), Vh, outh, 1, hd, static_cast<int>(cl)) != Status::OK)
+                return Status::ERROR;
+        }
+        return Status::OK;
+    }
+
     Status flash_attn_decomposed(const AttnParams& params) {
         static bool noted = false;
         if (!noted) {
@@ -1464,6 +1511,15 @@ public:
 
             buf_mgr_->copy_from(*buf_fa_out_, params.output, size_out);
             return Status::OK;
+        }
+
+        // Opt-in decomposed NPU attention (QK/AV bf16 GEMMs + host softmax).
+        // Falls back to host f32 on any failure.
+        const char* npu_attn = std::getenv("GGNPU_NPU_ATTN");
+        if (npu_attn && npu_attn[0] != '0') {
+            Status s = flash_attn_npu(params);
+            if (s == Status::OK) { last_status_ = s; return s; }
+            std::cerr << "Warning: NPU attention failed; falling back to host f32\n";
         }
 
         last_status_ = flash_attn_decomposed(params);
