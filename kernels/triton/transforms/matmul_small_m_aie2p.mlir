@@ -124,18 +124,29 @@ module attributes {transform.with_named_sequence} {
         %generic_fill_op = transform.structured.generalize %fill_op
             : (!transform.any_op) -> !transform.any_op
         transform.annotate %generic_fill_op "init_fill" : !transform.any_op
+        // Small-M: keep the natural (M_packed, N_packed) iteration order (no
+        // interchange) and tile [1, 8] so the prologue herd grid is (M=2, N=4),
+        // matching the compute herd's [1,8,0] tiling. The 256^3 kernel can
+        // interchange + tile [8,8] because its grid is square (4,4); at M=16 the
+        // M_packed dim is only 2, so an [8,8] tile would collapse it to a unit
+        // group and desync the shared L2 packed-C buffer from the compute herd.
         %interchanged_fill_op = transform.structured.interchange %generic_fill_op
           iterator_interchange = [1, 0, 2, 3]
           : (!transform.any_op) -> !transform.any_op
         %prologue_tiled_fill, %prologue_forall =
-          transform.structured.tile_using_forall %interchanged_fill_op tile_sizes [8, 8]
+          transform.structured.tile_using_forall %interchanged_fill_op tile_sizes [1, 8]
             : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         transform.annotate %prologue_forall "prologue_forall" : !transform.any_op
 
-        // Epilogue: unpack -> tile for L2 write-back
+        // Epilogue: unpack -> tile for L2 write-back. Small-M: tile [8, 64]
+        // (M tile 8 -> 2 groups, N tile 64 -> 4 groups) so the epilogue herd
+        // partitions the output into the same (M=2, N=4) 8-core grid as the
+        // compute and prologue herds. The packed-C buffer is promoted per-core
+        // to L1, so all three herds must use the same partition. The 256^3
+        // kernel uses [64, 64] (its M=256 already gives a square 4x4 grid).
         %unpack_op = transform.structured.match ops{["linalg.unpack"]} in %arg1 : (!transform.any_op) -> !transform.any_op
         %epilogue_tiled_unpack, %epilogue_forall =
-          transform.structured.tile_using_forall %unpack_op tile_sizes [64, 64]
+          transform.structured.tile_using_forall %unpack_op tile_sizes [8, 64]
             : (!transform.any_op) -> (!transform.any_op, !transform.any_op)
         transform.annotate %epilogue_forall "epilogue_forall" : !transform.any_op
 

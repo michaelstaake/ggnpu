@@ -209,6 +209,7 @@ FAILED=0
 # were authored for (they tile fixed block shapes).
 Kernels=(
     "matmul:--M 256 --N 256 --K 256"
+    "matmul_small_m:--M 16 --N 256 --K 256"
     "rmsnorm:--M 32 --N 256"
     "rmsnorm_2048:--M 2 --N 2048"
     "rmsnorm_4096:--M 2 --N 4096"

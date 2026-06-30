@@ -13,6 +13,40 @@ Hardware unless noted: AMD Ryzen AI 7 350 (Krackan / XDNA2 / `npu6`),
 
 ---
 
+## 2026-06-30 — small-M matmul kernel validated (branch `matmul-small-m-wip`)
+
+Decode-optimized `matmul_small_m` xclbin (M=16, N=K=256) now correct on hardware
+and wired into `mul_mat_q` (routes M ≤ 16; opt out `GGNPU_NO_SMALL_M=1`). See
+IMPLEMENTATION.md §7.1 for the AIR herd-consistency fix.
+
+**Correctness**
+- `bench-matmul` M ∈ {1, 16, ...}: PASS (A=B=1 → C=K).
+- `bench-layer` layer 0: all matmuls PASS; attn_q rel err 0.0166 = identical to
+  256³ baseline (small-M output is bit-equivalent).
+- `ctest` (8/8) PASS incl. `test_e2e_logits` (top-1 12366, ` Paris`).
+- France prompt n=16 → `Paris. It is the most visited city in the world. ...` ✅
+
+**Perf A/B — same build, `-v`, 21 token steps**
+
+```
+./build-npu/ggnpu -v -m models/llama-3.2-1b-q4_k_m.gguf \
+  -p "The capital of France is" -c 2048 -n 16            # small-M ON (default)
+GGNPU_NO_SMALL_M=1 ./build-npu/ggnpu -v ... -n 16        # 256³ baseline
+```
+
+| op | 256³ baseline | small-M | Δ |
+|----|------|------|------|
+| matmul | 15354.4 ms | 12304.9 ms | **−19.9%** |
+| logits | 3134.6 ms | 2585.9 ms | −17.5% |
+| **total** | 18901.9 ms | 15297.8 ms | **−19.1%** |
+| tok/s | ~1.11 | **~1.37** | **+23%** |
+
+The win is bounded (<16×) by the 8-core (2×4) herd vs the 256³'s 16 cores and
+unchanged host pack/DMA; only device row-compute shrinks (8 M-rows/core vs 64).
+A 2×8 (16-core) herd does not place on npu2 (4 compute rows max).
+
+---
+
 ## 2026-06-29 — commit `8959e21`
 
 **Run A — wall-clock generation timing**

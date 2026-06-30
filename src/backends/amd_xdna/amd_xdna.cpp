@@ -33,6 +33,12 @@ constexpr xrt::memory_group kDefaultMemGroup = 0;
 constexpr const char* kTritonXdnaKernelName = "MLIR_AIE";
 constexpr uint32_t kNpuOpcode = 3;
 constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256 int8
+// Decode-optimized matmul: a separate xclbin with the M tile shrunk to 16 (N/K
+// stay 256). Single-token decode is M=1, so the 256^3 kernel wastes 255/256 of
+// each tile's row-compute; the small-M kernel computes only 16 M-rows per tile.
+// mul_mat_q routes M<=kSmallMTile to it when matmul_small_m_<profile>.xclbin is
+// present (override off with GGNPU_NO_SMALL_M=1).
+constexpr int kSmallMTile = 16;
 // Prebuilt rmsnorm xclbin is M=1,N=2048 bf16 (Llama 3.2 hidden). Legacy 32x256
 // xclbins still work for N=256 bench sizes; rebuild with compile_kernels.py for 2048.
 constexpr int kRmsnormKernelCols = 256;
@@ -418,7 +424,20 @@ public:
 
         auto& kernel = it->second;
 
-        if (!kernel.bo_instr || kernel.instr_words == 0) {
+        // Decode-optimized routing: M<=kSmallMTile uses the small-M xclbin (16
+        // M-rows/tile instead of 256), which avoids computing the 255/256 wasted
+        // output rows of a single-token matmul. Falls back to the 256^3 kernel
+        // when the small-M xclbin is absent or GGNPU_NO_SMALL_M is set. N/K still
+        // tile at 256, so A/B/C packing and the B-tile cache are identical.
+        const bool use_small_m = (M <= kSmallMTile) &&
+                                 (std::getenv("GGNPU_NO_SMALL_M") == nullptr) &&
+                                 ensure_matmul_small_m_kernel();
+        CachedMatmulKernel& active_kernel = use_small_m ? matmul_small_m_kernel_ : kernel;
+        std::vector<MatmulPipelineSlot>& slots =
+            use_small_m ? matmul_small_m_slots_ : matmul_slots_;
+        const int T_m = use_small_m ? kSmallMTile : kMatmulTile;
+
+        if (!active_kernel.bo_instr || active_kernel.instr_words == 0) {
             std::cerr << "Error: matmul instruction sequence (matmul_" << profile_str_
                       << "_sequence.bin) missing from xclbin cache\n";
             last_status_ = Status::NPU_UNAVAILABLE;
@@ -554,7 +573,7 @@ public:
             if (batch.empty()) return Status::OK;
 
             const int n = static_cast<int>(batch.size());
-            ensure_matmul_pipeline_slots(kernel.krnl, n, tile_bytes_in, tile_bytes_out);
+            ensure_matmul_pipeline_slots(slots, active_kernel.krnl, n, tile_bytes_in, tile_bytes_out);
 
             auto batch_submit_start = do_timing ? std::chrono::high_resolution_clock::now()
                                                 : std::chrono::high_resolution_clock::time_point{};
@@ -562,7 +581,7 @@ public:
             // Phase 1: pack, DMA, and submit all tiles (no waits).
             for (int i = 0; i < n; i++) {
                 const auto& work = batch[static_cast<size_t>(i)];
-                auto& slot = matmul_slots_[static_cast<size_t>(i)];
+                auto& slot = slots[static_cast<size_t>(i)];
 
                 auto t_pack_start = do_timing ? std::chrono::high_resolution_clock::now()
                                               : std::chrono::high_resolution_clock::time_point{};
@@ -610,7 +629,7 @@ public:
                 }
 
                 try {
-                    slot.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                    slot.run(kNpuOpcode, active_kernel.bo_instr, active_kernel.instr_words,
                              slot.buf_a->handle(), slot.buf_b->handle(), slot.buf_c->handle());
                 } catch (const std::exception& e) {
                     std::cerr << "Error: matmul kernel execution failed: " << e.what() << "\n";
@@ -630,7 +649,7 @@ public:
             // Phase 2: wait, read back, and accumulate (kernels may overlap on device).
             for (int i = 0; i < n; i++) {
                 const auto& work = batch[static_cast<size_t>(i)];
-                auto& slot = matmul_slots_[static_cast<size_t>(i)];
+                auto& slot = slots[static_cast<size_t>(i)];
 
                 auto t_kernel_start = do_timing ? std::chrono::high_resolution_clock::now()
                                                 : std::chrono::high_resolution_clock::time_point{};
@@ -678,8 +697,8 @@ public:
             return Status::OK;
         };
 
-        for (int m0 = 0; m0 < M; m0 += T) {
-            int mc = std::min(T, M - m0);
+        for (int m0 = 0; m0 < M; m0 += T_m) {
+            int mc = std::min(T_m, M - m0);
             for (int n0 = 0; n0 < N; n0 += T) {
                 int nc = std::min(T, N - n0);
                 for (int k0 = 0; k0 < K; k0 += T) {
@@ -1641,20 +1660,21 @@ private:
     }
 
     // Load or compile the matmul xclbin for the target NPU profile
-    void ensure_matmul_pipeline_slots(const xrt::kernel& krnl, int slot_count,
+    void ensure_matmul_pipeline_slots(std::vector<MatmulPipelineSlot>& slots,
+                                      const xrt::kernel& krnl, int slot_count,
                                       size_t tile_bytes_in, size_t tile_bytes_out) {
         if (slot_count <= 0) return;
         const size_t need = static_cast<size_t>(slot_count);
-        if (matmul_slots_.size() < need) {
-            const size_t old = matmul_slots_.size();
-            matmul_slots_.resize(need);
+        if (slots.size() < need) {
+            const size_t old = slots.size();
+            slots.resize(need);
             for (size_t i = old; i < need; ++i) {
-                matmul_slots_[i].run = xrt::run(krnl);
-                matmul_slots_[i].run_initialized = true;
+                slots[i].run = xrt::run(krnl);
+                slots[i].run_initialized = true;
             }
         }
         for (int i = 0; i < slot_count; ++i) {
-            auto& slot = matmul_slots_[static_cast<size_t>(i)];
+            auto& slot = slots[static_cast<size_t>(i)];
             if (!slot.run_initialized) {
                 slot.run = xrt::run(krnl);
                 slot.run_initialized = true;
@@ -1804,6 +1824,47 @@ private:
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Warning: failed to load matmul_bf16 kernel: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    // Lazily load the decode-optimized small-M matmul xclbin
+    // (matmul_small_m_<profile>.xclbin, M=16 N=256 K=256 INT8). Returns false
+    // (and caches the result) when the xclbin is absent so callers transparently
+    // fall back to the 256^3 path.
+    bool ensure_matmul_small_m_kernel() {
+        if (matmul_small_m_loaded_) return true;
+        if (matmul_small_m_unavailable_) return false;
+        std::string name = "matmul_small_m_" + profile_str_ + ".xclbin";
+        std::string path = detail::find_prebuilt_xclbin(name, cache_dir_);
+        if (path.empty() && cache_->has_xclbin(name)) path = cache_->get_xclbin_path(name);
+        if (path.empty()) {
+            matmul_small_m_unavailable_ = true;
+            return false;
+        }
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) { matmul_small_m_unavailable_ = true; return false; }
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);  // keep context alive
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
+            CachedMatmulKernel cached{std::move(krnl), {}, 0,
+                                      kSmallMTile, kMatmulTile, kMatmulTile, GgmlType::I8};
+            std::string seq = detail::find_prebuilt_sequence(name, cache_dir_);
+            if (!seq.empty()) {
+                load_instr_bo(*device_, cached.krnl, cached.bo_instr, cached.instr_words, seq);
+            }
+            if (!cached.bo_instr || cached.instr_words == 0) {
+                std::cerr << "Error: matmul_small_m xclbin missing instruction sequence\n";
+                matmul_small_m_unavailable_ = true;
+                return false;
+            }
+            matmul_small_m_kernel_ = std::move(cached);
+            matmul_small_m_loaded_ = true;
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load matmul_small_m kernel: " << e.what() << "\n";
+            matmul_small_m_unavailable_ = true;
             return false;
         }
     }
@@ -2399,6 +2460,14 @@ private:
     xrt::hw_context hw_ctx_fa_;
 
     std::vector<MatmulPipelineSlot> matmul_slots_;
+
+    // Decode-optimized small-M matmul (M=16 tile). Lazily loaded from
+    // matmul_small_m_<profile>.xclbin; its pipeline slots are kept separate so
+    // their xrt::run handles stay bound to the small-M kernel.
+    CachedMatmulKernel matmul_small_m_kernel_;
+    bool matmul_small_m_loaded_ = false;
+    bool matmul_small_m_unavailable_ = false;
+    std::vector<MatmulPipelineSlot> matmul_small_m_slots_;
 
     std::shared_ptr<XrtBuffer> buf_rmsnorm_in_;
     std::shared_ptr<XrtBuffer> buf_rmsnorm_out_;

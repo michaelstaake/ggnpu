@@ -38,3 +38,7 @@ air_project_*/
 # Local dev package extracts (when system packages need sudo)
 third_party/xrt-dev/
 third_party/uuid-dev/
+
+# Python bytecode
+__pycache__/
+*.pyc

@@ -8,7 +8,7 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Verdict:** The supported path is host-native: install host prerequisites, build `ggnpu` locally, and provide local `.xclbin` + `*_sequence.bin` kernels under `~/.cache/ggnpu/xclbin/`.
 
-**Benchmark log:** Every timed/correctness run is recorded in [dev-benchmark.md](dev-benchmark.md) (commit, date, command, result). **Append a new entry whenever you run a benchmark or timed test** — it is the historical performance record. Latest (commit `8959e21`): Llama 3.2 1B Q4_K_M ≈ **1.0 tok/s**, runtime is **82% matmul + 16% logits** — throughput is matmul-bound, not attention-bound.
+**Benchmark log:** Every timed/correctness run is recorded in [dev-benchmark.md](dev-benchmark.md) (commit, date, command, result). **Append a new entry whenever you run a benchmark or timed test** — it is the historical performance record. Latest: Llama 3.2 1B Q4_K_M ≈ **1.37 tok/s** with the validated decode-optimized small-M matmul kernel (≈1.0 tok/s before; ~20% faster matmul, see §7.1). Runtime is still **~80% matmul + 17% logits** — throughput is matmul-bound, not attention-bound.
 
 ---
 
@@ -424,7 +424,7 @@ Work through these in order. Do not skip ahead.
 | 3 Q4_K weight path | Decode + one E2E matmul | **Done** — `bench-layer` FFN gate/up/down PASS vs CPU ref |
 | 4 Full decoder layer | One layer vs CPU ref | **Done** — NPU matmuls + RMSNorm N=2048 + SiLU; flash_attn on host f32 |
 | 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Done** — France prompt → Paris; `bench-logits` + `test_e2e_logits` regression |
-| 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; Llama 1B E2E validated on NPU; RMSNorm generalized to any hidden (1536/3072 via pad-to-pow2; 4096 kernel triggers AIR L2 split); batched RoPE on NPU (opt-in). Remaining: fused flash_attn, RoPE perf, 3B model validation |
+| 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; Llama 1B E2E validated on NPU; RMSNorm generalized to any hidden (1536/3072 via pad-to-pow2; 4096 kernel triggers AIR L2 split); batched RoPE on NPU (opt-in); decode-optimized small-M matmul validated (~20% faster matmul, §7.1). Remaining: fused flash_attn, RoPE perf, 3B model validation |
 
 ### Phase 0 — Scaffold
 
@@ -608,39 +608,63 @@ removing them yields ~0 net. Two attempts, both measured on hardware:
   pinned BOs + 19k allocations. Reverted.
 
 **Conclusion:** steady-state matmul (~70 µs/tile, batch 24) is bounded by the
-256³ INT8 **device kernel**, not host/driver overhead. The real lever is a
+256³ INT8 **device kernel**, not host/driver overhead. The real lever was a
 **small-M kernel**: decode is M=1, but the 256³ kernel computes 256 M-rows, so
-255/256 of each tile's row-compute is wasted. Kept the one free win: default
-`GGNPU_MATMUL_BATCH_SIZE` 8 → 24 (~8%).
+255/256 of each tile's row-compute is wasted. This is now **done** — see the
+validated small-M kernel below (~20% faster matmul, ~1.0 → 1.37 tok/s). Also
+kept the free win: default `GGNPU_MATMUL_BATCH_SIZE` 8 → 24 (~8%).
 
-#### Small-M matmul kernel (WIP — transform compiles at M=16, 2026-06-29)
+#### Small-M matmul kernel — **VALIDATED** (hardware-correct + ~20% decode win, 2026-06-30)
 
 A decode-optimized INT8 matmul tile (`matmul_small_m` in `compile_kernels.py`,
-transform `matmul_small_m_aie2p.mlir`) is in progress. Findings from the probe:
+transform `matmul_small_m_aie2p.mlir`) shrinks the M tile to **16** (N/K stay
+256). Decode is M=1, so the 256³ kernel computes 256 M-rows and wastes 255/256
+of each tile; the small-M kernel computes only 16. `mul_mat_q` routes M ≤ 16
+calls to it automatically when `matmul_small_m_<profile>.xclbin` is present
+(opt out with `GGNPU_NO_SMALL_M=1`). Same INT8 datapath, packing strides, and
+B-tile cache as the 256³ path — only the M-tile granularity, kernel handle, and
+pipeline slots differ.
 
-- **Naively shrinking `BLOCK_SIZE_M` fails.** M ≤ 64 dies in `airrt-to-npu` with
-  `memref.alloc inside air.herd must have memory space >= L1, but found L3` (the
-  packed A tile). Root cause: at M ≤ 64 the packed-M dim (M/8) ≤ 8, so PHASE 5's
-  `tile_using_forall [8,8,0]` collapses the M herd dimension to a **unit tile**;
-  A becomes loop-invariant across the N-only forall, gets hoisted out of the
-  herd, and is never promoted to L1. The herd *does* form — only A promotion fails.
-- **Fix:** PHASE 5 herd tile `[8,8,0] → [1,8,0]`. M-packed=2 (M=16) now splits
-  into 2 groups (non-unit M dim) → A varies across the herd and promotes to L1.
-  M=16 compiles to a valid xclbin; herd ≈ 2 M-groups × 4 N-groups = 8 cores,
-  **8 rows/core** vs the baseline's 64 → the per-core work drop that gives the win.
-- **Why M=128 is not the answer:** it compiles unchanged but gives *no* decode
-  speedup — per-core work is still 64 M-rows (8 packed); shrinking M just drops
-  core count proportionally. The win requires per-core M-rows < 64, i.e. the
-  `[1,8,0]` fine M-tiling at small M, not a bigger M.
+**Result (Llama 3.2 1B Q4_K_M, 21 token steps, same build A/B):**
+
+| op | 256³ (`GGNPU_NO_SMALL_M=1`) | small-M | Δ |
+|----|------|------|------|
+| matmul | 15354 ms | 12305 ms | **−19.9%** |
+| logits | 3135 ms | 2586 ms | −17.5% |
+| **total** | 18902 ms | 15298 ms | **−19.1%** (1.11 → 1.37 tok/s) |
+
+Output is bit-for-bit equivalent to the 256³ path: `bench-layer` attn_q rel
+error is 0.0166 with both kernels; `test_e2e_logits` top-1 unchanged (12366,
+` Paris`). The win is bounded below 16× because the small-M kernel uses 8 cores
+(2×4) vs the 256³'s 16, and host pack/DMA plus fixed per-core kernel overhead
+are unchanged; only the device row-compute shrinks.
+
+**How the transform was fixed (the hard part).** The original probe changed only
+PHASE 5's compute herd tile `[8,8,0] → [1,8,0]` (M-packed=2 → 2 M-groups, so A
+varies across the herd and promotes to L1 instead of being hoisted as
+loop-invariant — the `airrt-to-npu` L3 error). That compiled but was **numerically
+wrong**: only the first of 4 N-groups computed (output cols 0–63 correct, 64–255
+zero). Root cause: the packed-C buffer is promoted **per-core to L1** (PHASE 3),
+so the prologue-fill, compute, and epilogue-unpack herds must all partition it
+with the **same grid**. The 256³ kernel has all three at 4×4; the bare
+`[1,8,0]` change left the compute herd at (2,4) but the prologue
+(`interchange [1,0,2,3]` + `[8,8]`) and epilogue (`[64,64]`) at (4,1) — so the
+epilogue read the wrong cores' L1 tiles. Fix: bring all three herds to the
+**(M=2, N=4)** grid:
+- PHASE 5 compute: `[1,8,0]` (M/1=2 groups, N/8=4 groups).
+- PHASE 6 prologue fill: keep `interchange [1,0,2,3]`, tile `[8,8] → [1,8]`.
+- PHASE 6 epilogue unpack: tile `[64,64] → [8,64]` (M/8=2, N/64=4).
+
+A 2×8 (16-core) variant does **not** place on npu2 (only 4 compute rows; a
+size-8 herd dim overflows), and a larger-M kernel gives the same per-core work
+with more waste — so (2,4) at M=16 is the sweet spot.
+
 - **Tooling:** direct `compile_kernels.py` runs need
   `LD_LIBRARY_PATH=third_party/boost-lib/usr/lib/x86_64-linux-gnu` for
   `xclbinutil` (otherwise missing `libboost_filesystem.so.1.90.0`).
-  `build-kernels.sh` already sets this.
-
-**Still pending (next phase):** numerical validation (needs the C++ dispatch in
-`mul_mat_q` to route M ≤ 16 calls to the small-M xclbin with a 16-row M tile;
-the 256³ host tiling can't exercise it) and an end-to-end perf/`test_e2e_logits`
-run. Compiles + herds is the structural gate, **not** proof of correctness.
+  `build-kernels.sh` already sets this, and now builds `matmul_small_m`.
+- **Validation hook:** `bench-matmul` includes M ∈ {1, 16} shapes (A=B=1 → C=K
+  known-answer) that exercise the small-M kernel directly.
 
 #### Recently fixed (kernels / layer bench)
 

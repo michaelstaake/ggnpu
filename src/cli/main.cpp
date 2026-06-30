@@ -713,6 +713,9 @@ int main(int argc, char* argv[]) {
         std::cout << "Backend: " << backend->name() << "\n\n";
 
         std::vector<std::tuple<int, int, int>> sizes = {
+            {1, 256, 256},       // decode GEMV (exercises small-M kernel)
+            {16, 256, 256},      // small-M tile, full M
+            {1, 2048, 2048},     // decode attn_q shape
             {256, 256, 256},
             {512, 512, 512},
             {1024, 1024, 1024},
