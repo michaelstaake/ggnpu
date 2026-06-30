@@ -578,6 +578,38 @@ public:
             return it->second;
         };
 
+        // INT8 weights are constant across tokens: pack each tile into a resident
+        // device BO once and bind it directly on every later launch (no per-tile
+        // host->device weight copy). Gated to the deep-K decode path: that's where
+        // weight tiles are reused across many tokens, and it keeps a single set of
+        // (K=kDeepK) tile keys — prefill (256-K tiles, used once) keeps the per-
+        // call staging copy so it doesn't allocate a redundant resident BO set.
+        // Requires int8 weights (a deep-K shape can also be hit by F32 bench).
+        // Disable with GGNPU_NO_RESIDENT_W.
+        const bool use_resident_w = use_deepk && (B_int8_base != nullptr) &&
+                                    (std::getenv("GGNPU_NO_RESIDENT_W") == nullptr);
+        auto resolve_b_bo = [&](const BTileKey& key) -> XrtBuffer* {
+            auto cached = resident_b_bos_.find(key);
+            if (cached != resident_b_bos_.end()) return cached->second.get();
+
+            std::fill(b_tile.begin(), b_tile.end(), 0);
+            if (kq_path) {
+                for (int k = 0; k < key.kc; k++)
+                    for (int j = 0; j < key.nc; j++)
+                        b_tile[k * T + j] =
+                            B_int8_base[static_cast<size_t>(key.n0 + j) * K + (key.k0 + k)];
+            } else {
+                for (int k = 0; k < key.kc; k++)
+                    for (int j = 0; j < key.nc; j++)
+                        b_tile[k * T + j] =
+                            B_int8_base[(key.k0 + k) * params.ldb + (key.n0 + j)];
+            }
+            auto bo = buf_mgr_->alloc(tile_bytes_b, true);
+            buf_mgr_->copy_to(*bo, b_tile.data(), tile_bytes_b);  // pack once, resident
+            auto [it, _] = resident_b_bos_.emplace(key, std::move(bo));
+            return it->second.get();
+        };
+
         struct TileWork {
             int m0, mc, n0, nc, k0, kc;
             BTileKey bkey;
@@ -621,11 +653,6 @@ public:
                     last_status_ = Status::INVALID_PARAM;
                     return Status::INVALID_PARAM;
                 }
-                const std::vector<int8_t>& b_data = resolve_b_tile(work.bkey);
-                if (b_data.empty() && params.B_type != GgmlType::F32) {
-                    last_status_ = Status::INVALID_PARAM;
-                    return Status::INVALID_PARAM;
-                }
 
                 auto t_dma_a_start = do_timing ? std::chrono::high_resolution_clock::now()
                                                : std::chrono::high_resolution_clock::time_point{};
@@ -639,9 +666,22 @@ public:
                         std::chrono::high_resolution_clock::now() - t_dma_a_start).count();
                 }
 
+                // Resolve B: resident device BO (int8, packed once) or per-call
+                // staged copy into slot.buf_b (F32 bench path).
                 auto t_dma_b_start = do_timing ? std::chrono::high_resolution_clock::now()
                                                : std::chrono::high_resolution_clock::time_point{};
-                buf_mgr_->copy_to(*slot.buf_b, b_data.data(), tile_bytes_b);
+                xrt::bo* b_handle = nullptr;
+                if (use_resident_w) {
+                    b_handle = &resolve_b_bo(work.bkey)->handle();
+                } else {
+                    const std::vector<int8_t>& b_data = resolve_b_tile(work.bkey);
+                    if (b_data.empty() && params.B_type != GgmlType::F32) {
+                        last_status_ = Status::INVALID_PARAM;
+                        return Status::INVALID_PARAM;
+                    }
+                    buf_mgr_->copy_to(*slot.buf_b, b_data.data(), tile_bytes_b);
+                    b_handle = &slot.buf_b->handle();
+                }
                 if (do_timing) {
                     total_dma_b_ms += std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t_dma_b_start).count();
@@ -649,7 +689,7 @@ public:
 
                 try {
                     slot.run(kNpuOpcode, active_kernel.bo_instr, active_kernel.instr_words,
-                             slot.buf_a->handle(), slot.buf_b->handle(), slot.buf_c->handle());
+                             slot.buf_a->handle(), *b_handle, slot.buf_c->handle());
                 } catch (const std::exception& e) {
                     std::cerr << "Error: matmul kernel execution failed: " << e.what() << "\n";
                     last_status_ = Status::ERROR;
@@ -2537,6 +2577,15 @@ private:
     bool matmul_small_m_deepk_loaded_ = false;
     bool matmul_small_m_deepk_unavailable_ = false;
     std::vector<MatmulPipelineSlot> matmul_small_m_deepk_slots_;
+
+    // Resident packed-weight device BOs for the INT8 matmul path. A weight tile
+    // never changes across tokens, so once packed into a device BO we bind that
+    // BO directly on every later launch instead of re-copying it host->device
+    // each time. After deep-K shrank the device kernel, this per-launch weight
+    // DMA became ~64% of decode matmul time (it used to be hidden behind the
+    // 256^3 kernel). Keyed like the host B-tile cache. Member (not a global
+    // static) so the BOs are destroyed with the backend, before the device.
+    std::unordered_map<BTileKey, std::shared_ptr<XrtBuffer>, BTileKeyHash> resident_b_bos_;
 
     std::shared_ptr<XrtBuffer> buf_rmsnorm_in_;
     std::shared_ptr<XrtBuffer> buf_rmsnorm_out_;

@@ -709,6 +709,30 @@ N too) and/or cutting the now-exposed 512 KB/tile weight DMA (~19% of per-launch
 time), e.g. resident weight BOs — re-evaluate now that device compute shrank
 again. Both are kernel-shape work (the matmul transform generator isn't in-repo).
 
+#### Resident weight BOs — **DONE** (decode now device-bound, ~5%, 2026-06-30)
+
+With deep-K shrinking the device kernel, the per-launch **weight DMA** became 64%
+of decode matmul (it was hidden behind the 256³ kernel before). INT8 weights are
+constant across tokens, so `mul_mat_q` packs each deep-K weight tile into a
+**resident device BO** once (`resident_b_bos_`, keyed like the host B-tile cache)
+and binds it directly on every later launch — no per-token host→device copy.
+Gated to the deep-K decode path (`use_deepk && B_int8_base`); prefill keeps the
+per-call staging copy. Opt out `GGNPU_NO_RESIDENT_W=1`.
+
+**Memory-neutral** (the resident BOs replace the pageable B-tile cache, which is
+no longer populated on the int8 path): max RSS 2738 MB on vs 2737 MB off. Gives
+~5% (matmul 6206 → 5860 ms, 2.63 → 2.77 tok/s); top-1 ` Paris` unchanged.
+
+**Decode is now device-bound.** With resident BOs on, profiling shows the freed
+weight-DMA time was overlapping device execution (the NPU runs batched kernels
+serially while the host packs the next tile), so the deep-K tile's true device
+cost (~26 µs) is now the floor — further host-side work (pack-once, etc.) can't
+move the wall. The remaining lever is **device-side**: the ~26 µs tile is still
+~9× the raw MAC time, so widening N per launch (amortize per-launch device
+overhead across more output cols) or more cores would help — but that is
+transform/kernel-shape work (the matmul transform generator isn't in-repo, so the
+N tiling in `matmul_small_m_aie2p.mlir` would be hand-edited, like small-M).
+
 #### Recently fixed (kernels / layer bench)
 
 | Fix | File |
@@ -919,7 +943,7 @@ python3 scripts/compare_logits.py --check --ref  # + logit vs llama-cpp-python
 
 1. **Fused flash attention on NPU** — blocked on upstream Triton-XDNA fix for multi-reduction kernels. Workaround: host f32 decomposed path is production-quality. See §7.1 Known limitation for kernel restructuring options.
 2. **RoPE on NPU** — working transform for gather/pair-shuffle loads.
-3. **Matmul perf:** batched tiles (done), small-M decode kernel (done), **deep-K in-kernel reduction (done, ~2× decode)**. Remaining: widen N per launch (amortize per-launch overhead across N too); cut the now-exposed 512 KB/tile weight DMA (resident weight BOs — re-evaluate now that device compute shrank again).
+3. **Matmul perf:** batched tiles (done), small-M decode kernel (done), **deep-K in-kernel reduction (done, ~2× decode)**, **resident weight BOs (done, ~5%; decode now device-bound)**. Remaining is device-side: widen N per launch (amortize per-launch device overhead across N) or more cores — transform/kernel-shape work.
 4. **Phase 6:** 3B model, L2-aware tiling, production docs/errors, optional prebuilt xclbin distribution.
 
 ### 7.2 Memory constraints (16 GB RAM dev machine)
@@ -1174,7 +1198,7 @@ When generating NPU kernel code (`kernels/triton/`), **always** apply the four g
 
 1. **NPU attention** — decomposed path **works, opt-in** (`GGNPU_NPU_ATTN=1`): QK/AV as bf16 GEMMs (`matmul_bf16`) + host softmax (`flash_attn_npu`). Validated, but slow due to 256³ tile padding on attention's degenerate dims — next is perf (QK/AV-shaped xclbins, head batching) before it can replace the host f32 default. Fused single-kernel attention remains blocked (§7.1 Known limitation, no `air.herd`).
 2. **RoPE on NPU perf** — wired and validated (`rope_batched`, ~8 heads/launch); opt-in until per-token launch overhead is tuned to beat CPU.
-3. **Matmul perf:** batched tiles + small-M + **deep-K in-kernel reduction (done, ~2× decode, `matmul_small_m_deepk`)**. Remaining: widen N per launch; resident weight BOs to cut the now-exposed 512 KB/tile DMA.
+3. **Matmul perf:** batched tiles + small-M + **deep-K (done, ~2× decode, `matmul_small_m_deepk`)** + **resident weight BOs (done, ~5%)**. Decode is now device-bound; remaining lever is device-side (widen N per launch / more cores), hand-edited transform work.
 4. **Phase 6:** 3B, L2 tiling, production polish; keep `README.md`, `docs/host-setup-guide.md`, and §9–§10 aligned.
 5. **Hygiene:** rebuild `rmsnorm_2048` after mlir changes; clear `~/.cache/ggnpu/weights/` after Q4_K/Q6_K decoder changes.
 

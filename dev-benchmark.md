@@ -13,6 +13,53 @@ Hardware unless noted: AMD Ryzen AI 7 350 (Krackan / XDNA2 / `npu6`),
 
 ---
 
+## 2026-06-30 — resident weight BOs (decode now device-bound), ~5%
+
+After deep-K, profiling (`GGNPU_MATMUL_TIMING=1`, logits call, 501 tiles) showed
+the per-launch **weight DMA** (`dmaB`) had become 64% of decode matmul — it used
+to be hidden behind the 256³ kernel, but deep-K shrank the device kernel so it was
+exposed. INT8 weights never change across tokens, so `mul_mat_q` now packs each
+deep-K weight tile into a **resident device BO** once and binds it directly on
+every later launch (no per-token host→device copy). Gated to the deep-K decode
+path (`use_deepk && int8`); prefill keeps per-call staging. Opt out
+`GGNPU_NO_RESIDENT_W=1`. On commit after `7156ce4` (uncommitted).
+
+**Memory-neutral:** the resident BOs replace the pageable host B-tile cache
+(no longer populated on the int8 path), so max RSS is unchanged: **2738 MB**
+(resident ON) vs **2737 MB** (OFF).
+
+**Per-tile (logits, 501 tiles)**
+
+| component | resident OFF | resident ON |
+|-----------|------|------|
+| dmaB (weight) | 31.5 µs | **0.2 µs** |
+| pack (A) | 12.7 µs | 12.4 µs |
+| kernel wait | 2.4 µs | 26.4 µs |
+| submit wall | 23.5 ms | 7.7 ms |
+| wait wall | 2.2 ms | 14.2 ms |
+
+The freed weight-DMA time was **overlapping device execution** (the NPU runs
+batch kernels serially while the host packs/DMAs the next tile), so removing it
+mostly exposed the true device wait rather than shrinking the wall. Net per-tile
+47.4 → 39.8 µs. **Decode is now device-bound:** the deep-K tile takes ~26 µs of
+real device execution (the earlier "4 µs kernel-wait" was an artifact of the
+device finishing during the long weight-DMA submit). Host pack already overlaps
+device, so further host-side work won't move the wall — the next lever is
+device-side (widen N per launch to amortize the remaining ~9× per-launch device
+overhead, or more cores).
+
+**Perf A/B — `-v`, 21 token steps, France prompt n=16** (vs deep-K, `7156ce4`)
+
+| op | deep-K (`GGNPU_NO_RESIDENT_W=1`) | + resident W | Δ |
+|----|------|------|------|
+| matmul | 6206.1 ms | 5859.8 ms | −5.6% |
+| logits | 1366.1 ms | 1297.2 ms | −5.0% |
+| **total** | 7980.5 ms | 7581.8 ms | **−5.0%** (2.63 → 2.77 tok/s) |
+
+Correctness: `compare_logits.py --check` → top-1 ` Paris`; France n=16 coherent.
+
+---
+
 ## 2026-06-30 — deep-K decode matmul (in-kernel K=2048 reduction), ~2× decode
 
 New `matmul_small_m_deepk` xclbin (M=16, N=256, **K=2048**) folds the whole K
