@@ -13,6 +13,36 @@ Hardware unless noted: AMD Ryzen AI 7 350 (Krackan / XDNA2 / `npu6`),
 
 ---
 
+## 2026-06-30 — Qwen2.5-Coder-1.5B runs end-to-end on the NPU (2nd architecture)
+
+Second model architecture (`qwen2`) brought up on the NPU. Multi-arch is
+metadata-driven: `GgufLoader` now resolves hparams under `general.architecture`
+(`arch_key()`) instead of hardcoded `llama.*`. Qwen2 specifics handled generically
+— QKV bias add after projections (no-op for Llama), `rope.dimension_count`
+fallback to `embedding/n_head` (=128), RMSNorm pad-to-pow2 (1536→2048), SiLU
+host-tiling through the 8192 kernel (FFN=8960). RMSNorm validation gate widened
+1.2%→2.5% (Qwen2 activations peak ~1.68% vs Llama ~1.15%; still catches the old
+~8% cast bug). On commit after `eded2b3` (uncommitted).
+
+**Correctness**
+```
+./build-npu/ggnpu -m models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf \
+  -p "def fibonacci(n):" -c 2048 -n 40
+```
+→ coherent, correct Python:
+```
+    if n == 0:  return 0
+    elif n == 1: return 1
+    else: return fibonacci(n-1) + fibonacci(n-2)
+```
+(28 layers, hidden 1536, 12 heads / 2 KV, head_dim 128, FFN 8960, vocab 151936,
+RoPE θ=1e6.)
+
+**No Llama regression:** `compare_logits.py --check` → top-1 ` Paris`;
+`test_e2e_logits` PASS; France prompt coherent.
+
+---
+
 ## 2026-06-30 — resident weight BOs (decode now device-bound), ~5%
 
 After deep-K, profiling (`GGNPU_MATMUL_TIMING=1`, logits call, 501 tiles) showed

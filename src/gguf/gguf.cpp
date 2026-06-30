@@ -402,44 +402,50 @@ std::string GgufLoader::architecture() const {
     return arch();
 }
 
+std::string GgufLoader::arch_key(const std::string& suffix) const {
+    std::string a = arch();
+    if (a.empty()) a = "llama";  // fall back to llama-namespaced keys
+    return a + "." + suffix;
+}
+
 uint64_t GgufLoader::context_length() const {
-    return static_cast<uint64_t>(get_int("llama.context_length", 0));
+    return static_cast<uint64_t>(get_int(arch_key("context_length"), 0));
 }
 
 uint64_t GgufLoader::embedding_length() const {
-    return static_cast<uint64_t>(get_int("llama.embedding_length", 0));
+    return static_cast<uint64_t>(get_int(arch_key("embedding_length"), 0));
 }
 
 uint64_t GgufLoader::block_count() const {
-    return static_cast<uint64_t>(get_int("llama.block_count", 0));
+    return static_cast<uint64_t>(get_int(arch_key("block_count"), 0));
 }
 
 uint64_t GgufLoader::feed_forward_length() const {
-    return static_cast<uint64_t>(get_int("llama.feed_forward_length", 0));
+    return static_cast<uint64_t>(get_int(arch_key("feed_forward_length"), 0));
 }
 
 uint64_t GgufLoader::attention_head_count() const {
-    return static_cast<uint64_t>(get_int("llama.attention.head_count", 0));
+    return static_cast<uint64_t>(get_int(arch_key("attention.head_count"), 0));
 }
 
 uint64_t GgufLoader::attention_head_count_kv() const {
-    return static_cast<uint64_t>(get_int("llama.attention.head_count_kv", 0));
+    return static_cast<uint64_t>(get_int(arch_key("attention.head_count_kv"), 0));
 }
 
 double GgufLoader::attention_layer_norm_rms_epsilon() const {
-    return get_float("llama.attention.layer_norm_rms_epsilon", 1e-5);
+    return get_float(arch_key("attention.layer_norm_rms_epsilon"), 1e-5);
 }
 
 uint64_t GgufLoader::rope_dimension_count() const {
-    return static_cast<uint64_t>(get_int("llama.rope.dimension_count", 0));
+    return static_cast<uint64_t>(get_int(arch_key("rope.dimension_count"), 0));
 }
 
 double GgufLoader::rope_freq_scale() const {
-    return get_float("llama.rope.freq_scale", 1.0);
+    return get_float(arch_key("rope.freq_scale"), 1.0);
 }
 
 uint64_t GgufLoader::rope_freq_base() const {
-    return static_cast<uint64_t>(get_float("llama.rope.freq_base", 10000.0));
+    return static_cast<uint64_t>(get_float(arch_key("rope.freq_base"), 10000.0));
 }
 
 uint64_t GgufLoader::tensor_data_offset() const {

@@ -89,6 +89,11 @@ public:
     int64_t get_int(const std::string& key, int64_t default_val = 0) const;
     double get_float(const std::string& key, double default_val = 0.0) const;
 
+    // Build an architecture-prefixed metadata key, e.g. arch_key("block_count")
+    // -> "qwen2.block_count". GGUF namespaces hparams under general.architecture,
+    // so accessors resolve per-arch instead of being hardcoded to "llama.".
+    std::string arch_key(const std::string& suffix) const;
+
 private:
     bool parse_header();
     bool parse_kv();

@@ -8,6 +8,11 @@ Run GGUF models on AMD NPUs (Krackan / XDNA2).
 |---------|--------|
 | AMD NPU | Work in progress |
 
+Validated models (Q4_K_M, on `npu6` / Krackan): **Llama 3.2 1B**, **Qwen2.5-Coder
+1.5B**. Architecture support is metadata-driven (`general.architecture`), so other
+`llama`/`qwen2`-family GGUFs should load; non-pow2 hidden sizes and arbitrary FFN
+widths are handled by RMSNorm pad-to-pow2 and SiLU host-tiling.
+
 ## Native host setup
 
 `ggnpu` is intended to be built and run directly on the host. Docker is not used.

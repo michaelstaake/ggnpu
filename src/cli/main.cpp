@@ -871,7 +871,11 @@ int main(int argc, char* argv[]) {
     int num_layers = static_cast<int>(hparams.block_count);
     int num_heads = static_cast<int>(hparams.attention_head_count);
     int num_kv_heads = static_cast<int>(hparams.attention_head_count_kv);
+    // rope.dimension_count is optional in GGUF (e.g. qwen2 omits it); fall back to
+    // the natural head_dim = embedding / n_head. Both equal 64 for Llama 3.2 1B,
+    // and head_dim=128 for Qwen2.5 1.5B (rope is applied over the full head).
     int head_dim = static_cast<int>(hparams.rope_dimension_count);
+    if (head_dim == 0 && num_heads > 0) head_dim = hidden_size / num_heads;
     int ctx_size = static_cast<int>(model.hparams().context_length);
     float rms_eps = 1e-5f;
     if (hparams.attention_layer_norm_rms_epsilon > 0) {
@@ -1757,6 +1761,21 @@ int main(int argc, char* argv[]) {
                            params.verbose ? &step_timings.matmul_ms : nullptr);
 
             backend->sync();
+
+            // QKV bias (Qwen2 etc.): add the per-output-channel bias to each
+            // token's projection. Llama has no bias tensors, so this is a no-op
+            // there (find returns null). Biases are small F32 vectors.
+            auto add_qkv_bias = [&](const char* pattern, float* proj, int dim) {
+                const TensorView* b = find_tensor_pattern(model, pattern, layer);
+                if (!b || b->type != GgmlType::F32) return;
+                const float* bias = get_float_ptr(b);
+                for (int i = 0; i < n_tokens; i++)
+                    for (int j = 0; j < dim; j++)
+                        proj[static_cast<size_t>(i) * dim + j] += bias[j];
+            };
+            add_qkv_bias("blk.{layer}.attn_q.bias", q_proj.data(), hidden_size);
+            add_qkv_bias("blk.{layer}.attn_k.bias", k_proj.data(), num_kv_heads * head_dim);
+            add_qkv_bias("blk.{layer}.attn_v.bias", v_proj.data(), num_kv_heads * head_dim);
 
             {
                 ScopedTimer t(step_timings.rope_ms);

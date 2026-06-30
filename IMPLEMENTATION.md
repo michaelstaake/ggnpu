@@ -257,13 +257,26 @@ Implement per [GGUF spec](https://github.com/ggml-org/ggml/blob/master/docs/gguf
 
 ### Layer 2 — Architecture plugin (`src/arch/llama/`)
 
-| Priority | Arch | Quants |
-|----------|------|--------|
-| P0 | `llama` (3.2 1B/3B) | `Q4_K_M`, `Q8_0` |
-| P1 | `qwen2` | same |
-| P2 | `mistral`, `gemma2` | extend tensor maps |
+| Priority | Arch | Quants | Status |
+|----------|------|--------|--------|
+| P0 | `llama` (3.2 1B/3B) | `Q4_K_M`, `Q8_0` | **Validated** (1B) |
+| P1 | `qwen2` (2.5 1.5B) | `Q4_K_M` | **Validated** — coherent codegen on NPU |
+| P2 | `mistral`, `gemma2` | extend tensor maps | not yet |
 
 Map tensor names → roles (`attn_q`, `ffn_gate`, etc.). Handle GQA. Respect `llama.tensor_data_layout` permutes.
+
+**Multi-arch support is metadata-driven, not per-arch plugins.** GGUF namespaces
+hparams under `general.architecture`, so `GgufLoader::arch_key()` resolves
+`<arch>.<suffix>` (was hardcoded `llama.*`). What Qwen2 needed beyond Llama, all
+generic: (1) **QKV bias** — Qwen2 ships `attn_{q,k,v}.bias`; the forward pass adds
+them after the projections (no-op when absent, e.g. Llama). (2) **`rope.dimension_count`
+fallback** — optional in GGUF (Qwen2 omits it); fall back to `embedding/n_head`
+(=128 for Qwen2.5 1.5B). (3) **non-Llama sizes** — RMSNorm pads any hidden to the
+next pow2 (1536→2048) and SiLU host-tiles any FFN width through the fixed 8192
+kernel (Qwen2 FFN=8960), so no per-model kernel builds. (4) RoPE θ=1e6 and
+`rms_eps=1e-6` come straight from metadata. The bf16 RMSNorm validation gate was a
+gross-error detector tuned to Llama (~1.15% peak); widened to 2.5% to admit Qwen2's
+activation distribution (~1.68%) while still catching the old ~8% cast bug.
 
 ### Layer 3 — Quantization (`src/quant/`)
 

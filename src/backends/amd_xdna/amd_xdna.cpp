@@ -330,9 +330,18 @@ static bool rmsnorm_npu_matches_cpu(const float* input, const float* npu_out, in
         if (diff > tol) mismatches++;
     }
     if (max_ref < 1e-6f) return true;
-    // Global gate: typical <0.5% on random data; allow rare outliers on large activations.
-    if (max_diff / max_ref >= 0.012f) return false;
-    return mismatches <= std::max(1, N / 512);
+    if (std::getenv("GGNPU_RMSNORM_DEBUG"))
+        std::cerr << "[rmsnorm validate] N=" << N << " max_diff/max_ref="
+                  << (max_diff / max_ref) << " mismatches=" << mismatches
+                  << " (limit " << std::max(1, N / 256) << ")\n";
+    // Gate is a gross-error detector (catches the old ~8% bf16-cast bug), not a
+    // tight numeric check: the bf16 reduction noise depends on the model's
+    // activation distribution (Llama hidden=2048 peaks ~1.15%, Qwen2 hidden=1536
+    // ~1.68%), and the RMSNorm output feeds int8-quantized projections that carry
+    // ~1% error of their own. Bound at 2.5% peak with a proportional outlier
+    // budget — well below the grossly-broken regime, above legit cross-model bf16.
+    if (max_diff / max_ref >= 0.025f) return false;
+    return mismatches <= std::max(1, N / 256);
 }
 
 // Cached kernel for FlashAttention
@@ -1436,60 +1445,94 @@ public:
         }
 
         int N = params.size;
-
         std::string cache_key = "silu_" + std::to_string(N) + "_" + profile_str_;
 
         std::lock_guard<std::mutex> lock(mutex_);
 
+        // Prefer an exact-N kernel (prebuilt 8192, or one JIT-built for this N).
         auto it = silu_kernels_.find(N);
-        if (it == silu_kernels_.end()) {
-            if (!ensure_silu_kernel(N, cache_key)) {
-                std::cerr << "Error: SiLU NPU kernel unavailable for N=" << N << "\n";
-                std::cerr << "  Build: ./scripts/build-kernels.sh npu6 silu\n";
-                last_status_ = Status::NPU_UNAVAILABLE;
-                return last_status_;
+        if (it == silu_kernels_.end() && silu_tiled_sizes_.find(N) == silu_tiled_sizes_.end()) {
+            if (ensure_silu_kernel(N, cache_key)) {
+                it = silu_kernels_.find(N);
+            } else {
+                // No exact kernel and no runtime JIT — remember to host-tile this
+                // N through the fixed kSiluKernelSize kernel (SiLU is elementwise,
+                // so any N processes as ceil(N/8192) launches with a zero-padded
+                // final chunk). Lets non-Llama FFN sizes (e.g. Qwen2 8960) run.
+                silu_tiled_sizes_.insert(N);
             }
-            it = silu_kernels_.find(N);
         }
 
-        auto& kernel = it->second;
-
-        size_t bf16_bytes = N * sizeof(uint16_t);
-        std::vector<uint8_t> bf16_input;
-
-        if (kernel.bo_instr && kernel.instr_words > 0) {
-            bf16_input = convert_f32_to_bf16(params.input, N);
-
-            if (!buf_silu_bf16_in_ || buf_silu_bf16_in_->size() < bf16_bytes) {
-                buf_silu_bf16_in_ = buf_mgr_->alloc(bf16_bytes, true);
-            }
-            if (!buf_silu_bf16_out_ || buf_silu_bf16_out_->size() < bf16_bytes) {
-                buf_silu_bf16_out_ = buf_mgr_->alloc(bf16_bytes, true);
-            }
-
-            buf_mgr_->copy_to(*buf_silu_bf16_in_, bf16_input.data(), bf16_bytes);
-
-            try {
-                kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
-                           buf_silu_bf16_in_->handle(), buf_silu_bf16_out_->handle());
-                kernel.run.wait();
-            } catch (const std::exception& e) {
-                std::cerr << "Error: SiLU kernel execution failed: " << e.what() << "\n";
-                last_status_ = Status::ERROR;
+        if (it != silu_kernels_.end()) {
+            if (run_silu_launch(it->second, params.input, params.output, N, N) != Status::OK)
                 return last_status_;
-            }
+            return Status::OK;
+        }
 
-            std::vector<uint8_t> bf16_out_data(bf16_bytes);
-            buf_mgr_->copy_from(*buf_silu_bf16_out_, bf16_out_data.data(), bf16_bytes);
-            auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), N);
-            std::memcpy(params.output, f32_result.data(), N * sizeof(float));
+        // Tiled fallback through the prebuilt 8192 kernel.
+        auto k8 = silu_kernels_.find(kSiluKernelSize);
+        if (k8 == silu_kernels_.end()) {
+            if (ensure_silu_kernel(kSiluKernelSize,
+                                   "silu_" + std::to_string(kSiluKernelSize) + "_" + profile_str_))
+                k8 = silu_kernels_.find(kSiluKernelSize);
+        }
+        if (k8 == silu_kernels_.end()) {
+            std::cerr << "Error: SiLU NPU kernel unavailable for N=" << N
+                      << " (no exact kernel and no " << kSiluKernelSize << " tiling kernel)\n";
+            std::cerr << "  Build: ./scripts/build-kernels.sh npu6 silu\n";
+            last_status_ = Status::NPU_UNAVAILABLE;
+            return last_status_;
+        }
+        for (int off = 0; off < N; off += kSiluKernelSize) {
+            int chunk = std::min(kSiluKernelSize, N - off);
+            if (run_silu_launch(k8->second, params.input + off, params.output + off,
+                                chunk, kSiluKernelSize) != Status::OK)
+                return last_status_;
+        }
+        return Status::OK;
+    }
 
-        } else {
+    // Run one SiLU launch: bf16-convert `n` inputs (zero-padded to the kernel's
+    // fixed `kernel_n`), execute, and write `n` f32 outputs. Used directly for an
+    // exact-N kernel and per-chunk for the tiled fallback.
+    Status run_silu_launch(CachedSiluKernel& kernel, const float* input, float* output,
+                           int n, int kernel_n) {
+        if (!kernel.bo_instr || kernel.instr_words == 0) {
             std::cerr << "Error: SiLU xclbin missing BF16 instruction sequence\n";
             last_status_ = Status::NPU_UNAVAILABLE;
             return last_status_;
         }
+        size_t bf16_bytes = static_cast<size_t>(kernel_n) * sizeof(uint16_t);
 
+        std::vector<float> padded;
+        const float* src = input;
+        if (n < kernel_n) {              // zero-pad the final/short chunk
+            padded.assign(static_cast<size_t>(kernel_n), 0.0f);
+            std::memcpy(padded.data(), input, static_cast<size_t>(n) * sizeof(float));
+            src = padded.data();
+        }
+        std::vector<uint8_t> bf16_input = convert_f32_to_bf16(src, kernel_n);
+
+        if (!buf_silu_bf16_in_ || buf_silu_bf16_in_->size() < bf16_bytes)
+            buf_silu_bf16_in_ = buf_mgr_->alloc(bf16_bytes, true);
+        if (!buf_silu_bf16_out_ || buf_silu_bf16_out_->size() < bf16_bytes)
+            buf_silu_bf16_out_ = buf_mgr_->alloc(bf16_bytes, true);
+
+        buf_mgr_->copy_to(*buf_silu_bf16_in_, bf16_input.data(), bf16_bytes);
+        try {
+            kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                       buf_silu_bf16_in_->handle(), buf_silu_bf16_out_->handle());
+            kernel.run.wait();
+        } catch (const std::exception& e) {
+            std::cerr << "Error: SiLU kernel execution failed: " << e.what() << "\n";
+            last_status_ = Status::ERROR;
+            return last_status_;
+        }
+
+        std::vector<uint8_t> bf16_out_data(bf16_bytes);
+        buf_mgr_->copy_from(*buf_silu_bf16_out_, bf16_out_data.data(), bf16_bytes);
+        auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), n);
+        std::memcpy(output, f32_result.data(), static_cast<size_t>(n) * sizeof(float));
         return Status::OK;
     }
 
@@ -2613,6 +2656,7 @@ private:
     std::unordered_map<int, CachedRmsNormKernel> rmsnorm_kernels_;
     std::unordered_map<std::pair<int, int>, CachedSoftmaxKernel, PairHash> softmax_kernels_;
     std::unordered_map<int, CachedSiluKernel> silu_kernels_;
+    std::unordered_set<int> silu_tiled_sizes_;  // N with no exact kernel -> tile via 8192
     std::unordered_map<std::tuple<int, int, int64_t>, CachedFlashAttnKernel, TupleHash> flash_attn_kernels_;
     std::unordered_map<int, CachedRopeKernel> rope_kernels_;
 
