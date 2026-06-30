@@ -7,7 +7,6 @@ Run GGUF models on AMD NPUs (Krackan / XDNA2).
 | Backend | Status |
 |---------|--------|
 | AMD NPU | Work in progress |
-| Intel NPU | Implementation not currently in progress but planned for a later time |
 
 ## Native host setup
 

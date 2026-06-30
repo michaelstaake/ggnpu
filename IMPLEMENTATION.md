@@ -40,8 +40,6 @@ Build a standalone C++20 inference binary named `ggnpu` that:
 
 See **§9** and `docs/host-setup-guide.md`.
 
-**Future (not v1):** Intel NPU backend behind the same interface.
-
 ---
 
 ## 2. Hard constraints
@@ -385,8 +383,7 @@ ggnpu/
 │   ├── usage.md                   # CLI flags (≤80 lines)
 │   ├── architecture.md
 │   ├── amd-krackan.md
-│   ├── host-setup-guide.md
-│   └── intel-roadmap.md
+│   └── host-setup-guide.md
    ├── cmake/                         # FindXRT
 ├── third_party/                   # minimal only (xxhash, etc.)
 ├── include/ggnpu/
@@ -428,7 +425,6 @@ Work through these in order. Do not skip ahead.
 | 4 Full decoder layer | One layer vs CPU ref | **Done** — NPU matmuls + RMSNorm N=2048 + SiLU; flash_attn on host f32 |
 | 5 Inference MVP | Coherent text, Llama 1B ctx 2048 | **Done** — France prompt → Paris; `bench-logits` + `test_e2e_logits` regression |
 | 6 Production | Native deployment, 3B, L2 tiling | **Partial** — native setup documented; Llama 1B E2E validated on NPU; RMSNorm generalized to any hidden (1536/3072 via pad-to-pow2; 4096 kernel triggers AIR L2 split); batched RoPE on NPU (opt-in). Remaining: fused flash_attn, RoPE perf, 3B model validation |
-| 7 Intel stub | Interface research | **Not started** |
 
 ### Phase 0 — Scaffold
 
@@ -511,11 +507,6 @@ Coherent text runs with matmul + RMSNorm + SiLU on NPU and flash_attn on host f3
 - [ ] `docs/usage.md`, README quick start, `ggnpu --help` in sync
 
 **Done when:** New user runs inference using only `README.md` + `docs/host-setup-guide.md` on a native host install.
-
-### Phase 7 — Intel stub (after Phase 5)
-
-- [ ] `IntelNpuBackend` interface stub in `docs/intel-roadmap.md`
-- [ ] Panther Lake / Linux 7.0 NPU path research
 
 ### 7.1 Readiness snapshot
 

@@ -248,7 +248,7 @@ struct CliParams {
 };
 
 void print_help() {
-    std::cout << "ggnpu - Run GGUF AI Models on AMD and Intel NPUs\n\n";
+    std::cout << "ggnpu - Run GGUF AI Models on AMD NPUs\n\n";
     std::cout << "Usage:\n";
     std::cout << "  ggnpu [options]                    Text generation\n";
     std::cout << "  ggnpu --dump-tensors               List model tensors\n";
