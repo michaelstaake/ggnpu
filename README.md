@@ -225,6 +225,8 @@ These scripts check hardware, driver, permissions, XRT, and the local xclbin cac
 
 **Implementation spec:** [IMPLEMENTATION.md](IMPLEMENTATION.md) — complete handoff for contributors and AI agents.
 
+**Benchmark log:** [dev-benchmark.md](dev-benchmark.md) — running record of timed/correctness runs. **Append a new entry (commit, date, command, result) every time you run a benchmark or timed test.**
+
 **Full host setup guide:** [docs/host-setup-guide.md](docs/host-setup-guide.md)
 
 **Kernel builds:** Local kernel compilation requires `Triton-XDNA`. If you already have prebuilt `.xclbin` files, place them under `~/.cache/ggnpu/xclbin/`.

@@ -40,6 +40,17 @@ KERNELS = {
         "defaults": {"M": 256, "N": 256, "K": 256},
         "transform": "matmul_aie2p.mlir",
     },
+    "matmul_small_m": {
+        # Decode-optimized INT8 matmul: small M tile (16) instead of 256, so a
+        # single-token (M=1) decode matmul does not pay for 256 wasted output
+        # rows. Same INT8 datapath/transform as `matmul`; only BLOCK_SIZE_M
+        # shrinks. N/K stay 256 so the L3->L2 copy loops still tile (the M dim
+        # is not what PHASE 1 tiles). Probe toward usable decode throughput.
+        "description": "INT8 matmul, small M tile (decode GEMV)",
+        "params": ["M", "N", "K"],
+        "defaults": {"M": 16, "N": 256, "K": 256},
+        "transform": "matmul_small_m_aie2p.mlir",
+    },
     "matmul_bf16": {
         # bf16 A@B -> f32 C, reusing the int8 matmul transform with the contract
         # casts changed to bf16/f32 (16-bit packing is shared). Feasibility probe
@@ -508,6 +519,42 @@ def build_kernel_script(op: str, params: dict) -> str:
                 a, b, c, M, N, K,
                 a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
                 BLOCK_SIZE_M=256, BLOCK_SIZE_N=256, BLOCK_SIZE_K=K,
+            )
+        """)
+        kernel_src = textwrap.dedent("""
+            @triton.jit
+            def matmul_kernel(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                stride_am: tl.constexpr, stride_ak: tl.constexpr,
+                stride_bk: tl.constexpr, stride_bn: tl.constexpr,
+                stride_cm: tl.constexpr, stride_cn: tl.constexpr,
+                BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr):
+                pid_m = tl.program_id(0)
+                pid_n = tl.program_id(1)
+                offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+                offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+                offs_k = tl.arange(0, BLOCK_SIZE_K)
+                a_block = tl.load(A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+                b_block = tl.load(B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+                c_block = tl.dot(a_block, b_block)
+                tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, c_block)
+        """)
+
+    elif op == "matmul_small_m":
+        # Same kernel body as matmul, but launched with a small BLOCK_SIZE_M so
+        # the compute herd does less wasted M-row work for decode (M=1 padded
+        # to BLOCK_SIZE_M). N/K block sizes stay 256 so the transform's L3->L2
+        # copy loops still have something to tile.
+        block_m = p.get("M", 16)
+        launch = textwrap.dedent(f"""
+            M, N, K = {block_m}, {p.get("N", 256)}, {p.get("K", 256)}
+            a = torch.randint(-8, 8, (M, K), dtype=torch.int8)
+            b = torch.randint(-8, 8, (K, N), dtype=torch.int8)
+            c = torch.zeros((M, N), dtype=torch.int32)
+            grid = lambda META: (triton.cdiv(M, META["BLOCK_SIZE_M"]), triton.cdiv(N, META["BLOCK_SIZE_N"]))
+            compiled = matmul_kernel[grid](
+                a, b, c, M, N, K,
+                a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+                BLOCK_SIZE_M={block_m}, BLOCK_SIZE_N=256, BLOCK_SIZE_K=K,
             )
         """)
         kernel_src = textwrap.dedent("""

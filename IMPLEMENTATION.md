@@ -8,6 +8,8 @@ This document is the complete specification for building **ggnpu**: a custom lla
 
 **Verdict:** The supported path is host-native: install host prerequisites, build `ggnpu` locally, and provide local `.xclbin` + `*_sequence.bin` kernels under `~/.cache/ggnpu/xclbin/`.
 
+**Benchmark log:** Every timed/correctness run is recorded in [dev-benchmark.md](dev-benchmark.md) (commit, date, command, result). **Append a new entry whenever you run a benchmark or timed test** — it is the historical performance record. Latest (commit `8959e21`): Llama 3.2 1B Q4_K_M ≈ **1.0 tok/s**, runtime is **82% matmul + 16% logits** — throughput is matmul-bound, not attention-bound.
+
 ---
 
 ## 1. Mission
@@ -615,10 +617,39 @@ removing them yields ~0 net. Two attempts, both measured on hardware:
   pinned BOs + 19k allocations. Reverted.
 
 **Conclusion:** steady-state matmul (~70 µs/tile, batch 24) is bounded by the
-256³ INT8 **device kernel**, not host/driver overhead. The only real lever is
-fewer/bigger launches — a larger-K or matvec (M=1) kernel — which needs a new
-xclbin, and there is **no in-repo generator** (same wall as the attention note).
-Kept the one free win: default `GGNPU_MATMUL_BATCH_SIZE` 8 → 24 (~8%).
+256³ INT8 **device kernel**, not host/driver overhead. The real lever is a
+**small-M kernel**: decode is M=1, but the 256³ kernel computes 256 M-rows, so
+255/256 of each tile's row-compute is wasted. Kept the one free win: default
+`GGNPU_MATMUL_BATCH_SIZE` 8 → 24 (~8%).
+
+#### Small-M matmul kernel (WIP — transform compiles at M=16, 2026-06-29)
+
+A decode-optimized INT8 matmul tile (`matmul_small_m` in `compile_kernels.py`,
+transform `matmul_small_m_aie2p.mlir`) is in progress. Findings from the probe:
+
+- **Naively shrinking `BLOCK_SIZE_M` fails.** M ≤ 64 dies in `airrt-to-npu` with
+  `memref.alloc inside air.herd must have memory space >= L1, but found L3` (the
+  packed A tile). Root cause: at M ≤ 64 the packed-M dim (M/8) ≤ 8, so PHASE 5's
+  `tile_using_forall [8,8,0]` collapses the M herd dimension to a **unit tile**;
+  A becomes loop-invariant across the N-only forall, gets hoisted out of the
+  herd, and is never promoted to L1. The herd *does* form — only A promotion fails.
+- **Fix:** PHASE 5 herd tile `[8,8,0] → [1,8,0]`. M-packed=2 (M=16) now splits
+  into 2 groups (non-unit M dim) → A varies across the herd and promotes to L1.
+  M=16 compiles to a valid xclbin; herd ≈ 2 M-groups × 4 N-groups = 8 cores,
+  **8 rows/core** vs the baseline's 64 → the per-core work drop that gives the win.
+- **Why M=128 is not the answer:** it compiles unchanged but gives *no* decode
+  speedup — per-core work is still 64 M-rows (8 packed); shrinking M just drops
+  core count proportionally. The win requires per-core M-rows < 64, i.e. the
+  `[1,8,0]` fine M-tiling at small M, not a bigger M.
+- **Tooling:** direct `compile_kernels.py` runs need
+  `LD_LIBRARY_PATH=third_party/boost-lib/usr/lib/x86_64-linux-gnu` for
+  `xclbinutil` (otherwise missing `libboost_filesystem.so.1.90.0`).
+  `build-kernels.sh` already sets this.
+
+**Still pending (next phase):** numerical validation (needs the C++ dispatch in
+`mul_mat_q` to route M ≤ 16 calls to the small-M xclbin with a 16-row M tile;
+the 256³ host tiling can't exercise it) and an end-to-end perf/`test_e2e_logits`
+run. Compiles + herds is the structural gate, **not** proof of correctness.
 
 #### Recently fixed (kernels / layer bench)
 
