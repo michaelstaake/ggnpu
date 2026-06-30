@@ -715,7 +715,8 @@ int main(int argc, char* argv[]) {
         std::vector<std::tuple<int, int, int>> sizes = {
             {1, 256, 256},       // decode GEMV (exercises small-M kernel)
             {16, 256, 256},      // small-M tile, full M
-            {1, 2048, 2048},     // decode attn_q shape
+            {1, 2048, 2048},     // decode attn_q shape (single deep-K span)
+            {1, 256, 8192},      // decode ffn_down shape (4 deep-K spans, host accum)
             {256, 256, 256},
             {512, 512, 512},
             {1024, 1024, 1024},

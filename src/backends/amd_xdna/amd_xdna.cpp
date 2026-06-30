@@ -39,6 +39,11 @@ constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256
 // mul_mat_q routes M<=kSmallMTile to it when matmul_small_m_<profile>.xclbin is
 // present (override off with GGNPU_NO_SMALL_M=1).
 constexpr int kSmallMTile = 16;
+// Deep-K decode matmul: the small-M kernel recompiled with the K reduction done
+// in-kernel at this width instead of 256, so one launch replaces K/256 separate
+// tile launches + host accumulation. mul_mat_q uses it for M<=16 matmuls whose K
+// is a multiple of kDeepK (override off with GGNPU_NO_DEEPK=1).
+constexpr int kDeepK = 2048;
 // Prebuilt rmsnorm xclbin is M=1,N=2048 bf16 (Llama 3.2 hidden). Legacy 32x256
 // xclbins still work for N=256 bench sizes; rebuild with compile_kernels.py for 2048.
 constexpr int kRmsnormKernelCols = 256;
@@ -432,10 +437,20 @@ public:
         const bool use_small_m = (M <= kSmallMTile) &&
                                  (std::getenv("GGNPU_NO_SMALL_M") == nullptr) &&
                                  ensure_matmul_small_m_kernel();
-        CachedMatmulKernel& active_kernel = use_small_m ? matmul_small_m_kernel_ : kernel;
+        // Deep-K: when the matmul is small-M and K is a whole number of kDeepK
+        // spans, fold the K reduction into the kernel (one launch per kDeepK of K
+        // instead of kDeepK/256 launches). Same INT8 datapath; only the K extent
+        // per launch grows, so A/B/C packing generalizes with T_k.
+        const bool use_deepk = use_small_m && (K % kDeepK == 0) &&
+                               (std::getenv("GGNPU_NO_DEEPK") == nullptr) &&
+                               ensure_matmul_small_m_deepk_kernel();
+        CachedMatmulKernel& active_kernel = use_deepk ? matmul_small_m_deepk_kernel_
+                                            : use_small_m ? matmul_small_m_kernel_ : kernel;
         std::vector<MatmulPipelineSlot>& slots =
-            use_small_m ? matmul_small_m_slots_ : matmul_slots_;
+            use_deepk ? matmul_small_m_deepk_slots_
+            : use_small_m ? matmul_small_m_slots_ : matmul_slots_;
         const int T_m = use_small_m ? kSmallMTile : kMatmulTile;
+        const int T_k = use_deepk ? kDeepK : kMatmulTile;  // K extent per launch
 
         if (!active_kernel.bo_instr || active_kernel.instr_words == 0) {
             std::cerr << "Error: matmul instruction sequence (matmul_" << profile_str_
@@ -444,9 +459,12 @@ public:
             return last_status_;
         }
 
-        constexpr int T = kMatmulTile;
-        size_t tile_bytes_in = static_cast<size_t>(T) * T;                  // int8
-        size_t tile_bytes_out = static_cast<size_t>(T) * T * sizeof(int32_t);
+        constexpr int T = kMatmulTile;  // N tile + C row width (output is M x N)
+        // A is [T_m x T_k], B is [T_k x T], C is [T_m x T] (int32). For the 256^3
+        // and 256-K small-M paths T_k == T so these are all 256*256.
+        size_t tile_bytes_a = static_cast<size_t>(T_m) * T_k;               // int8
+        size_t tile_bytes_b = static_cast<size_t>(T_k) * T;                 // int8
+        size_t tile_bytes_out = static_cast<size_t>(T_m) * T * sizeof(int32_t);
 
         // Batch size: number of tiles to submit before waiting. Deeper batches
         // let the device overlap kernel execution with host packing/DMA of later
@@ -465,9 +483,9 @@ public:
         float* C = static_cast<float*>(params.C);
         std::fill(C, C + static_cast<size_t>(M) * N, 0.0f);
 
-        std::vector<int8_t> a_tile(static_cast<size_t>(T) * T);
-        std::vector<int8_t> b_tile(static_cast<size_t>(T) * T);
-        std::vector<int32_t> c_tile(static_cast<size_t>(T) * T);
+        std::vector<int8_t> a_tile(tile_bytes_a);
+        std::vector<int8_t> b_tile(tile_bytes_b);
+        std::vector<int32_t> c_tile(static_cast<size_t>(T_m) * T);
 
         auto to_i8 = [](float v) -> int8_t {
             float r = std::nearbyint(v);
@@ -573,7 +591,8 @@ public:
             if (batch.empty()) return Status::OK;
 
             const int n = static_cast<int>(batch.size());
-            ensure_matmul_pipeline_slots(slots, active_kernel.krnl, n, tile_bytes_in, tile_bytes_out);
+            ensure_matmul_pipeline_slots(slots, active_kernel.krnl, n, tile_bytes_a,
+                                         tile_bytes_b, tile_bytes_out);
 
             auto batch_submit_start = do_timing ? std::chrono::high_resolution_clock::now()
                                                 : std::chrono::high_resolution_clock::time_point{};
@@ -589,7 +608,7 @@ public:
                 for (int row = 0; row < work.mc; row++) {
                     const float inv_a = 1.0f / a_scales[static_cast<size_t>(work.m0 + row)];
                     for (int k = 0; k < work.kc; k++)
-                        a_tile[row * T + k] =
+                        a_tile[row * T_k + k] =
                             to_i8(A[(work.m0 + row) * params.lda + (work.k0 + k)] * inv_a);
                 }
                 if (do_timing) {
@@ -610,11 +629,11 @@ public:
 
                 auto t_dma_a_start = do_timing ? std::chrono::high_resolution_clock::now()
                                                : std::chrono::high_resolution_clock::time_point{};
-                // DMA only the real M rows of A. Rows [mc, T) in the device buffer
-                // hold stale data and produce output rows we never read back, so
-                // skipping them is safe and saves up to T/mc (256x for decode).
+                // DMA only the real M rows of A. Rows [mc, T_m) in the device
+                // buffer hold stale data and produce output rows we never read
+                // back, so skipping them is safe and saves up to T_m/mc.
                 buf_mgr_->copy_to(*slot.buf_a, a_tile.data(),
-                                  static_cast<size_t>(work.mc) * T);
+                                  static_cast<size_t>(work.mc) * T_k);
                 if (do_timing) {
                     total_dma_a_ms += std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t_dma_a_start).count();
@@ -622,7 +641,7 @@ public:
 
                 auto t_dma_b_start = do_timing ? std::chrono::high_resolution_clock::now()
                                                : std::chrono::high_resolution_clock::time_point{};
-                buf_mgr_->copy_to(*slot.buf_b, b_data.data(), tile_bytes_in);
+                buf_mgr_->copy_to(*slot.buf_b, b_data.data(), tile_bytes_b);
                 if (do_timing) {
                     total_dma_b_ms += std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t_dma_b_start).count();
@@ -701,8 +720,8 @@ public:
             int mc = std::min(T_m, M - m0);
             for (int n0 = 0; n0 < N; n0 += T) {
                 int nc = std::min(T, N - n0);
-                for (int k0 = 0; k0 < K; k0 += T) {
-                    int kc = std::min(T, K - k0);
+                for (int k0 = 0; k0 < K; k0 += T_k) {
+                    int kc = std::min(T_k, K - k0);
 
                     TileWork work{m0, mc, n0, nc, k0, kc, {B_int8_base, n0, k0, nc, kc, K}, kq_path};
                     batch.push_back(work);
@@ -1662,7 +1681,8 @@ private:
     // Load or compile the matmul xclbin for the target NPU profile
     void ensure_matmul_pipeline_slots(std::vector<MatmulPipelineSlot>& slots,
                                       const xrt::kernel& krnl, int slot_count,
-                                      size_t tile_bytes_in, size_t tile_bytes_out) {
+                                      size_t tile_bytes_a, size_t tile_bytes_b,
+                                      size_t tile_bytes_out) {
         if (slot_count <= 0) return;
         const size_t need = static_cast<size_t>(slot_count);
         if (slots.size() < need) {
@@ -1679,10 +1699,10 @@ private:
                 slot.run = xrt::run(krnl);
                 slot.run_initialized = true;
             }
-            if (!slot.buf_a || slot.buf_a->size() < tile_bytes_in)
-                slot.buf_a = buf_mgr_->alloc(tile_bytes_in, true);
-            if (!slot.buf_b || slot.buf_b->size() < tile_bytes_in)
-                slot.buf_b = buf_mgr_->alloc(tile_bytes_in, true);
+            if (!slot.buf_a || slot.buf_a->size() < tile_bytes_a)
+                slot.buf_a = buf_mgr_->alloc(tile_bytes_a, true);
+            if (!slot.buf_b || slot.buf_b->size() < tile_bytes_b)
+                slot.buf_b = buf_mgr_->alloc(tile_bytes_b, true);
             if (!slot.buf_c || slot.buf_c->size() < tile_bytes_out)
                 slot.buf_c = buf_mgr_->alloc(tile_bytes_out, true);
         }
@@ -1865,6 +1885,46 @@ private:
         } catch (const std::exception& e) {
             std::cerr << "Warning: failed to load matmul_small_m kernel: " << e.what() << "\n";
             matmul_small_m_unavailable_ = true;
+            return false;
+        }
+    }
+
+    // Lazily load the deep-K decode matmul xclbin (matmul_small_m_deepk_<profile>
+    // .xclbin, M=16 N=256 K=kDeepK INT8). Returns false (cached) when absent so
+    // callers fall back to the 256-K-tiled small-M path.
+    bool ensure_matmul_small_m_deepk_kernel() {
+        if (matmul_small_m_deepk_loaded_) return true;
+        if (matmul_small_m_deepk_unavailable_) return false;
+        std::string name = "matmul_small_m_deepk_" + profile_str_ + ".xclbin";
+        std::string path = detail::find_prebuilt_xclbin(name, cache_dir_);
+        if (path.empty() && cache_->has_xclbin(name)) path = cache_->get_xclbin_path(name);
+        if (path.empty()) {
+            matmul_small_m_deepk_unavailable_ = true;
+            return false;
+        }
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) { matmul_small_m_deepk_unavailable_ = true; return false; }
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);  // keep context alive
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
+            CachedMatmulKernel cached{std::move(krnl), {}, 0,
+                                      kSmallMTile, kMatmulTile, kDeepK, GgmlType::I8};
+            std::string seq = detail::find_prebuilt_sequence(name, cache_dir_);
+            if (!seq.empty()) {
+                load_instr_bo(*device_, cached.krnl, cached.bo_instr, cached.instr_words, seq);
+            }
+            if (!cached.bo_instr || cached.instr_words == 0) {
+                std::cerr << "Error: matmul_small_m_deepk xclbin missing instruction sequence\n";
+                matmul_small_m_deepk_unavailable_ = true;
+                return false;
+            }
+            matmul_small_m_deepk_kernel_ = std::move(cached);
+            matmul_small_m_deepk_loaded_ = true;
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load matmul_small_m_deepk kernel: " << e.what() << "\n";
+            matmul_small_m_deepk_unavailable_ = true;
             return false;
         }
     }
@@ -2468,6 +2528,15 @@ private:
     bool matmul_small_m_loaded_ = false;
     bool matmul_small_m_unavailable_ = false;
     std::vector<MatmulPipelineSlot> matmul_small_m_slots_;
+
+    // Deep-K decode matmul (M=16, N=256, K=2048): does the whole K-reduction
+    // in-kernel so one launch replaces the 8 separate 256-K-tile launches +
+    // host accumulation a K=2048 matmul otherwise needs. Loaded from
+    // matmul_small_m_deepk_<profile>.xclbin; separate pipeline slots.
+    CachedMatmulKernel matmul_small_m_deepk_kernel_;
+    bool matmul_small_m_deepk_loaded_ = false;
+    bool matmul_small_m_deepk_unavailable_ = false;
+    std::vector<MatmulPipelineSlot> matmul_small_m_deepk_slots_;
 
     std::shared_ptr<XrtBuffer> buf_rmsnorm_in_;
     std::shared_ptr<XrtBuffer> buf_rmsnorm_out_;

@@ -210,6 +210,7 @@ FAILED=0
 Kernels=(
     "matmul:--M 256 --N 256 --K 256"
     "matmul_small_m:--M 16 --N 256 --K 256"
+    "matmul_small_m_deepk:--M 16 --N 256 --K 2048"
     "rmsnorm:--M 32 --N 256"
     "rmsnorm_2048:--M 2 --N 2048"
     "rmsnorm_4096:--M 2 --N 4096"

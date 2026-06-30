@@ -547,7 +547,7 @@ Production commands use the **native host build** (§9). NPU ops (matmul, rmsnor
 | Flash attention fused opt-in | `amd_xdna.cpp` | `GGNPU_FLASH_ATTN_FUSED=1` + experimental xclbin; default is host f32 |
 | RMSNorm xclbin staleness | `build-kernels.sh`, `rmsnorm_aie2p.mlir` | Old `rmsnorm_2048` xclbins (~8% error) must be rebuilt after mlir fix |
 | SiLU FFN=8192 on NPU | `amd_xdna.cpp` | **Works** when `silu_npu6.xclbin` present |
-| Matmul perf: host-side tiling | `amd_xdna.cpp` | Host weight-tile cache; per-tile DMA (device persist deferred) |
+| Matmul perf: host-side tiling | `amd_xdna.cpp` | Host weight-tile cache; per-tile DMA. Decode uses small-M (M=16) + **deep-K (in-kernel K=2048 reduction, ~2× decode)**; device weight persist deferred |
 | RoPE | `main.cpp`, `amd_xdna.cpp` | NPU batched kernel (`rope_batched`, opt-in `GGNPU_NPU_ROPE=1`) + CPU default; correct Llama 3 math |
 | Logits projection | `main.cpp` | NPU INT8 mul_mat_q with WeightCache decode (Q4_K/Q6_K); CPU fallback for F32 weights |
 | Residual adds on CPU | `main.cpp` | Cheap; acceptable for MVP |
@@ -665,6 +665,49 @@ with more waste — so (2,4) at M=16 is the sweet spot.
   `build-kernels.sh` already sets this, and now builds `matmul_small_m`.
 - **Validation hook:** `bench-matmul` includes M ∈ {1, 16} shapes (A=B=1 → C=K
   known-answer) that exercise the small-M kernel directly.
+
+#### Deep-K decode matmul — **VALIDATED** (~2× decode, in-kernel K reduction, 2026-06-30)
+
+After small-M, profiling showed decode matmul was bounded by **fixed per-launch
+device overhead** (~13 µs/tile, ~35× the actual MACs), not the MACs or DMA. A
+K=2048 matmul tiled K at 256 paid that overhead **8×** (8 separate launches +
+host f32 accumulation of the 8 partial Cs). `matmul_small_m_deepk`
+(`compile_kernels.py` + the **same** `matmul_small_m_aie2p.mlir` transform) is the
+small-M kernel compiled at **K=2048**: the Triton `tl.dot` is unchanged and the
+transform's PHASE 4 K-reduction loop (tile factor 8 packed = 64 raw K) simply
+iterates 32× instead of 4×, accumulating across all of K in the L1 packed-C
+buffer. One launch now replaces 8. No transform edits were needed — only the
+launch `BLOCK_SIZE_K`.
+
+`mul_mat_q` routes a small-M (M ≤ 16) matmul to the deep-K kernel when `K %
+kDeepK == 0` (`kDeepK = 2048`); opt out with `GGNPU_NO_DEEPK=1`. K=8192
+(ffn_down) runs as 4 deep-K spans accumulated on the host. The host path
+generalizes the K tile to `T_k` (256 or 2048): A is `[T_m × T_k]`, B is
+`[T_k × 256]`, C is `[T_m × 256]` int32; B-tile cache, packing strides, and
+batched pipeline are otherwise identical. The per-tile B weight DMA grows to
+512 KB but there are 8× fewer tiles, so total cached weight bytes and DMA are
+unchanged.
+
+**Result (Llama 3.2 1B Q4_K_M, 21 token steps, same build A/B):**
+
+| op | small-M K=256 (`GGNPU_NO_DEEPK=1`) | deep-K | Δ |
+|----|------|------|------|
+| matmul | 12211.8 ms | 6206.1 ms | **−49.2%** |
+| logits | 2581.4 ms | 1366.1 ms | −47.1% |
+| **total** | 15255.0 ms | 7980.5 ms | **−47.7%** (1.38 → 2.63 tok/s) |
+
+Correct on hardware: `bench-matmul` `1×2048×2048` (single span) and `1×8192×256`
+(4 spans, host accum) PASS (A=B=1 → C=K); `test_e2e_logits` PASS;
+`compare_logits.py --check` → top-1 ` Paris`. The int8 values and int32 partial
+sums are bit-identical to the K=256 path; deep-K just replaces 8 host f32
+partial-sum adds with one f32 scale, so it is at least as accurate (greedy output
+can still diverge after a near-tie). Cumulative vs the original 256³ path:
+**2.37× faster decode**.
+
+The next matmul lever is widening N per launch (amortize the same overhead across
+N too) and/or cutting the now-exposed 512 KB/tile weight DMA (~19% of per-launch
+time), e.g. resident weight BOs — re-evaluate now that device compute shrank
+again. Both are kernel-shape work (the matmul transform generator isn't in-repo).
 
 #### Recently fixed (kernels / layer bench)
 
@@ -876,7 +919,7 @@ python3 scripts/compare_logits.py --check --ref  # + logit vs llama-cpp-python
 
 1. **Fused flash attention on NPU** — blocked on upstream Triton-XDNA fix for multi-reduction kernels. Workaround: host f32 decomposed path is production-quality. See §7.1 Known limitation for kernel restructuring options.
 2. **RoPE on NPU** — working transform for gather/pair-shuffle loads.
-3. **Matmul perf:** batch tile runs, persist converted weight tiles, larger fixed-shape xclbins.
+3. **Matmul perf:** batched tiles (done), small-M decode kernel (done), **deep-K in-kernel reduction (done, ~2× decode)**. Remaining: widen N per launch (amortize per-launch overhead across N too); cut the now-exposed 512 KB/tile weight DMA (resident weight BOs — re-evaluate now that device compute shrank again).
 4. **Phase 6:** 3B model, L2-aware tiling, production docs/errors, optional prebuilt xclbin distribution.
 
 ### 7.2 Memory constraints (16 GB RAM dev machine)
@@ -1131,7 +1174,7 @@ When generating NPU kernel code (`kernels/triton/`), **always** apply the four g
 
 1. **NPU attention** — decomposed path **works, opt-in** (`GGNPU_NPU_ATTN=1`): QK/AV as bf16 GEMMs (`matmul_bf16`) + host softmax (`flash_attn_npu`). Validated, but slow due to 256³ tile padding on attention's degenerate dims — next is perf (QK/AV-shaped xclbins, head batching) before it can replace the host f32 default. Fused single-kernel attention remains blocked (§7.1 Known limitation, no `air.herd`).
 2. **RoPE on NPU perf** — wired and validated (`rope_batched`, ~8 heads/launch); opt-in until per-token launch overhead is tuned to beat CPU.
-3. **Matmul perf:** batch tiles, weight-tile persistence, larger xclbins.
+3. **Matmul perf:** batched tiles + small-M + **deep-K in-kernel reduction (done, ~2× decode, `matmul_small_m_deepk`)**. Remaining: widen N per launch; resident weight BOs to cut the now-exposed 512 KB/tile DMA.
 4. **Phase 6:** 3B, L2 tiling, production polish; keep `README.md`, `docs/host-setup-guide.md`, and §9–§10 aligned.
 5. **Hygiene:** rebuild `rmsnorm_2048` after mlir changes; clear `~/.cache/ggnpu/weights/` after Q4_K/Q6_K decoder changes.
 

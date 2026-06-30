@@ -51,6 +51,19 @@ KERNELS = {
         "defaults": {"M": 16, "N": 256, "K": 256},
         "transform": "matmul_small_m_aie2p.mlir",
     },
+    "matmul_small_m_deepk": {
+        # Deep-K decode matmul: identical to matmul_small_m (M=16, N=256) but the
+        # K reduction is done entirely in-kernel at K=2048 instead of K=256. The
+        # transform's PHASE 4 K-reduction loop (tile factor 64) just iterates 32x
+        # instead of 4x, accumulating in the L1 packed-C buffer, so one launch
+        # replaces the 8 separate 256-K-tile launches + host accumulation a
+        # K=2048 matmul currently needs. Collapses ~8x of the per-launch device
+        # overhead that dominates decode. Same transform/datapath as small_m.
+        "description": "INT8 matmul, small M + deep K=2048 (in-kernel reduction)",
+        "params": ["M", "N", "K"],
+        "defaults": {"M": 16, "N": 256, "K": 2048},
+        "transform": "matmul_small_m_aie2p.mlir",
+    },
     "matmul_bf16": {
         # bf16 A@B -> f32 C, reusing the int8 matmul transform with the contract
         # casts changed to bf16/f32 (16-bit packing is shared). Feasibility probe
@@ -539,7 +552,7 @@ def build_kernel_script(op: str, params: dict) -> str:
                 tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, c_block)
         """)
 
-    elif op == "matmul_small_m":
+    elif op in ("matmul_small_m", "matmul_small_m_deepk"):
         # Same kernel body as matmul, but launched with a small BLOCK_SIZE_M so
         # the compute herd does less wasted M-row work for decode (M=1 padded
         # to BLOCK_SIZE_M). N/K block sizes stay 256 so the transform's L3->L2

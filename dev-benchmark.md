@@ -13,6 +13,54 @@ Hardware unless noted: AMD Ryzen AI 7 350 (Krackan / XDNA2 / `npu6`),
 
 ---
 
+## 2026-06-30 — deep-K decode matmul (in-kernel K=2048 reduction), ~2× decode
+
+New `matmul_small_m_deepk` xclbin (M=16, N=256, **K=2048**) folds the whole K
+reduction into one kernel launch instead of issuing K/256 separate 256³ tile
+launches accumulated on the host. `mul_mat_q` routes small-M matmuls whose K is a
+multiple of `kDeepK` (2048) to it (opt out `GGNPU_NO_DEEPK=1`); K=8192 (ffn_down)
+runs as 4 deep-K spans accumulated on the host. Same INT8 datapath/transform as
+small-M — only the K extent per launch grows (the transform's PHASE 4 K-reduction
+loop just iterates 32× instead of 4×, accumulating in the L1 packed-C buffer). On
+commit after `53542da` (uncommitted working tree).
+
+**Why it works:** the prior profile showed decode matmul was bounded by
+fixed per-launch device overhead (~13 µs/tile, ~35× the actual MACs), not the
+MACs or DMA. A K=2048 matmul paid that overhead 8× (8 K-tiles). Deep-K pays it
+once, so kernel-wait per output block drops ~8×.
+
+**Correctness (all on hardware)**
+- `bench-matmul`: `1×2048×2048` (single deep-K span) and `1×8192×256` (4 spans,
+  host accum) both PASS (A=B=1 → C=K). 256³…4096³ paths unchanged.
+- `test_e2e_logits` PASS (25 s); `compare_logits.py --check` → top-1 ` Paris`
+  (id 12366).
+- France prompt n=16 → ` Paris, and it is the most visited city in the world…` ✅
+  (greedy output diverges from the K=256 path after a near-tie; top-1 logit is
+  identical — deep-K does one int32 accumulation + one f32 scale vs 8 host f32
+  partial sums, so it is at least as accurate).
+
+**Perf A/B — same build, `-v`, 21 token steps, France prompt n=16**
+
+```
+./build-npu/ggnpu -v -m models/llama-3.2-1b-q4_k_m.gguf \
+  -p "The capital of France is" -c 2048 -n 16            # deep-K ON (default)
+GGNPU_NO_DEEPK=1 ./build-npu/ggnpu -v ... -n 16          # small-M K=256 baseline
+```
+
+| op | small-M K=256 | deep-K K=2048 | Δ |
+|----|------|------|------|
+| matmul | 12211.8 ms | 6206.1 ms | **−49.2%** |
+| logits | 2581.4 ms | 1366.1 ms | −47.1% |
+| **total** | 15255.0 ms | 7980.5 ms | **−47.7%** |
+| tok/s | ~1.38 | **~2.63** | **+91%** |
+
+Cumulative vs the original 256³ path (18902 ms, 2026-06-30 small-M entry):
+**2.37× faster decode** (256³ → small-M → deep-K). Matmul is still the top cost
+(78%) + logits (17%); the next lever would be a deep-K kernel that also widens N
+or reduces the 512 KB/tile weight DMA (now ~19% of per-launch time).
+
+---
+
 ## 2026-06-30 — small-M matmul kernel validated (branch `matmul-small-m-wip`)
 
 Decode-optimized `matmul_small_m` xclbin (M=16, N=K=256) now correct on hardware
