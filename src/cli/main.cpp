@@ -1760,12 +1760,15 @@ int main(int argc, char* argv[]) {
     const TensorView* ple_proj_norm = is_gemma ? find_tensor(model, "per_layer_proj_norm.weight") : nullptr;
 
     // Gemma4 RMSNorm: raw weight (this arch stores the full scale, no (1+w)
-    // offset — verified against the reference graph). Host; sizes 256/512/1536.
-    auto g_rmsnorm = [](float* out, const float* in, int n, const float* w, float eps) {
-        double ss = 0.0;
-        for (int i = 0; i < n; i++) ss += static_cast<double>(in[i]) * in[i];
-        float scale = 1.0f / std::sqrt(static_cast<float>(ss / n) + eps);
-        for (int i = 0; i < n; i++) out[i] = in[i] * scale * w[i];
+    // offset — verified against the reference graph). Sizes 256/512/1536, all
+    // NPU-dispatched via the existing `rms_norm` helper (any N via
+    // next_pow2 padding; weight applied host-side inside backend->rms_norm()).
+    auto g_rmsnorm = [&](float* out, const float* in, int n, const float* w, float eps) -> bool {
+        if (!rms_norm(out, in, 1, n, eps, w)) {
+            model.unload();
+            return false;
+        }
+        return true;
     };
     // Gemma NeoX RoPE (rotate halves i, i+hd/2), per-layer freq base, over full head_dim.
     auto g_rope = [](float* v, int n_heads, int hd, int64_t pos, float base) {
@@ -1859,7 +1862,7 @@ int main(int argc, char* argv[]) {
                 for (int L = 0; L < num_layers; L++) {
                     float* slice = ple_ctx.data() + static_cast<size_t>(L) * ple_dim;
                     for (int i = 0; i < ple_dim; i++) slice[i] *= ctx_scale;
-                    g_rmsnorm(slice, slice, ple_dim, plpn, rms_eps);
+                    if (!g_rmsnorm(slice, slice, ple_dim, plpn, rms_eps)) return 1;
                 }
                 const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
                 for (int i = 0; i < ple_total; i++)
@@ -1886,7 +1889,7 @@ int main(int argc, char* argv[]) {
                 const TensorView* postffw_w = find_tensor_pattern(model, "blk.{layer}.post_ffw_norm.weight", L);
 
                 // Attention input norm.
-                g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(attn_norm_w), rms_eps);
+                if (!g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(attn_norm_w), rms_eps)) return 1;
 
                 // Q projection -> per-head QK-norm -> RoPE.
                 q.assign(qdim, 0.0f);
@@ -1926,7 +1929,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 for (int h = 0; h < num_heads; h++)
-                    g_rmsnorm(q.data() + h * hd, q.data() + h * hd, hd, get_float_ptr(qn_w), rms_eps);
+                    if (!g_rmsnorm(q.data() + h * hd, q.data() + h * hd, hd, get_float_ptr(qn_w), rms_eps)) return 1;
                 g_rope(q.data(), num_heads, hd, pos, gl.rope_base);
                 // Gemma4 attention scale is 1.0 (f_attention_scale); the host
                 // flash_attn bakes in 1/sqrt(head_dim), so pre-scale Q by sqrt(hd)
@@ -1947,15 +1950,10 @@ int main(int argc, char* argv[]) {
                     mul_mat_weight(xn.data(), v_w, vbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd);
                     backend->sync();
                     // K: RMSNorm with attn_k_norm weight, then RoPE.
-                    g_rmsnorm(kbuf.data(), kbuf.data(), hd, get_float_ptr(kn_w), rms_eps);
+                    if (!g_rmsnorm(kbuf.data(), kbuf.data(), hd, get_float_ptr(kn_w), rms_eps)) return 1;
                     g_rope(kbuf.data(), 1, hd, pos, gl.rope_base);
                     // V: plain RMSNorm (no weight, no RoPE) — Vcur = ggml_rms_norm(Vcur, eps).
-                    {
-                        double ss = 0.0;
-                        for (int i = 0; i < hd; i++) ss += static_cast<double>(vbuf[i]) * vbuf[i];
-                        float vs = 1.0f / std::sqrt(static_cast<float>(ss / hd) + rms_eps);
-                        for (int i = 0; i < hd; i++) vbuf[i] *= vs;
-                    }
+                    if (!g_rmsnorm(vbuf.data(), vbuf.data(), hd, nullptr, rms_eps)) return 1;
                     gk_store[L].insert(gk_store[L].end(), kbuf.begin(), kbuf.end());
                     gv_store[L].insert(gv_store[L].end(), vbuf.begin(), vbuf.end());
                 }
@@ -2006,11 +2004,11 @@ int main(int argc, char* argv[]) {
                 attn_o.assign(hidden_size, 0.0f);
                 mul_mat_weight(attn_in.data(), o_w, attn_o.data(), 1, hidden_size, qdim, qdim, hidden_size, hidden_size);
                 backend->sync();
-                g_rmsnorm(attn_o.data(), attn_o.data(), hidden_size, get_float_ptr(postattn_w), rms_eps);
+                if (!g_rmsnorm(attn_o.data(), attn_o.data(), hidden_size, get_float_ptr(postattn_w), rms_eps)) return 1;
                 for (int i = 0; i < hidden_size; i++) inp_embd[i] += attn_o[i];
 
                 // FFN: pre-norm -> GeGLU -> down -> post-FFN norm -> residual.
-                g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(ffnnorm_w), rms_eps);
+                if (!g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(ffnnorm_w), rms_eps)) return 1;
                 const int ffn = gl.ffn;
                 gate.assign(ffn, 0.0f);
                 up.assign(ffn, 0.0f);
@@ -2022,7 +2020,7 @@ int main(int argc, char* argv[]) {
                 dn.assign(hidden_size, 0.0f);
                 mul_mat_weight(act.data(), down_w, dn.data(), 1, hidden_size, ffn, ffn, hidden_size, hidden_size);
                 backend->sync();
-                g_rmsnorm(dn.data(), dn.data(), hidden_size, get_float_ptr(postffw_w), rms_eps);
+                if (!g_rmsnorm(dn.data(), dn.data(), hidden_size, get_float_ptr(postffw_w), rms_eps)) return 1;
                 for (int i = 0; i < hidden_size; i++) inp_embd[i] += dn[i];
 
                 // Per-Layer Embedding injection (G3):
@@ -2041,7 +2039,7 @@ int main(int argc, char* argv[]) {
                     mul_mat_weight(pgate.data(), proj_w, inj.data(),
                                    1, hidden_size, ple_dim, ple_dim, hidden_size, hidden_size);
                     backend->sync();
-                    g_rmsnorm(inj.data(), inj.data(), hidden_size, get_float_ptr(postnorm_w), rms_eps);
+                    if (!g_rmsnorm(inj.data(), inj.data(), hidden_size, get_float_ptr(postnorm_w), rms_eps)) return 1;
                     for (int i = 0; i < hidden_size; i++) inp_embd[i] += inj[i];
                 }
 
@@ -2056,7 +2054,7 @@ int main(int argc, char* argv[]) {
 
             // Final norm into inp_norm (fed to logits below).
             const TensorView* out_norm_w = find_tensor(model, "output_norm.weight");
-            g_rmsnorm(inp_norm.data(), inp_embd.data(), hidden_size, get_float_ptr(out_norm_w), rms_eps);
+            if (!g_rmsnorm(inp_norm.data(), inp_embd.data(), hidden_size, get_float_ptr(out_norm_w), rms_eps)) return 1;
         }
 
         // Transformer layers (non-gemma path)

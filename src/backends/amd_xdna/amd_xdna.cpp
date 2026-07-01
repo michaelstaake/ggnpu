@@ -830,14 +830,24 @@ public:
         // The BF16 kernel's BLOCK_N must be a power of 2 (Triton tl.arange). For
         // non-pow2 hidden sizes (e.g. 1536) pad up to N_pad = next_pow2(N) and use
         // the N_pad kernel. The kernel divides the sum-of-squares by N_pad, so its
-        // rstd is too large by sqrt(N_pad/N); correct it with a CONSTANT output
-        // factor c = sqrt(N/N_pad). Zero padding contributes nothing to the sum.
+        // rstd is too large by sqrt(N_pad/N); zero padding contributes nothing to
+        // the sum, so this is corrected with an output factor computed below.
         // The input is NOT scaled, so it stays on the same bf16 grid as the
-        // reference (full accuracy); the only approximation is that eps is
-        // effectively scaled by N_pad/N (~1e-6 relative, negligible). c == 1 for
-        // pow2 N, making this an exact no-op for hidden=2048.
+        // reference (full accuracy).
+        //
+        // The compiled kernel also bakes eps=1e-5 in at compile time (see
+        // compile_kernels.py's rmsnorm launch trace) — RmsNormParams.eps is
+        // NOT wired into the NPU kernel at runtime. For eps==1e-5 callers
+        // (Llama/Qwen2) and large-magnitude activations this is invisible,
+        // but gemma4 uses eps=1e-6 and can hit near-zero activations (e.g.
+        // QK-norm/PLE-norm), where the baked-vs-requested eps mismatch is a
+        // large relative error. The exact correction below folds in BOTH the
+        // N_pad divisor and the eps mismatch (computed from the actual input,
+        // in double precision); it reduces to the old sqrt(N/N_pad) formula
+        // whenever eps is negligible next to mean-of-squares (the Llama/Qwen2
+        // regime), so it's a strict improvement, not a behavior change there.
         const int N_pad = next_pow2(N);
-        const float rms_out_corr = std::sqrt(static_cast<float>(N) / static_cast<float>(N_pad));
+        constexpr float kRmsnormBakedEps = 1e-5f;
 
         std::string cache_key = "rmsnorm_" + std::to_string(N_pad) + "_" + profile_str_;
 
@@ -865,9 +875,11 @@ public:
         const float* input_ptr = npu_params.input;
         float* output_ptr = npu_params.output;
 
-        // RMSNorm kernels are BF16 — convert f32 input → bf16 for DMA. The pow2
-        // kernels are compiled M=2 (M=1 won't compile); duplicate row 0 into both.
-        const int npu_rows = (N_pad >= 512) ? kRmsnormHiddenPadRows : 1;
+        // RMSNorm kernels are BF16 — convert f32 input → bf16 for DMA. Every
+        // shaped bf16 kernel (bo_instr present) is compiled M=2 (M=1 won't
+        // compile); duplicate row 0 into both. Only the legacy no-instruction-
+        // sequence N=256 F32 kernel (bo_instr absent) takes a single row.
+        const int npu_rows = (kernel.bo_instr && kernel.instr_words > 0) ? kRmsnormHiddenPadRows : 1;
         const size_t row_bf16_bytes = static_cast<size_t>(N_pad) * sizeof(uint16_t);
         const size_t bf16_bytes = static_cast<size_t>(npu_rows) * row_bf16_bytes;
         std::vector<uint8_t> bf16_input;
@@ -876,6 +888,18 @@ public:
             // Zero-padded f32 row of N_pad cols (input unscaled), then bf16.
             std::vector<float> padded_row(static_cast<size_t>(N_pad), 0.0f);
             for (int i = 0; i < N; i++) padded_row[i] = input_ptr[i];
+
+            // Exact output correction: fold in both the N_pad divisor and the
+            // baked-vs-requested eps mismatch (see comment above). Zero padding
+            // contributes nothing to the sum, so summing over N == summing over N_pad.
+            double ss = 0.0;
+            for (int i = 0; i < N; i++) ss += static_cast<double>(padded_row[i]) * padded_row[i];
+            const double mean_sq_pad = ss / static_cast<double>(N_pad);
+            const double mean_sq_true = ss / static_cast<double>(N);
+            const float rms_out_corr = static_cast<float>(std::sqrt(
+                (mean_sq_pad + static_cast<double>(kRmsnormBakedEps)) /
+                (mean_sq_true + static_cast<double>(npu_params.eps))));
+
             std::vector<uint8_t> row_bf16 = convert_f32_to_bf16(padded_row.data(), N_pad);
             bf16_input.resize(bf16_bytes);
             for (int r = 0; r < npu_rows; r++) {

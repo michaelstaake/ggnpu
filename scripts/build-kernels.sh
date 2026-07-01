@@ -212,11 +212,15 @@ Kernels=(
     "matmul_small_m:--M 16 --N 256 --K 256"
     "matmul_small_m_deepk:--M 16 --N 256 --K 2048"
     "rmsnorm:--M 32 --N 256"
+    "rmsnorm_256:--M 2 --N 256"
+    "rmsnorm_512:--M 2 --N 512"
     "rmsnorm_2048:--M 2 --N 2048"
     "rmsnorm_4096:--M 2 --N 4096"
     "softmax:--rows 256 --cols 256"
     "silu:--N 8192"
     "rope:--n_pairs 32"
+    "rope_256:--n_pairs 128"
+    "rope_512:--n_pairs 256"
 )
 
 # flash_attn blocked on Triton-XDNA multi-reduction lowering (3+ tl.sum ops).
@@ -253,6 +257,10 @@ for kernel_def in "${Kernels[@]}"; do
     # rmsnorm_<N> (any size) compiles under op "rmsnorm", installs shaped.
     if [[ "$kernel_name" =~ ^rmsnorm_[0-9]+$ ]]; then
         compile_op="rmsnorm"
+        shaped_install="$kernel_name"
+    # rope_<n_dims> (head_dim, e.g. rope_256) compiles under op "rope", installs shaped.
+    elif [[ "$kernel_name" =~ ^rope_[0-9]+$ ]]; then
+        compile_op="rope"
         shaped_install="$kernel_name"
     elif [ "$kernel_name" = "flash_attn_32x64x2048" ]; then
         compile_op="flash_attn"
