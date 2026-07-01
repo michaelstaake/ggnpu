@@ -1751,6 +1751,10 @@ int main(int argc, char* argv[]) {
     // 256-dim auxiliary signal per layer, injected at the end of each block.
     const int gemma_ple_dim =
         static_cast<int>(model.gguf().get_int("gemma4.embedding_length_per_layer_input", 256));
+    // Sliding-window size for local (SWA) layers: a query at position p attends
+    // only to keys k with p - k < n_swa (STANDARD SWA). 0 disables windowing.
+    const int64_t gemma_swa_window =
+        is_gemma ? model.gguf().get_int("gemma4.attention.sliding_window", 0) : 0;
     const TensorView* ple_tok_embd = is_gemma ? find_tensor(model, "per_layer_token_embd.weight") : nullptr;
     const TensorView* ple_model_proj = is_gemma ? find_tensor(model, "per_layer_model_proj.weight") : nullptr;
     const TensorView* ple_proj_norm = is_gemma ? find_tensor(model, "per_layer_proj_norm.weight") : nullptr;
@@ -1957,7 +1961,14 @@ int main(int argc, char* argv[]) {
                 }
 
                 const int src = gl.kv_src;
-                const int64_t ctx_len = pos + 1;
+                // Sliding-window attention on local layers: attend only to keys k
+                // with pos - k < n_swa. Slice the KV store to [k0..pos]; global
+                // layers keep the full context. Passing the sliced window keeps the
+                // host flash_attn's plain causal mask correct (query is last).
+                int64_t k0 = 0;
+                if (gl.is_swa && gemma_swa_window > 0)
+                    k0 = std::max<int64_t>(0, (pos + 1) - gemma_swa_window);
+                const int64_t ctx_len = (pos + 1) - k0;
                 // Broadcast the single KV head to all query heads (num_kv_heads=1).
                 kexp.assign(static_cast<size_t>(num_heads) * ctx_len * hd, 0.0f);
                 vexp.assign(static_cast<size_t>(num_heads) * ctx_len * hd, 0.0f);
@@ -1966,13 +1977,13 @@ int main(int argc, char* argv[]) {
                 for (int h = 0; h < num_heads; h++) {
                     for (int64_t j = 0; j < ctx_len; j++) {
                         std::memcpy(kexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
-                                    ks.data() + static_cast<size_t>(j) * hd, hd * sizeof(float));
+                                    ks.data() + static_cast<size_t>(k0 + j) * hd, hd * sizeof(float));
                         std::memcpy(vexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
-                                    vs.data() + static_cast<size_t>(j) * hd, hd * sizeof(float));
+                                    vs.data() + static_cast<size_t>(k0 + j) * hd, hd * sizeof(float));
                     }
                 }
 
-                // Causal attention (host f32); SWA masking deferred to G4.
+                // Causal attention (host f32) over the (possibly windowed) keys.
                 attn_in.assign(qdim, 0.0f);
                 AttnParams fa;
                 fa.Q = q.data();
@@ -1983,7 +1994,7 @@ int main(int argc, char* argv[]) {
                 fa.n_head = num_heads;
                 fa.head_dim = hd;
                 fa.ctx_len = ctx_len;
-                fa.query_pos = pos;
+                fa.query_pos = ctx_len - 1;  // query is the last (newest) key in the slice
                 fa.freq_factors = nullptr;
                 if (backend->flash_attn(fa) != Status::OK) {
                     std::cerr << "Error: gemma flash_attn failed at layer " << L << "\n";

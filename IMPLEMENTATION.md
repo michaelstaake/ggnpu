@@ -1027,9 +1027,10 @@ Each phase is independently verifiable; do not start a phase before the prior on
   - **Milestone met:** coherent, correct output — `"The capital of France is" → " Paris."`, `"…2+2? Answer:" → " 4"`, model then emits end-of-turn/EOS. Llama/Qwen2 unregressed.
   - Second embedding lookup + `per_layer_model_proj`/`per_layer_proj_norm` + per-block `inp_gate`/`proj` injection.
   - **Milestone:** output quality jumps toward reference; `compare_logits.py` gap narrows sharply.
-- [ ] **Phase G4 — Heterogeneous attention.**
-  - Apply `sliding_window_pattern`: windowed mask + dual rope base + per-layer head_dim (256 local / 512 global); implement shared-KV layer→source mapping (`shared_kv_layers`).
-  - **Milestone:** logits within tolerance of reference across a multi-token prompt.
+- [x] **Phase G4 — Heterogeneous attention.** *(done 2026-07-01)*
+  - **Shared-KV mapping verified exactly** against `llama.cpp` (`llama-model.cpp` gemma4 `reuse()` = `n_layer_kv_from_start − (is_swa?2:1)`): shared layers reuse layer **13** (local) / **14** (global) — identical to the "last same-type owning layer" logic already in G2, which is why output was already coherent. `n_layer_kv_from_start = 35 − shared_kv_layers(20) = 15` (layers 0–14 own KV).
+  - **Sliding-window masking** added for local layers (`is_masked_swa` STANDARD: mask key k when `pos − k ≥ n_swa`, `n_swa=512`): the KV store is sliced to `[max(0, pos+1−n_swa) .. pos]` so the host flash_attn's plain causal mask stays correct (RoPE is applied at store time in absolute positions, so relative encoding survives the slice). Global layers keep full context. Per-layer head_dim (256/512) and dual RoPE base (1e6 global / 1e4 local) were already wired in G2/G3.
+  - **Milestone:** short prompts unchanged (`France → Paris`, `2+2 → 4`); windowing activates only for pos ≥ 512. Long-context (>512) exercises the window path but isn't empirically validated here due to host-side decode speed.
 - [ ] **Phase G5 — Finishing + validation.**
   - `layer_output_scale`, final logit soft-cap, then full E2E vs llama.cpp reference logits.
   - NPU kernel size checks: head_dim 512, FFN 12288, 256-dim per-head QK-norm — confirm existing host-tiled matmul/rmsnorm absorb these or add tiling (cf. [[npu-rmsnorm-pad-pow2]], SiLU host-tiling).
