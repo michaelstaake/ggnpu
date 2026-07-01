@@ -24,9 +24,12 @@ public:
     int bos_token_id() const { return bos_token_id_; }
     int eos_token_id() const { return eos_token_id_; }
     int vocab_size() const { return static_cast<int>(vocab_.size()); }
+    bool is_unigram() const { return model_type_ == ModelType::Unigram; }
 
 private:
     enum class PreType { Default, Gpt2, Llama3 };
+    // BPE (Llama/Qwen merge-rank) vs Unigram (SentencePiece score-max, e.g. gemma).
+    enum class ModelType { Bpe, Unigram };
 
     using BpePair = std::pair<std::string, std::string>;
 
@@ -34,6 +37,12 @@ private:
     std::map<std::string, int> vocab_;
     std::map<int, std::string> reverse_vocab_;
     PreType pre_type_ = PreType::Default;
+    ModelType model_type_ = ModelType::Bpe;
+    // Unigram (SentencePiece) state, indexed by token id.
+    std::vector<float> token_scores_;
+    std::vector<int32_t> token_types_;
+    bool add_space_prefix_ = true;
+    int unk_token_id_ = -1;
     int bos_token_id_ = -1;
     int eos_token_id_ = -1;
     bool add_bos_ = true;
@@ -44,6 +53,11 @@ private:
     std::vector<int> bpe_tokenize(const std::string& text) const;
     std::vector<int> bpe_tokenize_word(const std::string& word) const;
     std::string decode_piece(const std::string& piece) const;
+
+    // Unigram / SentencePiece path.
+    int piece_to_id(const std::string& piece) const;
+    std::vector<int> spm_tokenize(const std::string& text) const;
+    std::string spm_decode_piece(int token_id) const;
 };
 
 } // namespace ggnpu

@@ -208,6 +208,9 @@ bool GgufLoader::parse_kv() {
                 if (buffered_read(arr_count_buf, 8) != 8) return false;
                 uint64_t arr_count = read_u64_le(arr_count_buf);
 
+                kv.array_type = arr_type;
+                kv.array_length = arr_count;
+
                 size_t elem_size = 4;
                 switch (arr_type) {
                     case GgufType::UINT8:  elem_size = 1; break;
@@ -489,6 +492,68 @@ int64_t GgufLoader::get_int(const std::string& key, int64_t default_val) const {
         }
     }
     return default_val;
+}
+
+std::vector<int64_t> GgufLoader::get_int_array(const std::string& key) const {
+    std::vector<int64_t> out;
+    auto it = kv_pairs_.find(key);
+    if (it == kv_pairs_.end() || it->second.value_type != GgufType::ARRAY) return out;
+    const GgufKV& kv = it->second;
+    const uint8_t* p = kv.data.data();
+    size_t n = kv.array_length;
+    auto have = [&](size_t bytes) { return kv.data.size() >= bytes; };
+    switch (kv.array_type) {
+        case GgufType::UINT8:
+        case GgufType::BOOL:
+            if (!have(n)) return {};
+            for (size_t i = 0; i < n; i++) out.push_back(static_cast<int64_t>(p[i]));
+            break;
+        case GgufType::INT8:
+            if (!have(n)) return {};
+            for (size_t i = 0; i < n; i++) out.push_back(static_cast<int64_t>(static_cast<int8_t>(p[i])));
+            break;
+        case GgufType::UINT16:
+            if (!have(n * 2)) return {};
+            for (size_t i = 0; i < n; i++) out.push_back(static_cast<int64_t>(static_cast<uint16_t>(p[i*2] | (p[i*2+1] << 8))));
+            break;
+        case GgufType::INT16:
+            if (!have(n * 2)) return {};
+            for (size_t i = 0; i < n; i++) out.push_back(static_cast<int64_t>(static_cast<int16_t>(p[i*2] | (p[i*2+1] << 8))));
+            break;
+        case GgufType::UINT32:
+            if (!have(n * 4)) return {};
+            for (size_t i = 0; i < n; i++) out.push_back(static_cast<int64_t>(read_u32_le(p + i*4)));
+            break;
+        case GgufType::INT32:
+            if (!have(n * 4)) return {};
+            for (size_t i = 0; i < n; i++) out.push_back(static_cast<int64_t>(static_cast<int32_t>(read_u32_le(p + i*4))));
+            break;
+        case GgufType::UINT64:
+        case GgufType::INT64:
+            if (!have(n * 8)) return {};
+            for (size_t i = 0; i < n; i++) out.push_back(read_i64_le(p + i*8));
+            break;
+        default:
+            return {};
+    }
+    return out;
+}
+
+std::vector<double> GgufLoader::get_float_array(const std::string& key) const {
+    std::vector<double> out;
+    auto it = kv_pairs_.find(key);
+    if (it == kv_pairs_.end() || it->second.value_type != GgufType::ARRAY) return out;
+    const GgufKV& kv = it->second;
+    const uint8_t* p = kv.data.data();
+    size_t n = kv.array_length;
+    if (kv.array_type == GgufType::FLOAT32) {
+        if (kv.data.size() < n * 4) return {};
+        for (size_t i = 0; i < n; i++) out.push_back(static_cast<double>(read_f32_le(p + i*4)));
+    } else if (kv.array_type == GgufType::FLOAT64) {
+        if (kv.data.size() < n * 8) return {};
+        for (size_t i = 0; i < n; i++) out.push_back(read_f64_le(p + i*8));
+    }
+    return out;
 }
 
 double GgufLoader::get_float(const std::string& key, double default_val) const {

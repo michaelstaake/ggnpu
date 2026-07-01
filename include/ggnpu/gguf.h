@@ -41,6 +41,11 @@ struct GgufKV {
     std::string string_value;
     int64_t int_value = 0;
     double float_value = 0.0;
+    // For value_type == ARRAY: element type and count. Numeric arrays store their
+    // raw little-endian elements in `data` (no prefix); STRING arrays store a
+    // (u32 type, u64 count, [u64 len, bytes]...) layout in `data`.
+    GgufType array_type = GgufType::UINT8;
+    uint64_t array_length = 0;
 };
 
 struct GgufTensorInfo {
@@ -88,6 +93,14 @@ public:
     std::string get_string(const std::string& key, const std::string& default_val = "") const;
     int64_t get_int(const std::string& key, int64_t default_val = 0) const;
     double get_float(const std::string& key, double default_val = 0.0) const;
+
+    // Decode a numeric metadata ARRAY. Integer variants read UINT8/INT8/BOOL/
+    // UINT16/INT16/UINT32/INT32/UINT64/INT64; float variants read FLOAT32/FLOAT64.
+    // Returns empty if the key is absent or not a numeric array of that class.
+    // Used for per-layer metadata (e.g. gemma4 feed_forward_length,
+    // sliding_window_pattern) and tokenizer scores/token_type.
+    std::vector<int64_t> get_int_array(const std::string& key) const;
+    std::vector<double> get_float_array(const std::string& key) const;
 
     // Build an architecture-prefixed metadata key, e.g. arch_key("block_count")
     // -> "qwen2.block_count". GGUF namespaces hparams under general.architecture,

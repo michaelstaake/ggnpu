@@ -136,6 +136,14 @@ if(GGNPU_BUILD_TESTS)
         endif()
     endforeach()
 
+    # Gemma 3n (gemma4) SentencePiece-unigram tokenizer golden, if the model is
+    # present locally (not committed). Reuses the test_tokenizer binary, which
+    # dispatches on the tokenizer type.
+    set(GEMMA_MODEL ${CMAKE_SOURCE_DIR}/models/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf)
+    if(EXISTS ${GEMMA_MODEL})
+        add_test(NAME test_tokenizer_gemma COMMAND test_tokenizer ${GEMMA_MODEL})
+    endif()
+
     # E2E: France prompt → greedy top-1 is Paris (requires local model.gguf)
     add_test(
         NAME test_e2e_logits

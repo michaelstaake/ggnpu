@@ -982,6 +982,64 @@ Dev laptop has ~14 GiB RAM + 4 GiB swap. Cursor IDE can consume several GB; comb
 
 ---
 
+### 7.3 Gemma 3n (`gemma4`) support roadmap
+
+`models/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf` reports `general.architecture =
+gemma4` and is **Gemma 3n E2B** (MatFormer family). This is the next model-breadth
+target. Unlike Qwen2 (a small metadata delta over Llama — QKV bias + rope fallback,
+§ multi-arch), Gemma 3n is one of the densest open architectures and is a
+**multi-session effort**. This section is the plan of record; update the checkboxes
+as phases land.
+
+#### Feature inventory (verified via `--dump-tensors`)
+
+| Feature | Evidence | Runtime delta |
+|---------|----------|---------------|
+| **SentencePiece *unigram* tokenizer** | `tokenizer.ggml.model=gemma4`, `scores` + `token_type` arrays, 262144 vocab | Current tokenizer (`src/cli/tokenizer.cpp`) is **BPE-only** (llama3/gpt2 merge-rank). Unigram is a different algorithm (score-maximizing segmentation) — a real addition, not config. |
+| **Per-Layer Embeddings (PLE)** | `per_layer_token_embd` [8960×262144], `per_layer_model_proj`, `per_layer_proj_norm`, per-block `inp_gate` [1536,256] / `proj` [256,1536] | A second embedding pathway: look up a 256-dim per-layer vector per token and inject it into every block via gating. New forward substructure. |
+| **QK-norm** | `blk.N.attn_q_norm` / `attn_k_norm` (F32) | Per-head RMSNorm applied to Q and K before attention. |
+| **Sandwich norms (5/block)** | `attn_norm`, `post_attention_norm`, `ffn_norm`, `post_ffw_norm`, `post_norm` | Gemma pre+post norm pattern; RMSNorm uses `1+w` weight convention and √hidden embedding scaling. |
+| **Heterogeneous attention (SWA vs global)** | `sliding_window=512`, `sliding_window_pattern` (35-elem array), `key_length=512` / `key_length_swa=256`, `rope.freq_base=1e6` / `rope.freq_base_swa=1e4`; `blk.0.attn_q_norm=[256]` vs `blk.34.attn_q_norm=[512]` | Per-layer: local layers use head_dim 256 + windowed mask + rope base 1e4; global layers use head_dim 512 + full mask + rope base 1e6. head_dim is decoupled from embedding (1536/8=192≠256). |
+| **Shared KV across layers** | `shared_kv_layers=20`; e.g. `blk.20` has **no** `attn_k`/`attn_v`/`attn_k_norm` | Some layers reuse a preceding layer's KV projections instead of computing their own. Needs a layer→KV-source mapping. |
+| **MatFormer variable FFN widths** | `feed_forward_length` is an **array** (blk.0=6144, blk.20/34=12288) | FFN width varies per layer; loader must read the array, forward must not assume a constant. |
+| **Per-layer output scale** | `blk.N.layer_output_scale` [1] (F32) | Scalar multiply on each block's output. |
+| **Final logit soft-capping** | `final_logit_softcapping=30` | `logits = 30 * tanh(logits/30)` before sampling. |
+
+Other metadata: 35 layers, hidden 1536, 8 attn / 1 KV head, `rms_eps=1e-6`,
+`embedding_length_per_layer_input=256`, ctx 131072 (use `-c 2048`), non-tied
+(`output.weight` present via `output_norm` + main embed — confirm at load).
+
+#### Phased plan (correctness-first, host-hybrid — same path Llama/Qwen2 took: matmul/norm/silu on NPU, orchestration on host)
+
+Each phase is independently verifiable; do not start a phase before the prior one's milestone passes.
+
+- [x] **Phase G1 — Load + metadata + tokenizer.** *(done 2026-07-01)*
+  - Array-valued metadata parsing: `GgufKV` now records `array_type`/`array_length`; `GgufLoader::get_int_array` / `get_float_array` decode numeric arrays (`src/gguf/`). Verified on gemma4 `feed_forward_length` (35× i32: 6144×15 then 12288×20) and `attention.sliding_window_pattern` (35× bool: every 5th layer = global).
+  - SentencePiece-**unigram** tokenizer in `src/cli/tokenizer.cpp`: score-max merge (llama.cpp `llm_tokenizer_spm` algorithm) over `tokens`+`scores`, meta-space (U+2581) normalization with `add_space_prefix=false`, `<0xXX>` byte fallback, unigram decode path. Auto-selected via `tokenizer.ggml.model` (`gpt2` ⇒ BPE, else scores ⇒ unigram) — note gemma ships **both** merges and scores, so merge-presence is not a BPE signal.
+  - **Milestone met:** `--dump-tensors` exits clean; `test_tokenizer` (dispatches on tokenizer type) passes gemma goldens `"The capital of France is"→[818,5279,529,7001,563]`, `"Hello, world!"`, a code snippet, plus round-trip; registered as ctest `test_tokenizer_gemma`. Full ctest suite green (8/8). No Llama/Qwen regression.
+- [ ] **Phase G2 — Forward skeleton (no PLE, all-global attention).**
+  - Embedding √hidden scale, `1+w` RMSNorm, 5 sandwich norms, QK-norm, GQA (8:1), head_dim from `key_length`.
+  - Treat every layer as global (ignore SWA, ignore shared-KV — give each layer its own KV) to validate plumbing first.
+  - **Milestone:** runs end-to-end, output is roughly on-topic (not yet reference-correct).
+- [ ] **Phase G3 — PLE pathway.**
+  - Second embedding lookup + `per_layer_model_proj`/`per_layer_proj_norm` + per-block `inp_gate`/`proj` injection.
+  - **Milestone:** output quality jumps toward reference; `compare_logits.py` gap narrows sharply.
+- [ ] **Phase G4 — Heterogeneous attention.**
+  - Apply `sliding_window_pattern`: windowed mask + dual rope base + per-layer head_dim (256 local / 512 global); implement shared-KV layer→source mapping (`shared_kv_layers`).
+  - **Milestone:** logits within tolerance of reference across a multi-token prompt.
+- [ ] **Phase G5 — Finishing + validation.**
+  - `layer_output_scale`, final logit soft-cap, then full E2E vs llama.cpp reference logits.
+  - NPU kernel size checks: head_dim 512, FFN 12288, 256-dim per-head QK-norm — confirm existing host-tiled matmul/rmsnorm absorb these or add tiling (cf. [[npu-rmsnorm-pad-pow2]], SiLU host-tiling).
+
+#### Risks / open questions
+
+- **Unigram tokenizer** is the biggest non-forward piece; get a golden reference early (llama.cpp `--verbose-prompt` or HF tokenizer) to avoid debugging tokenization and model math simultaneously.
+- **Shared-KV semantics** (`shared_kv_layers=20`): confirm exactly which layers share and from where by checking which blocks omit `attn_k`/`attn_v` (blk.20+ observed). Get the mapping right or attention silently corrupts.
+- **head_dim 512 global layers** may stress NPU attention/matmul kernels sized around ≤128 head_dim; the decomposed host-f32 attention path is the safe fallback while validating.
+- Memory: 2.6 GB Q4 file + PLE table; fine on the dev box only with `-c 2048` (131k ctx KV would OOM).
+
+---
+
 ## 8. CLI reference
 
 Implement all flags below. `ggnpu --help` must match `docs/usage.md`.
@@ -1243,7 +1301,7 @@ models/
 |------|--------------|-------|
 | `models/llama-3.2-1b-q4_k_m.gguf` | ~770 MB | **MVP target**; ctx metadata 131072 — use `-c 2048` after KV fix |
 | `models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf` | ~1.1 GB | P1 arch; use after Llama 1B works |
-| `models/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf` | ~2.6 GB | Larger; avoid on 16 GB RAM until KV fixed |
+| `models/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf` | ~2.6 GB | **Gemma 3n E2B** (`gemma4`); not yet supported — see §7.3 roadmap. Use `-c 2048`. |
 
 Llama 3.2 1B metadata (verified via `--dump-tensors`): 16 layers, 2048 hidden, 32 attn / 8 KV heads, 64 rope dim, `Q4_K_M` (file_type 15).
 
