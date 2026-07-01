@@ -1759,11 +1759,20 @@ int main(int argc, char* argv[]) {
     const TensorView* ple_model_proj = is_gemma ? find_tensor(model, "per_layer_model_proj.weight") : nullptr;
     const TensorView* ple_proj_norm = is_gemma ? find_tensor(model, "per_layer_proj_norm.weight") : nullptr;
 
+    // Per-op timing accumulator for the gemma4 path (-v/--verbose), mirroring
+    // the Llama path's step_timings. Declared here (stable address) rather
+    // than freshly per-iteration so the g_rmsnorm/g_rope/g_gelu lambdas below
+    // (defined once, outside the decode loop) can capture it by reference;
+    // reset at the top of each loop iteration instead of re-declared.
+    InferenceTimings step_timings;
+
     // Gemma4 RMSNorm: raw weight (this arch stores the full scale, no (1+w)
     // offset — verified against the reference graph). Sizes 256/512/1536, all
     // NPU-dispatched via the existing `rms_norm` helper (any N via
     // next_pow2 padding; weight applied host-side inside backend->rms_norm()).
     auto g_rmsnorm = [&](float* out, const float* in, int n, const float* w, float eps) -> bool {
+        std::unique_ptr<ScopedTimer> t;
+        if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.rms_norm_ms);
         if (!rms_norm(out, in, 1, n, eps, w)) {
             model.unload();
             return false;
@@ -1775,6 +1784,8 @@ int main(int argc, char* argv[]) {
     // underlying kernel is a pure elementwise vector-add — only host
     // (de)interleave indexing differs from Llama's adjacent-pair layout.
     auto g_rope = [&](float* v, int n_heads, int hd, int64_t pos, float base) -> bool {
+        std::unique_ptr<ScopedTimer> t;
+        if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.rope_ms);
         RopeBatchedParams rp;
         rp.data = v;
         rp.n_heads = n_heads;
@@ -1794,7 +1805,10 @@ int main(int argc, char* argv[]) {
     // Gemma GeGLU activation (tanh-approx GELU on the gate). NPU-dispatched
     // via backend->gelu() in place; the caller does the cheap elementwise
     // multiply by the FFN up-projection (or PLE per-layer gate) afterward.
+    // Timed into silu_ms (shared "FFN activation" bucket with the Llama path).
     auto g_gelu = [&](float* buf, int n) -> bool {
+        std::unique_ptr<ScopedTimer> t;
+        if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.silu_ms);
         GeluParams gp{buf, buf, n};
         if (backend->gelu(gp) != Status::OK) {
             std::cerr << "Error: gemma GELU failed\n";
@@ -1813,7 +1827,7 @@ int main(int argc, char* argv[]) {
 
     bool first_token = true;
     while (generated < params.max_tokens || params.bench_logits) {
-        InferenceTimings step_timings;
+        step_timings = InferenceTimings();
         step_timings.token_steps = 1;
 
         int tok = 0;
@@ -1868,7 +1882,8 @@ int main(int argc, char* argv[]) {
 
                 std::vector<float> ple_ctx(static_cast<size_t>(ple_total), 0.0f);
                 mul_mat_weight(inp_embd.data(), ple_model_proj, ple_ctx.data(),
-                               1, ple_total, hidden_size, hidden_size, ple_total, ple_total);
+                               1, ple_total, hidden_size, hidden_size, ple_total, ple_total,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
                 backend->sync();
                 const float ctx_scale = 1.0f / std::sqrt(static_cast<float>(hidden_size));
                 const float* plpn = get_float_ptr(ple_proj_norm);
@@ -1906,7 +1921,8 @@ int main(int argc, char* argv[]) {
 
                 // Q projection -> per-head QK-norm -> RoPE.
                 q.assign(qdim, 0.0f);
-                mul_mat_weight(xn.data(), q_w, q.data(), 1, qdim, hidden_size, hidden_size, qdim, qdim);
+                mul_mat_weight(xn.data(), q_w, q.data(), 1, qdim, hidden_size, hidden_size, qdim, qdim,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
                 backend->sync();
 
                 // Debug (GGNPU_GEMMA_DEBUG): validate the Q4_0 NPU matmul against a
@@ -1959,8 +1975,10 @@ int main(int argc, char* argv[]) {
                     const TensorView* kn_w = find_tensor_pattern(model, "blk.{layer}.attn_k_norm.weight", L);
                     kbuf.assign(hd, 0.0f);
                     vbuf.assign(hd, 0.0f);
-                    mul_mat_weight(xn.data(), k_w, kbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd);
-                    mul_mat_weight(xn.data(), v_w, vbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd);
+                    mul_mat_weight(xn.data(), k_w, kbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd,
+                                   params.verbose ? &step_timings.matmul_ms : nullptr);
+                    mul_mat_weight(xn.data(), v_w, vbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd,
+                                   params.verbose ? &step_timings.matmul_ms : nullptr);
                     backend->sync();
                     // K: RMSNorm with attn_k_norm weight, then RoPE.
                     if (!g_rmsnorm(kbuf.data(), kbuf.data(), hd, get_float_ptr(kn_w), rms_eps)) return 1;
@@ -1985,12 +2003,16 @@ int main(int argc, char* argv[]) {
                 vexp.assign(static_cast<size_t>(num_heads) * ctx_len * hd, 0.0f);
                 const std::vector<float>& ks = gk_store[src];
                 const std::vector<float>& vs = gv_store[src];
-                for (int h = 0; h < num_heads; h++) {
-                    for (int64_t j = 0; j < ctx_len; j++) {
-                        std::memcpy(kexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
-                                    ks.data() + static_cast<size_t>(k0 + j) * hd, hd * sizeof(float));
-                        std::memcpy(vexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
-                                    vs.data() + static_cast<size_t>(k0 + j) * hd, hd * sizeof(float));
+                {
+                    std::unique_ptr<ScopedTimer> t;
+                    if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.kv_expand_ms);
+                    for (int h = 0; h < num_heads; h++) {
+                        for (int64_t j = 0; j < ctx_len; j++) {
+                            std::memcpy(kexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
+                                        ks.data() + static_cast<size_t>(k0 + j) * hd, hd * sizeof(float));
+                            std::memcpy(vexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
+                                        vs.data() + static_cast<size_t>(k0 + j) * hd, hd * sizeof(float));
+                        }
                     }
                 }
 
@@ -2007,15 +2029,20 @@ int main(int argc, char* argv[]) {
                 fa.ctx_len = ctx_len;
                 fa.query_pos = ctx_len - 1;  // query is the last (newest) key in the slice
                 fa.freq_factors = nullptr;
-                if (backend->flash_attn(fa) != Status::OK) {
-                    std::cerr << "Error: gemma flash_attn failed at layer " << L << "\n";
-                    model.unload();
-                    return 1;
+                {
+                    std::unique_ptr<ScopedTimer> t;
+                    if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.flash_attn_ms);
+                    if (backend->flash_attn(fa) != Status::OK) {
+                        std::cerr << "Error: gemma flash_attn failed at layer " << L << "\n";
+                        model.unload();
+                        return 1;
+                    }
                 }
 
                 // Output projection -> post-attention norm -> residual.
                 attn_o.assign(hidden_size, 0.0f);
-                mul_mat_weight(attn_in.data(), o_w, attn_o.data(), 1, hidden_size, qdim, qdim, hidden_size, hidden_size);
+                mul_mat_weight(attn_in.data(), o_w, attn_o.data(), 1, hidden_size, qdim, qdim, hidden_size, hidden_size,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
                 backend->sync();
                 if (!g_rmsnorm(attn_o.data(), attn_o.data(), hidden_size, get_float_ptr(postattn_w), rms_eps)) return 1;
                 for (int i = 0; i < hidden_size; i++) inp_embd[i] += attn_o[i];
@@ -2025,14 +2052,17 @@ int main(int argc, char* argv[]) {
                 const int ffn = gl.ffn;
                 gate.assign(ffn, 0.0f);
                 up.assign(ffn, 0.0f);
-                mul_mat_weight(xn.data(), gate_w, gate.data(), 1, ffn, hidden_size, hidden_size, ffn, ffn);
-                mul_mat_weight(xn.data(), up_w, up.data(), 1, ffn, hidden_size, hidden_size, ffn, ffn);
+                mul_mat_weight(xn.data(), gate_w, gate.data(), 1, ffn, hidden_size, hidden_size, ffn, ffn,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
+                mul_mat_weight(xn.data(), up_w, up.data(), 1, ffn, hidden_size, hidden_size, ffn, ffn,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
                 backend->sync();
                 act.assign(ffn, 0.0f);
                 if (!g_gelu(gate.data(), ffn)) return 1;
                 for (int i = 0; i < ffn; i++) act[i] = gate[i] * up[i];
                 dn.assign(hidden_size, 0.0f);
-                mul_mat_weight(act.data(), down_w, dn.data(), 1, hidden_size, ffn, ffn, hidden_size, hidden_size);
+                mul_mat_weight(act.data(), down_w, dn.data(), 1, hidden_size, ffn, ffn, hidden_size, hidden_size,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
                 backend->sync();
                 if (!g_rmsnorm(dn.data(), dn.data(), hidden_size, get_float_ptr(postffw_w), rms_eps)) return 1;
                 for (int i = 0; i < hidden_size; i++) inp_embd[i] += dn[i];
@@ -2045,14 +2075,16 @@ int main(int argc, char* argv[]) {
                 if (inpgate_w && proj_w && postnorm_w) {
                     std::fill(pgate.begin(), pgate.end(), 0.0f);
                     mul_mat_weight(inp_embd.data(), inpgate_w, pgate.data(),
-                                   1, ple_dim, hidden_size, hidden_size, ple_dim, ple_dim);
+                                   1, ple_dim, hidden_size, hidden_size, ple_dim, ple_dim,
+                                   params.verbose ? &step_timings.matmul_ms : nullptr);
                     backend->sync();
                     const float* pli_L = pli.data() + static_cast<size_t>(L) * ple_dim;
                     if (!g_gelu(pgate.data(), ple_dim)) return 1;
                     for (int i = 0; i < ple_dim; i++) pgate[i] = pgate[i] * pli_L[i];
                     std::fill(inj.begin(), inj.end(), 0.0f);
                     mul_mat_weight(pgate.data(), proj_w, inj.data(),
-                                   1, hidden_size, ple_dim, ple_dim, hidden_size, hidden_size);
+                                   1, hidden_size, ple_dim, ple_dim, hidden_size, hidden_size,
+                                   params.verbose ? &step_timings.matmul_ms : nullptr);
                     backend->sync();
                     if (!g_rmsnorm(inj.data(), inj.data(), hidden_size, get_float_ptr(postnorm_w), rms_eps)) return 1;
                     for (int i = 0; i < hidden_size; i++) inp_embd[i] += inj[i];
