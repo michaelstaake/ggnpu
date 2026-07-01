@@ -1791,10 +1791,17 @@ int main(int argc, char* argv[]) {
         }
         return true;
     };
-    // Gemma GeGLU activation (tanh-approx GELU on the gate).
-    auto g_gelu = [](float x) {
-        const float k = 0.7978845608f;  // sqrt(2/pi)
-        return 0.5f * x * (1.0f + std::tanh(k * (x + 0.044715f * x * x * x)));
+    // Gemma GeGLU activation (tanh-approx GELU on the gate). NPU-dispatched
+    // via backend->gelu() in place; the caller does the cheap elementwise
+    // multiply by the FFN up-projection (or PLE per-layer gate) afterward.
+    auto g_gelu = [&](float* buf, int n) -> bool {
+        GeluParams gp{buf, buf, n};
+        if (backend->gelu(gp) != Status::OK) {
+            std::cerr << "Error: gemma GELU failed\n";
+            model.unload();
+            return false;
+        }
+        return true;
     };
 
     // Decode-style forward: one token per step (correct KV + causal attention).
@@ -2022,7 +2029,8 @@ int main(int argc, char* argv[]) {
                 mul_mat_weight(xn.data(), up_w, up.data(), 1, ffn, hidden_size, hidden_size, ffn, ffn);
                 backend->sync();
                 act.assign(ffn, 0.0f);
-                for (int i = 0; i < ffn; i++) act[i] = g_gelu(gate[i]) * up[i];
+                if (!g_gelu(gate.data(), ffn)) return 1;
+                for (int i = 0; i < ffn; i++) act[i] = gate[i] * up[i];
                 dn.assign(hidden_size, 0.0f);
                 mul_mat_weight(act.data(), down_w, dn.data(), 1, hidden_size, ffn, ffn, hidden_size, hidden_size);
                 backend->sync();
@@ -2040,7 +2048,8 @@ int main(int argc, char* argv[]) {
                                    1, ple_dim, hidden_size, hidden_size, ple_dim, ple_dim);
                     backend->sync();
                     const float* pli_L = pli.data() + static_cast<size_t>(L) * ple_dim;
-                    for (int i = 0; i < ple_dim; i++) pgate[i] = g_gelu(pgate[i]) * pli_L[i];
+                    if (!g_gelu(pgate.data(), ple_dim)) return 1;
+                    for (int i = 0; i < ple_dim; i++) pgate[i] = pgate[i] * pli_L[i];
                     std::fill(inj.begin(), inj.end(), 0.0f);
                     mul_mat_weight(pgate.data(), proj_w, inj.data(),
                                    1, hidden_size, ple_dim, ple_dim, hidden_size, hidden_size);

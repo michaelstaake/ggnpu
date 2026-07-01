@@ -91,6 +91,12 @@ struct SiluParams {
     int size;
 };
 
+struct GeluParams {
+    const float* input;
+    float* output;
+    int size;
+};
+
 struct AttnParams {
     const float* Q;
     const float* K;
@@ -144,6 +150,7 @@ public:
 
     virtual Status softmax(const SoftmaxParams& params) = 0;
     virtual Status silu(const SiluParams& params) = 0;
+    virtual Status gelu(const GeluParams& params) = 0;
     virtual Status flash_attn(const AttnParams& params) = 0;
     virtual void sync() = 0;
 

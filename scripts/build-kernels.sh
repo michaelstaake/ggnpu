@@ -218,6 +218,7 @@ Kernels=(
     "rmsnorm_4096:--M 2 --N 4096"
     "softmax:--rows 256 --cols 256"
     "silu:--N 8192"
+    "gelu:--N 8192"
     "rope:--n_pairs 32"
     "rope_256:--n_pairs 128"
     "rope_512:--n_pairs 256"

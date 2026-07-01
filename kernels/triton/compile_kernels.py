@@ -98,6 +98,15 @@ KERNELS = {
         "defaults": {"N": 8192},
         "transform": "silu_aie2p.mlir",
     },
+    "gelu": {
+        # tanh-approx GELU (used by Gemma4's GeGLU FFN gate). Reuses SiLU's
+        # transform as-is: the AIE2P pipeline (pad_and_promote_unary_bf16 etc.)
+        # is math-agnostic elementwise-unary, not specific to sigmoid(x)*x.
+        "description": "GELU activation (tanh approximation)",
+        "params": ["N"],
+        "defaults": {"N": 8192},
+        "transform": "silu_aie2p.mlir",
+    },
     "rope": {
         "description": "Rotary positional embeddings (pre-deinterleaved even/odd + precomputed cos/sin)",
         "params": ["n_pairs"],
@@ -695,6 +704,32 @@ def build_kernel_script(op: str, params: dict) -> str:
                 x = tl.load(X + offsets)
                 x_f32 = x.to(tl.float32)
                 sig = tl.sigmoid(x_f32)
+                y = (x_f32 * sig).to(x.dtype)
+                tl.store(Y + offsets, y)
+        """)
+
+    elif op == "gelu":
+        launch = textwrap.dedent(f"""
+            N = {p.get("N", 8192)}
+            x = torch.randn(N, dtype=torch.bfloat16)
+            y = torch.empty(N, dtype=torch.bfloat16)
+            grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
+            compiled = gelu_kernel[grid](x, y, N, BLOCK_SIZE=1024)
+        """)
+        kernel_src = textwrap.dedent("""
+            @triton.jit
+            def gelu_kernel(X, Y, n_elements: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+                pid = tl.program_id(0)
+                offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                x = tl.load(X + offsets)
+                x_f32 = x.to(tl.float32)
+                # tanh-approx GELU via the sigmoid identity tanh(z) = 2*sigmoid(2z)-1:
+                #   0.5*x*(1+tanh(k*(x+0.044715*x^3))) == x*sigmoid(2*k*(x+0.044715*x^3))
+                # Avoids depending on a tanh primitive in the AIE2P lowering — only
+                # sigmoid, already proven correct by the SiLU kernel.
+                k = 0.7978845608028654
+                inner = k * (x_f32 + 0.044715 * x_f32 * x_f32 * x_f32)
+                sig = tl.sigmoid(2.0 * inner)
                 y = (x_f32 * sig).to(x.dtype)
                 tl.store(Y + offsets, y)
         """)

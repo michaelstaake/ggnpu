@@ -208,6 +208,18 @@ public:
         return Status::OK;
     }
 
+    Status gelu(const GeluParams& params) override {
+        if (!params.input || !params.output) return Status::INVALID_PARAM;
+
+        const float k = 0.7978845608f;  // sqrt(2/pi)
+        for (int i = 0; i < params.size; i++) {
+            float x = params.input[i];
+            params.output[i] = 0.5f * x * (1.0f + std::tanh(k * (x + 0.044715f * x * x * x)));
+        }
+
+        return Status::OK;
+    }
+
     Status flash_attn(const AttnParams& params) override {
         // Proper decomposed flash attention v1:
         //   attn = softmax(Q @ K^T / sqrt(d)) @ V

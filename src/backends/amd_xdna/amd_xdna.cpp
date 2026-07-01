@@ -50,6 +50,7 @@ constexpr int kRmsnormKernelCols = 256;
 constexpr int kRmsnormKernelHidden = 2048;
 constexpr int kRmsnormHiddenPadRows = 2;  // M=2,N=2048 (row 0 duplicated; M=1 won't compile)
 constexpr int kSiluKernelSize = 8192;  // prebuilt silu xclbin default N
+constexpr int kGeluKernelSize = 8192;  // prebuilt gelu xclbin default N
 constexpr int kSoftmaxKernelRows = 256;  // prebuilt softmax xclbin is 256x256 bf16
 constexpr int kSoftmaxKernelCols = 256;
 constexpr int kRopePairs = 32;          // prebuilt rope xclbin: n_pairs=32 (head_dim=64, Llama 1B/3B)
@@ -98,6 +99,7 @@ namespace detail {
     std::vector<uint8_t> jit_compile_rope(int n_dims, int profile);
     std::vector<uint8_t> jit_compile_softmax(int cols, int rows, int profile);
     std::vector<uint8_t> jit_compile_silu(int size, int profile);
+    std::vector<uint8_t> jit_compile_gelu(int size, int profile);
     std::vector<uint8_t> jit_compile_flash_attn(int n_head, int head_dim, int64_t ctx_len, int profile);
     std::string make_cache_key(const std::string& op, int M, int N, int K, const std::string& profile);
     bool jit_compilation_available();
@@ -249,6 +251,15 @@ struct CachedSiluKernel {
     int size;
 };
 
+// Cached kernel for GELU (BF16) — same shape as CachedSiluKernel.
+struct CachedGeluKernel {
+    xrt::run run;
+    xrt::kernel krnl;
+    xrt::bo bo_instr;
+    size_t instr_words = 0;
+    int size;
+};
+
 struct BTileKey {
     const int8_t* B = nullptr;
     int n0 = 0;
@@ -340,6 +351,42 @@ static bool rmsnorm_npu_matches_cpu(const float* input, const float* npu_out, in
     // ~1.68%), and the RMSNorm output feeds int8-quantized projections that carry
     // ~1% error of their own. Bound at 2.5% peak with a proportional outlier
     // budget — well below the grossly-broken regime, above legit cross-model bf16.
+    if (max_diff / max_ref >= 0.025f) return false;
+    return mismatches <= std::max(1, N / 256);
+}
+
+static void gelu_cpu_ref(const float* input, float* output, int N) {
+    constexpr float k = 0.7978845608f;  // sqrt(2/pi)
+    for (int i = 0; i < N; i++) {
+        float x = input[i];
+        output[i] = 0.5f * x * (1.0f + std::tanh(k * (x + 0.044715f * x * x * x)));
+    }
+}
+
+// Validation-only reference, same shape as rmsnorm_npu_matches_cpu above.
+static bool gelu_npu_matches_cpu(const float* input, const float* npu_out, int N) {
+    auto qinput = roundtrip_bf16_f32(input, N);
+    std::vector<float> cpu_out(static_cast<size_t>(N));
+    gelu_cpu_ref(qinput.data(), cpu_out.data(), N);
+
+    constexpr float kRtol = 0.01f;
+    constexpr float kAtol = 0.02f;
+    float max_diff = 0.0f;
+    float max_ref = 0.0f;
+    int mismatches = 0;
+    for (int i = 0; i < N; i++) {
+        float ref = cpu_out[static_cast<size_t>(i)];
+        float diff = std::fabs(ref - npu_out[i]);
+        max_diff = std::max(max_diff, diff);
+        max_ref = std::max(max_ref, std::fabs(ref));
+        float tol = kAtol + kRtol * std::fabs(ref);
+        if (diff > tol) mismatches++;
+    }
+    if (max_ref < 1e-6f) return true;
+    if (std::getenv("GGNPU_GELU_DEBUG"))
+        std::cerr << "[gelu validate] N=" << N << " max_diff/max_ref="
+                  << (max_diff / max_ref) << " mismatches=" << mismatches
+                  << " (limit " << std::max(1, N / 256) << ")\n";
     if (max_diff / max_ref >= 0.025f) return false;
     return mismatches <= std::max(1, N / 256);
 }
@@ -1582,6 +1629,127 @@ public:
         return Status::OK;
     }
 
+    // GELU (tanh-approx, used by Gemma4's GeGLU FFN gate). Structurally
+    // identical to silu() above — tiled through the fixed kGeluKernelSize
+    // kernel for non-exact N.
+    Status gelu(const GeluParams& params) override {
+        if (!params.input || !params.output || params.size <= 0) {
+            last_status_ = Status::INVALID_PARAM;
+            return last_status_;
+        }
+
+        int N = params.size;
+        std::string cache_key = "gelu_" + std::to_string(N) + "_" + profile_str_;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = gelu_kernels_.find(N);
+        if (it == gelu_kernels_.end() && gelu_tiled_sizes_.find(N) == gelu_tiled_sizes_.end()) {
+            if (ensure_gelu_kernel(N, cache_key)) {
+                it = gelu_kernels_.find(N);
+            } else {
+                gelu_tiled_sizes_.insert(N);
+            }
+        }
+
+        // gelu() is normally called in place (input == output, e.g. gemma4's
+        // GeGLU gate buffer); snapshot the pre-computation input now, before
+        // dispatch overwrites it, so validate_gelu_once() below compares
+        // against the real input rather than the just-written output.
+        const bool need_validation = gelu_validated_.find(N) == gelu_validated_.end();
+        std::vector<float> input_snapshot;
+        if (need_validation) {
+            input_snapshot.assign(params.input, params.input + N);
+        }
+
+        if (it != gelu_kernels_.end()) {
+            if (run_gelu_launch(it->second, params.input, params.output, N, N) != Status::OK)
+                return last_status_;
+            return validate_gelu_once(need_validation ? input_snapshot.data() : nullptr, params.output, N);
+        }
+
+        auto k8 = gelu_kernels_.find(kGeluKernelSize);
+        if (k8 == gelu_kernels_.end()) {
+            if (ensure_gelu_kernel(kGeluKernelSize,
+                                   "gelu_" + std::to_string(kGeluKernelSize) + "_" + profile_str_))
+                k8 = gelu_kernels_.find(kGeluKernelSize);
+        }
+        if (k8 == gelu_kernels_.end()) {
+            std::cerr << "Error: GELU NPU kernel unavailable for N=" << N
+                      << " (no exact kernel and no " << kGeluKernelSize << " tiling kernel)\n";
+            std::cerr << "  Build: ./scripts/build-kernels.sh npu6 gelu\n";
+            last_status_ = Status::NPU_UNAVAILABLE;
+            return last_status_;
+        }
+        for (int off = 0; off < N; off += kGeluKernelSize) {
+            int chunk = std::min(kGeluKernelSize, N - off);
+            if (run_gelu_launch(k8->second, params.input + off, params.output + off,
+                                chunk, kGeluKernelSize) != Status::OK)
+                return last_status_;
+        }
+        return validate_gelu_once(need_validation ? input_snapshot.data() : nullptr, params.output, N);
+    }
+
+    // First call for a given N validates the NPU output against a CPU
+    // reference (same pattern as RMSNorm's rmsnorm_validated_ gate). `input`
+    // must be a snapshot taken before dispatch — gelu() is normally called
+    // in place, so params.input may already equal the post-computation
+    // output by the time this runs. input == nullptr means N was already
+    // validated by an earlier call (no snapshot was taken).
+    Status validate_gelu_once(const float* input, const float* output, int N) {
+        if (input && gelu_validated_.find(N) == gelu_validated_.end()) {
+            gelu_validated_.insert(N);
+            if (!gelu_npu_matches_cpu(input, output, N)) {
+                std::cerr << "Error: GELU NPU kernel failed bf16-aware validation for N=" << N << "\n";
+                last_status_ = Status::ERROR;
+                return last_status_;
+            }
+        }
+        return Status::OK;
+    }
+
+    // Run one GELU launch — same bf16 marshaling as run_silu_launch().
+    Status run_gelu_launch(CachedGeluKernel& kernel, const float* input, float* output,
+                           int n, int kernel_n) {
+        if (!kernel.bo_instr || kernel.instr_words == 0) {
+            std::cerr << "Error: GELU xclbin missing BF16 instruction sequence\n";
+            last_status_ = Status::NPU_UNAVAILABLE;
+            return last_status_;
+        }
+        size_t bf16_bytes = static_cast<size_t>(kernel_n) * sizeof(uint16_t);
+
+        std::vector<float> padded;
+        const float* src = input;
+        if (n < kernel_n) {              // zero-pad the final/short chunk
+            padded.assign(static_cast<size_t>(kernel_n), 0.0f);
+            std::memcpy(padded.data(), input, static_cast<size_t>(n) * sizeof(float));
+            src = padded.data();
+        }
+        std::vector<uint8_t> bf16_input = convert_f32_to_bf16(src, kernel_n);
+
+        if (!buf_gelu_bf16_in_ || buf_gelu_bf16_in_->size() < bf16_bytes)
+            buf_gelu_bf16_in_ = buf_mgr_->alloc(bf16_bytes, true);
+        if (!buf_gelu_bf16_out_ || buf_gelu_bf16_out_->size() < bf16_bytes)
+            buf_gelu_bf16_out_ = buf_mgr_->alloc(bf16_bytes, true);
+
+        buf_mgr_->copy_to(*buf_gelu_bf16_in_, bf16_input.data(), bf16_bytes);
+        try {
+            kernel.run(kNpuOpcode, kernel.bo_instr, kernel.instr_words,
+                       buf_gelu_bf16_in_->handle(), buf_gelu_bf16_out_->handle());
+            kernel.run.wait();
+        } catch (const std::exception& e) {
+            std::cerr << "Error: GELU kernel execution failed: " << e.what() << "\n";
+            last_status_ = Status::ERROR;
+            return last_status_;
+        }
+
+        std::vector<uint8_t> bf16_out_data(bf16_bytes);
+        buf_mgr_->copy_from(*buf_gelu_bf16_out_, bf16_out_data.data(), bf16_bytes);
+        auto f32_result = convert_bf16_to_f32(bf16_out_data.data(), n);
+        std::memcpy(output, f32_result.data(), static_cast<size_t>(n) * sizeof(float));
+        return Status::OK;
+    }
+
     // Fused flash_attn Triton kernel has no working mlir transform yet (scf.for +
     // online softmax). Host f32 decomposed attention matches cpu_ref; INT8 NPU matmul
     // QK/AV loses too much precision for coherent 16-layer inference.
@@ -2436,6 +2604,62 @@ private:
         }
     }
 
+    // Load or compile the GELU kernel. Unlike silu (preloaded at startup),
+    // gelu is loaded lazily from a shaped prebuilt file the first time it's
+    // needed — no hw_ctx_gelu_/startup-preload path.
+    bool ensure_gelu_kernel(int size, const std::string& cache_key) {
+        if (cache_->has_xclbin(cache_key)) {
+            return load_gelu_kernel_for_shape(cache_->get_xclbin_path(cache_key), size, cache_key);
+        }
+
+        // The default prebuilt gelu_<profile>.xclbin is compiled for exactly
+        // kGeluKernelSize elements (fixed grid/BLOCK_SIZE) — only match it for
+        // that exact size. Other sizes must tile through it (see gelu() below)
+        // or JIT-compile their own exact-N kernel.
+        if (size == kGeluKernelSize) {
+            std::string shaped_name = "gelu_" + profile_str_ + ".xclbin";
+            std::string shaped_path = detail::find_prebuilt_xclbin(shaped_name, cache_dir_);
+            if (!shaped_path.empty()) {
+                return load_gelu_kernel_for_shape(shaped_path, size, cache_key);
+            }
+        }
+
+        if (detail::jit_compilation_available()) {
+            std::vector<uint8_t> xclbin_data = detail::jit_compile_gelu(size, npu_profile_);
+            if (!xclbin_data.empty()) {
+                cache_->store_xclbin(cache_key, xclbin_data);
+                return load_gelu_kernel_for_shape(cache_->get_xclbin_path(cache_key), size, cache_key);
+            }
+        }
+
+        return false;
+    }
+
+    bool load_gelu_kernel_for_shape(const std::string& path, int size, const std::string& cache_key) {
+        (void)cache_key;
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) return false;
+
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);
+
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
+            xrt::run run(krnl);
+
+            CachedGeluKernel cached{run, krnl, {}, 0, size};
+            std::string seq_path = detail::find_prebuilt_sequence("gelu_" + profile_str_ + ".xclbin", cache_dir_);
+            if (!seq_path.empty()) {
+                load_instr_bo(*device_, krnl, cached.bo_instr, cached.instr_words, seq_path);
+            }
+            gelu_kernels_[size] = std::move(cached);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load gelu kernel: " << e.what() << "\n";
+            return false;
+        }
+    }
+
     // Load or compile the RoPE kernel
     bool ensure_rope_kernel(int n_dims, int N, const std::string& cache_key) {
         if (cache_->has_xclbin(cache_key)) {
@@ -2697,6 +2921,9 @@ private:
     std::shared_ptr<XrtBuffer> buf_silu_bf16_out_;
     std::shared_ptr<XrtBuffer> buf_silu_out_;
 
+    std::shared_ptr<XrtBuffer> buf_gelu_bf16_in_;
+    std::shared_ptr<XrtBuffer> buf_gelu_bf16_out_;
+
     std::shared_ptr<XrtBuffer> buf_fa_q_;
     std::shared_ptr<XrtBuffer> buf_fa_k_;
     std::shared_ptr<XrtBuffer> buf_fa_v_;
@@ -2711,6 +2938,8 @@ private:
     std::unordered_map<std::pair<int, int>, CachedSoftmaxKernel, PairHash> softmax_kernels_;
     std::unordered_map<int, CachedSiluKernel> silu_kernels_;
     std::unordered_set<int> silu_tiled_sizes_;  // N with no exact kernel -> tile via 8192
+    std::unordered_map<int, CachedGeluKernel> gelu_kernels_;
+    std::unordered_set<int> gelu_tiled_sizes_;  // N with no exact kernel -> tile via 8192
     std::unordered_map<std::tuple<int, int, int64_t>, CachedFlashAttnKernel, TupleHash> flash_attn_kernels_;
     std::unordered_map<int, CachedRopeKernel> rope_kernels_;
 
@@ -2721,6 +2950,7 @@ private:
     Status last_status_;
     mutable std::mutex mutex_;
     std::unordered_set<int> rmsnorm_validated_;  // hidden sizes validated vs CPU ref
+    std::unordered_set<int> gelu_validated_;      // sizes validated vs CPU ref
 };
 
 std::shared_ptr<Backend> create_amd_xdna_backend(int device_id) {

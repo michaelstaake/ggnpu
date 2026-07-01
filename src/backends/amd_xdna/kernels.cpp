@@ -385,6 +385,18 @@ std::vector<uint8_t> jit_compile_silu(int size, int npu_profile) {
 }
 
 //====//
+// JIT compile gelu kernel
+//====//
+std::vector<uint8_t> jit_compile_gelu(int size, int npu_profile) {
+    std::string profile_str;
+    if (npu_profile == 4) profile_str = "npu4";
+    else if (npu_profile == 5) profile_str = "npu5";
+    else profile_str = "npu6";
+
+    return jit_compile_kernel("gelu", profile_str, npu_profile);
+}
+
+//====//
 // JIT compile flash_attn kernel
 //====//
 std::vector<uint8_t> jit_compile_flash_attn(int n_head, int head_dim, int64_t ctx_len, int npu_profile) {
