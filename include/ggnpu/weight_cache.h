@@ -134,7 +134,10 @@ private:
     std::string make_key(const std::string& tensor_name, GgmlType type, size_t data_size = 0) {
         std::hash<std::string> hasher;
         size_t hash = hasher(tensor_name);
-        const char* ver = (type == GgmlType::Q4_K || type == GgmlType::Q6_K) ? "w3_" : "w_";
+        // Versioned prefixes bust stale on-disk decodes after a decoder change.
+        // Q4_0 bumped to w4_ (per-row int8 rewrite; earlier per-block was broken).
+        const char* ver = (type == GgmlType::Q4_K || type == GgmlType::Q6_K) ? "w3_"
+                        : (type == GgmlType::Q4_0) ? "w4_" : "w_";
         return std::string(ver) + std::to_string(hash) + "_t" + std::to_string(static_cast<int>(type))
                + "_" + std::to_string(data_size);
     }

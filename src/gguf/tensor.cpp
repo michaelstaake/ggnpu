@@ -23,7 +23,10 @@ constexpr size_t block_sizes[] = {
 };
 
 constexpr size_t type_sizes[] = {
-    4, 2, 16, 18, 1, 1,
+    // Q4_0 block is 18 bytes: fp16 scale (2) + 16 packed 4-bit nibbles (32 vals).
+    // (The other legacy low-bit sizes here — Q4_1/Q5_0/Q5_1 — are unused and
+    // unverified; only Q4_0 and the K-quants/Q8_0 are exercised.)
+    4, 2, 18, 18, 1, 1,
     20, 22, 34, 34, 84, 110,
     144, 176, 210, 292, 66, 74,
     98, 50, 18, 110, 82, 136,

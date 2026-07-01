@@ -12,6 +12,7 @@ namespace ggnpu {
 //   int8_output:  dequantized INT8 values (block_size per block)
 //   scales_output: per-block or per-group scales
 void decode_q4_0_for_npu(const uint8_t* gguf_data, size_t data_size,
+                         int64_t n_rows, int64_t n_cols,
                          std::vector<int8_t>& int8_output,
                          std::vector<float>& scales_output);
 

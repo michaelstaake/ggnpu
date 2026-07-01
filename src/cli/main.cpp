@@ -21,6 +21,7 @@
 #include "tokenizer.h"
 #include "weight_cache.h"
 #include "quant/kquant.h"
+#include "quant/q4_0.h"
 
 namespace ggnpu {
 
@@ -33,6 +34,25 @@ void dequant_tensor_row(const TensorView* tv, int row, float* out, int row_dim) 
     if (tv->type == GgmlType::F32) {
         const float* src = reinterpret_cast<const float*>(tv->data);
         std::memcpy(out, src + static_cast<size_t>(row) * row_dim, static_cast<size_t>(row_dim) * sizeof(float));
+        return;
+    }
+
+    if (tv->type == GgmlType::Q4_0) {
+        constexpr int QK4_0 = 32;
+        constexpr size_t Q4_0_BLOCK_BYTES = 18;
+        const size_t blocks_per_row =
+            (static_cast<size_t>(row_dim) + QK4_0 - 1) / QK4_0;
+        const size_t row_bytes = blocks_per_row * Q4_0_BLOCK_BYTES;
+        const uint8_t* row_data =
+            static_cast<const uint8_t*>(tv->data) + static_cast<size_t>(row) * row_bytes;
+        std::vector<float> block_f32(QK4_0);
+        for (size_t b = 0; b < blocks_per_row; b++) {
+            dequant_q4_0_block(row_data + b * Q4_0_BLOCK_BYTES, block_f32.data());
+            for (int j = 0; j < QK4_0; j++) {
+                size_t k = b * QK4_0 + j;
+                if (k < static_cast<size_t>(row_dim)) out[k] = block_f32[j];
+            }
+        }
         return;
     }
 
@@ -87,7 +107,8 @@ void compute_logits(const float* hidden, const TensorView* weight, float* logits
 
     bool npu_path = backend.name() == "amd_xdna";
 
-    if (npu_path && (weight->type == GgmlType::Q4_K || weight->type == GgmlType::Q6_K)) {
+    if (npu_path && (weight->type == GgmlType::Q4_K || weight->type == GgmlType::Q6_K ||
+                     weight->type == GgmlType::Q4_0)) {
         const int8_t* decoded = weight_cache.get_or_decode(*weight);
         if (!decoded) goto cpu_fallback;
 
@@ -443,7 +464,8 @@ bool report_compare(const char* label, const CompareResult& r, int n,
 }
 
 bool attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cache) {
-    if (!w || (w->type != GgmlType::Q4_K && w->type != GgmlType::Q6_K)) {
+    if (!w || (w->type != GgmlType::Q4_K && w->type != GgmlType::Q6_K &&
+               w->type != GgmlType::Q4_0)) {
         return true;
     }
     const auto& scales = cache.get_scales(*w);
@@ -1681,6 +1703,79 @@ int main(int argc, char* argv[]) {
 
     model.kv_cache().reset();
 
+    // ---- Gemma 4 (gemma4) forward path — Phase G2 skeleton ----
+    // Gemma 4 E2B: per-layer head_dim (256 local / 512 global), num_kv_heads=1,
+    // KV sharing (layers without attn_k/attn_v reuse an earlier same-type layer),
+    // QK-norm, 4 sandwich RMSNorms with the (1+w) weight convention, GeGLU FFN,
+    // NeoX RoPE with per-type freq base, sqrt(hidden) embedding scale, and final
+    // logit soft-capping. PLE (per-layer embeddings, inp_gate/proj/per_layer_*),
+    // post_norm, layer_output_scale and sliding-window masking are deferred to
+    // G3/G4 — the core decoder still runs (degraded) without them.
+    const bool is_gemma = (model.gguf().arch() == "gemma4");
+    struct GemmaLayer { int head_dim; bool is_swa; float rope_base; int ffn; int kv_src; };
+    std::vector<GemmaLayer> gplan;
+    std::vector<std::vector<float>> gk_store, gv_store;  // per-owning-layer KV: [pos*head_dim]
+    float gemma_embd_scale = 1.0f;
+    const float gemma_logit_softcap =
+        static_cast<float>(model.gguf().get_float("gemma4.final_logit_softcapping", 0.0));
+    if (is_gemma) {
+        const double rb_global = model.gguf().get_float("gemma4.rope.freq_base", 1e6);
+        const double rb_swa = model.gguf().get_float("gemma4.rope.freq_base_swa", 1e4);
+        auto ffn_arr = model.gguf().get_int_array(model.gguf().arch_key("feed_forward_length"));
+        auto swa_arr = model.gguf().get_int_array(model.gguf().arch_key("attention.sliding_window_pattern"));
+        gplan.resize(num_layers);
+        int last_local_kv = -1, last_global_kv = -1;
+        for (int L = 0; L < num_layers; L++) {
+            const TensorView* qw = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", L);
+            const TensorView* kw = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", L);
+            GemmaLayer gl;
+            gl.head_dim = (qw && num_heads > 0) ? static_cast<int>(qw->dims[1] / num_heads) : head_dim;
+            gl.is_swa = (L < static_cast<int>(swa_arr.size())) ? (swa_arr[L] != 0) : true;
+            gl.rope_base = gl.is_swa ? static_cast<float>(rb_swa) : static_cast<float>(rb_global);
+            gl.ffn = (L < static_cast<int>(ffn_arr.size())) ? static_cast<int>(ffn_arr[L]) : ffn_size;
+            if (kw) {
+                gl.kv_src = L;
+                if (gl.is_swa) last_local_kv = L; else last_global_kv = L;
+            } else {
+                gl.kv_src = gl.is_swa ? last_local_kv : last_global_kv;
+            }
+            gplan[L] = gl;
+        }
+        gk_store.resize(num_layers);
+        gv_store.resize(num_layers);
+        gemma_embd_scale = std::sqrt(static_cast<float>(hidden_size));
+        std::cout << "gemma4 forward (G2 skeleton): " << num_layers << " layers, "
+                  << "num_heads=" << num_heads << ", softcap=" << gemma_logit_softcap << "\n";
+    }
+
+    // Gemma RMSNorm with the (1+w) weight convention (host; sizes 256/512/1536).
+    auto g_rmsnorm = [](float* out, const float* in, int n, const float* w, float eps) {
+        double ss = 0.0;
+        for (int i = 0; i < n; i++) ss += static_cast<double>(in[i]) * in[i];
+        float scale = 1.0f / std::sqrt(static_cast<float>(ss / n) + eps);
+        for (int i = 0; i < n; i++) out[i] = in[i] * scale * (1.0f + w[i]);
+    };
+    // Gemma NeoX RoPE (rotate halves i, i+hd/2), per-layer freq base, over full head_dim.
+    auto g_rope = [](float* v, int n_heads, int hd, int64_t pos, float base) {
+        int half = hd / 2;
+        for (int h = 0; h < n_heads; h++) {
+            float* p = v + static_cast<size_t>(h) * hd;
+            for (int i = 0; i < half; i++) {
+                float freq = std::pow(base, -(2.0f * i) / hd);
+                float ang = static_cast<float>(pos) * freq;
+                float c = std::cos(ang), s = std::sin(ang);
+                float x0 = p[i], x1 = p[i + half];
+                p[i] = x0 * c - x1 * s;
+                p[i + half] = x0 * s + x1 * c;
+            }
+        }
+    };
+    // Gemma GeGLU activation (tanh-approx GELU on the gate).
+    auto g_gelu = [](float x) {
+        const float k = 0.7978845608f;  // sqrt(2/pi)
+        return 0.5f * x * (1.0f + std::tanh(k * (x + 0.044715f * x * x * x)));
+    };
+
     // Decode-style forward: one token per step (correct KV + causal attention).
     if (!params.bench_logits) {
         std::cout << "Generating: ";
@@ -1725,8 +1820,122 @@ int main(int argc, char* argv[]) {
             dequant_tensor_row(tok_embd, tok, inp_embd.data(), hidden_size);
         }
 
-        // Transformer layers
-        for (int layer = 0; layer < max_layers_override; layer++) {
+        // ---- Gemma 4 forward (G2 skeleton) ----
+        if (is_gemma) {
+            for (int i = 0; i < hidden_size; i++) inp_embd[i] *= gemma_embd_scale;
+
+            std::vector<float> xn(hidden_size), q, kbuf, vbuf, attn_in, attn_o(hidden_size);
+            std::vector<float> gate, up, act, dn(hidden_size), kexp, vexp;
+
+            for (int L = 0; L < max_layers_override; L++) {
+                const GemmaLayer& gl = gplan[L];
+                const int hd = gl.head_dim;
+                const int qdim = num_heads * hd;
+
+                const TensorView* attn_norm_w = find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", L);
+                const TensorView* q_w = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", L);
+                const TensorView* qn_w = find_tensor_pattern(model, "blk.{layer}.attn_q_norm.weight", L);
+                const TensorView* o_w = find_tensor_pattern(model, "blk.{layer}.attn_output.weight", L);
+                const TensorView* postattn_w = find_tensor_pattern(model, "blk.{layer}.post_attention_norm.weight", L);
+                const TensorView* ffnnorm_w = find_tensor_pattern(model, "blk.{layer}.ffn_norm.weight", L);
+                const TensorView* gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", L);
+                const TensorView* up_w = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", L);
+                const TensorView* down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", L);
+                const TensorView* postffw_w = find_tensor_pattern(model, "blk.{layer}.post_ffw_norm.weight", L);
+
+                // Attention input norm.
+                g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(attn_norm_w), rms_eps);
+
+                // Q projection -> per-head QK-norm -> RoPE.
+                q.assign(qdim, 0.0f);
+                mul_mat_weight(xn.data(), q_w, q.data(), 1, qdim, hidden_size, hidden_size, qdim, qdim);
+                backend->sync();
+                for (int h = 0; h < num_heads; h++)
+                    g_rmsnorm(q.data() + h * hd, q.data() + h * hd, hd, get_float_ptr(qn_w), rms_eps);
+                g_rope(q.data(), num_heads, hd, pos, gl.rope_base);
+
+                // K/V: compute + append if this layer owns them, else reuse the source layer's store.
+                if (gl.kv_src == L) {
+                    const TensorView* k_w = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", L);
+                    const TensorView* v_w = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", L);
+                    const TensorView* kn_w = find_tensor_pattern(model, "blk.{layer}.attn_k_norm.weight", L);
+                    kbuf.assign(hd, 0.0f);
+                    vbuf.assign(hd, 0.0f);
+                    mul_mat_weight(xn.data(), k_w, kbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd);
+                    mul_mat_weight(xn.data(), v_w, vbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd);
+                    backend->sync();
+                    g_rmsnorm(kbuf.data(), kbuf.data(), hd, get_float_ptr(kn_w), rms_eps);
+                    g_rope(kbuf.data(), 1, hd, pos, gl.rope_base);
+                    gk_store[L].insert(gk_store[L].end(), kbuf.begin(), kbuf.end());
+                    gv_store[L].insert(gv_store[L].end(), vbuf.begin(), vbuf.end());
+                }
+
+                const int src = gl.kv_src;
+                const int64_t ctx_len = pos + 1;
+                // Broadcast the single KV head to all query heads (num_kv_heads=1).
+                kexp.assign(static_cast<size_t>(num_heads) * ctx_len * hd, 0.0f);
+                vexp.assign(static_cast<size_t>(num_heads) * ctx_len * hd, 0.0f);
+                const std::vector<float>& ks = gk_store[src];
+                const std::vector<float>& vs = gv_store[src];
+                for (int h = 0; h < num_heads; h++) {
+                    for (int64_t j = 0; j < ctx_len; j++) {
+                        std::memcpy(kexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
+                                    ks.data() + static_cast<size_t>(j) * hd, hd * sizeof(float));
+                        std::memcpy(vexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
+                                    vs.data() + static_cast<size_t>(j) * hd, hd * sizeof(float));
+                    }
+                }
+
+                // Causal attention (host f32); SWA masking deferred to G4.
+                attn_in.assign(qdim, 0.0f);
+                AttnParams fa;
+                fa.Q = q.data();
+                fa.K = kexp.data();
+                fa.V = vexp.data();
+                fa.output = attn_in.data();
+                fa.batch_size = 1;
+                fa.n_head = num_heads;
+                fa.head_dim = hd;
+                fa.ctx_len = ctx_len;
+                fa.query_pos = pos;
+                fa.freq_factors = nullptr;
+                if (backend->flash_attn(fa) != Status::OK) {
+                    std::cerr << "Error: gemma flash_attn failed at layer " << L << "\n";
+                    model.unload();
+                    return 1;
+                }
+
+                // Output projection -> post-attention norm -> residual.
+                attn_o.assign(hidden_size, 0.0f);
+                mul_mat_weight(attn_in.data(), o_w, attn_o.data(), 1, hidden_size, qdim, qdim, hidden_size, hidden_size);
+                backend->sync();
+                g_rmsnorm(attn_o.data(), attn_o.data(), hidden_size, get_float_ptr(postattn_w), rms_eps);
+                for (int i = 0; i < hidden_size; i++) inp_embd[i] += attn_o[i];
+
+                // FFN: pre-norm -> GeGLU -> down -> post-FFN norm -> residual.
+                g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(ffnnorm_w), rms_eps);
+                const int ffn = gl.ffn;
+                gate.assign(ffn, 0.0f);
+                up.assign(ffn, 0.0f);
+                mul_mat_weight(xn.data(), gate_w, gate.data(), 1, ffn, hidden_size, hidden_size, ffn, ffn);
+                mul_mat_weight(xn.data(), up_w, up.data(), 1, ffn, hidden_size, hidden_size, ffn, ffn);
+                backend->sync();
+                act.assign(ffn, 0.0f);
+                for (int i = 0; i < ffn; i++) act[i] = g_gelu(gate[i]) * up[i];
+                dn.assign(hidden_size, 0.0f);
+                mul_mat_weight(act.data(), down_w, dn.data(), 1, hidden_size, ffn, ffn, hidden_size, hidden_size);
+                backend->sync();
+                g_rmsnorm(dn.data(), dn.data(), hidden_size, get_float_ptr(postffw_w), rms_eps);
+                for (int i = 0; i < hidden_size; i++) inp_embd[i] += dn[i];
+            }
+
+            // Final norm into inp_norm (fed to logits below).
+            const TensorView* out_norm_w = find_tensor(model, "output_norm.weight");
+            g_rmsnorm(inp_norm.data(), inp_embd.data(), hidden_size, get_float_ptr(out_norm_w), rms_eps);
+        }
+
+        // Transformer layers (non-gemma path)
+        for (int layer = 0; !is_gemma && layer < max_layers_override; layer++) {
             const TensorView* attn_norm_w =
                 find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", layer);
             const TensorView* ffn_norm_w =
@@ -1925,9 +2134,10 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Final normalization (output_norm before logits)
-        const TensorView* output_norm_w = find_tensor(model, "output_norm.weight");
-        {
+        // Final normalization (output_norm before logits) — non-gemma path
+        // (the gemma branch above already wrote inp_norm with its (1+w) norm).
+        if (!is_gemma) {
+            const TensorView* output_norm_w = find_tensor(model, "output_norm.weight");
             ScopedTimer t(step_timings.rms_norm_ms);
             if (!rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,
                           get_float_ptr(output_norm_w))) {
@@ -1954,6 +2164,12 @@ int main(int argc, char* argv[]) {
         }
 
         backend->sync();
+
+        // Gemma 4 final logit soft-capping: cap * tanh(logit / cap).
+        if (is_gemma && gemma_logit_softcap > 0.0f) {
+            for (float& l : logits)
+                l = gemma_logit_softcap * std::tanh(l / gemma_logit_softcap);
+        }
 
         if (params.bench_logits) {
             if (params.verbose) {

@@ -14,7 +14,7 @@ void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
                     std::vector<float>& scales_output) {
     switch (type) {
         case GgmlType::Q4_0:
-            decode_q4_0_for_npu(gguf_data, data_size, int8_output, scales_output);
+            decode_q4_0_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
             break;
 
         case GgmlType::Q8_0:
