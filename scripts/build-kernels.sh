@@ -263,6 +263,14 @@ for kernel_def in "${Kernels[@]}"; do
     elif [[ "$kernel_name" =~ ^rope_[0-9]+$ ]]; then
         compile_op="rope"
         shaped_install="$kernel_name"
+    # matmul_small_m_deepk_<K> (deep-K span) compiles under op
+    # "matmul_small_m_deepk", installs shaped. K must be a power of 2 (Triton
+    # tl.arange constraint on BLOCK_SIZE_K) — non-pow2 K (e.g. Gemma4's 1536)
+    # instead reuses the default 2048 kernel with a zero-padded partial tile
+    # (see kDeepK/ensure_matmul_deepk_kernel in amd_xdna.cpp), no new xclbin.
+    elif [[ "$kernel_name" =~ ^matmul_small_m_deepk_[0-9]+$ ]]; then
+        compile_op="matmul_small_m_deepk"
+        shaped_install="$kernel_name"
     elif [ "$kernel_name" = "flash_attn_32x64x2048" ]; then
         compile_op="flash_attn"
         shaped_install="flash_attn_32x64x2048"

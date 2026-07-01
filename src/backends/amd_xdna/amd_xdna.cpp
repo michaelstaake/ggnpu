@@ -40,9 +40,19 @@ constexpr int kMatmulTile = 256;  // prebuilt matmul xclbin is fixed 256x256x256
 // present (override off with GGNPU_NO_SMALL_M=1).
 constexpr int kSmallMTile = 16;
 // Deep-K decode matmul: the small-M kernel recompiled with the K reduction done
-// in-kernel at this width instead of 256, so one launch replaces K/256 separate
-// tile launches + host accumulation. mul_mat_q uses it for M<=16 matmuls whose K
-// is a multiple of kDeepK (override off with GGNPU_NO_DEEPK=1).
+// in-kernel at this width instead of 256, so one launch replaces up to K/256
+// separate tile launches + host accumulation (override off with
+// GGNPU_NO_DEEPK=1). BLOCK_SIZE_K must be a power of 2 (Triton tl.arange
+// constraint), so only kDeepK=2048 (Llama's hidden size) is buildable — a
+// non-multiple K (e.g. Gemma4's hidden=1536) still uses it: the existing
+// K-tiling loop (`for k0 in 0..K step T_k; kc = min(T_k, K-k0)`) already
+// zero-pads a partial final tile, so K<2048 gets exactly ONE padded launch
+// and K>2048-not-a-multiple gets ceil(K/2048) launches with a padded last
+// one — both correct (zero padding contributes nothing to the dot product)
+// and still far fewer launches than the 256-wide fallback. Profiled
+// 2026-07-01: 7 of 9 gemma4 per-layer matmuls have K=1536, which the old
+// exact-multiple-only condition rejected entirely, falling back to 6 plain
+// 256-K-tile launches each.
 constexpr int kDeepK = 2048;
 // Prebuilt rmsnorm xclbin is M=1,N=2048 bf16 (Llama 3.2 hidden). Legacy 32x256
 // xclbins still work for N=256 bench sizes; rebuild with compile_kernels.py for 2048.
@@ -493,20 +503,24 @@ public:
         const bool use_small_m = (M <= kSmallMTile) &&
                                  (std::getenv("GGNPU_NO_SMALL_M") == nullptr) &&
                                  ensure_matmul_small_m_kernel();
-        // Deep-K: when the matmul is small-M and K is a whole number of kDeepK
-        // spans, fold the K reduction into the kernel (one launch per kDeepK of K
-        // instead of kDeepK/256 launches). Same INT8 datapath; only the K extent
-        // per launch grows, so A/B/C packing generalizes with T_k.
-        const bool use_deepk = use_small_m && (K % kDeepK == 0) &&
-                               (std::getenv("GGNPU_NO_DEEPK") == nullptr) &&
-                               ensure_matmul_small_m_deepk_kernel();
-        CachedMatmulKernel& active_kernel = use_deepk ? matmul_small_m_deepk_kernel_
+        // Deep-K: when the matmul is small-M and K is large enough to benefit
+        // (see kDeepK's comment — worth it whenever K > kMatmulTile, exact
+        // multiple or not; the K-tiling loop below zero-pads any partial last
+        // tile). Same INT8 datapath; only the K extent per launch grows, so
+        // A/B/C packing generalizes with T_k.
+        int deepk_span = 0;
+        if (use_small_m && K > kMatmulTile && std::getenv("GGNPU_NO_DEEPK") == nullptr &&
+            ensure_matmul_deepk_kernel(kDeepK)) {
+            deepk_span = kDeepK;
+        }
+        const bool use_deepk = deepk_span != 0;
+        CachedMatmulKernel& active_kernel = use_deepk ? matmul_deepk_kernels_.at(deepk_span)
                                             : use_small_m ? matmul_small_m_kernel_ : kernel;
         std::vector<MatmulPipelineSlot>& slots =
-            use_deepk ? matmul_small_m_deepk_slots_
+            use_deepk ? matmul_deepk_slots_[deepk_span]
             : use_small_m ? matmul_small_m_slots_ : matmul_slots_;
         const int T_m = use_small_m ? kSmallMTile : kMatmulTile;
-        const int T_k = use_deepk ? kDeepK : kMatmulTile;  // K extent per launch
+        const int T_k = use_deepk ? deepk_span : kMatmulTile;  // K extent per launch
 
         if (!active_kernel.bo_instr || active_kernel.instr_words == 0) {
             std::cerr << "Error: matmul instruction sequence (matmul_" << profile_str_
@@ -2186,42 +2200,47 @@ private:
         }
     }
 
-    // Lazily load the deep-K decode matmul xclbin (matmul_small_m_deepk_<profile>
-    // .xclbin, M=16 N=256 K=kDeepK INT8). Returns false (cached) when absent so
-    // callers fall back to the 256-K-tiled small-M path.
-    bool ensure_matmul_small_m_deepk_kernel() {
-        if (matmul_small_m_deepk_loaded_) return true;
-        if (matmul_small_m_deepk_unavailable_) return false;
-        std::string name = "matmul_small_m_deepk_" + profile_str_ + ".xclbin";
+    // Lazily load a deep-K decode matmul xclbin for the given K span (M=16
+    // N=256 K=span INT8). The default span (kDeepK, built first for Llama)
+    // keeps the original unshaped filename for backward compat with already-
+    // built xclbins; other spans use the shaped "matmul_small_m_deepk_<span>_
+    // <profile>.xclbin" naming (same pattern as rmsnorm_<N>/rope_<n_dims>).
+    // Returns false (cached per span) when absent so callers fall back to the
+    // 256-K-tiled small-M path.
+    bool ensure_matmul_deepk_kernel(int span) {
+        if (matmul_deepk_kernels_.find(span) != matmul_deepk_kernels_.end()) return true;
+        if (matmul_deepk_unavailable_.find(span) != matmul_deepk_unavailable_.end()) return false;
+        std::string name = (span == kDeepK)
+            ? "matmul_small_m_deepk_" + profile_str_ + ".xclbin"
+            : "matmul_small_m_deepk_" + std::to_string(span) + "_" + profile_str_ + ".xclbin";
         std::string path = detail::find_prebuilt_xclbin(name, cache_dir_);
         if (path.empty() && cache_->has_xclbin(name)) path = cache_->get_xclbin_path(name);
         if (path.empty()) {
-            matmul_small_m_deepk_unavailable_ = true;
+            matmul_deepk_unavailable_.insert(span);
             return false;
         }
         try {
             auto data = detail::load_xclbin_file(path);
-            if (data.empty()) { matmul_small_m_deepk_unavailable_ = true; return false; }
+            if (data.empty()) { matmul_deepk_unavailable_.insert(span); return false; }
             xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
             matmul_shape_ctxs_.push_back(ctx);  // keep context alive
             xrt::kernel krnl(ctx, kTritonXdnaKernelName);
             CachedMatmulKernel cached{std::move(krnl), {}, 0,
-                                      kSmallMTile, kMatmulTile, kDeepK, GgmlType::I8};
+                                      kSmallMTile, kMatmulTile, span, GgmlType::I8};
             std::string seq = detail::find_prebuilt_sequence(name, cache_dir_);
             if (!seq.empty()) {
                 load_instr_bo(*device_, cached.krnl, cached.bo_instr, cached.instr_words, seq);
             }
             if (!cached.bo_instr || cached.instr_words == 0) {
-                std::cerr << "Error: matmul_small_m_deepk xclbin missing instruction sequence\n";
-                matmul_small_m_deepk_unavailable_ = true;
+                std::cerr << "Error: matmul_small_m_deepk (K=" << span << ") xclbin missing instruction sequence\n";
+                matmul_deepk_unavailable_.insert(span);
                 return false;
             }
-            matmul_small_m_deepk_kernel_ = std::move(cached);
-            matmul_small_m_deepk_loaded_ = true;
+            matmul_deepk_kernels_[span] = std::move(cached);
             return true;
         } catch (const std::exception& e) {
-            std::cerr << "Warning: failed to load matmul_small_m_deepk kernel: " << e.what() << "\n";
-            matmul_small_m_deepk_unavailable_ = true;
+            std::cerr << "Warning: failed to load matmul_small_m_deepk (K=" << span << ") kernel: " << e.what() << "\n";
+            matmul_deepk_unavailable_.insert(span);
             return false;
         }
     }
@@ -2890,14 +2909,14 @@ private:
     bool matmul_small_m_unavailable_ = false;
     std::vector<MatmulPipelineSlot> matmul_small_m_slots_;
 
-    // Deep-K decode matmul (M=16, N=256, K=2048): does the whole K-reduction
-    // in-kernel so one launch replaces the 8 separate 256-K-tile launches +
-    // host accumulation a K=2048 matmul otherwise needs. Loaded from
-    // matmul_small_m_deepk_<profile>.xclbin; separate pipeline slots.
-    CachedMatmulKernel matmul_small_m_deepk_kernel_;
-    bool matmul_small_m_deepk_loaded_ = false;
-    bool matmul_small_m_deepk_unavailable_ = false;
-    std::vector<MatmulPipelineSlot> matmul_small_m_deepk_slots_;
+    // Deep-K decode matmul (M=16, N=256, K=<span>): does the whole K-reduction
+    // in-kernel so one launch replaces span/256 separate 256-K-tile launches +
+    // host accumulation. Keyed by span (see kDeepKSpans) since Llama (K=2048)
+    // and Gemma4 (K=1536) need different compiled spans; separate pipeline
+    // slots per span (buffer sizes depend on T_k).
+    std::unordered_map<int, CachedMatmulKernel> matmul_deepk_kernels_;
+    std::unordered_set<int> matmul_deepk_unavailable_;
+    std::unordered_map<int, std::vector<MatmulPipelineSlot>> matmul_deepk_slots_;
 
     // Resident packed-weight device BOs for the INT8 matmul path. A weight tile
     // never changes across tokens, so once packed into a device BO we bind that
