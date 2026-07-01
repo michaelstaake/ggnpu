@@ -1863,13 +1863,12 @@ int main(int argc, char* argv[]) {
             }
 
             std::vector<float> xn(hidden_size), q, kbuf, vbuf, attn_in, attn_o(hidden_size);
-            std::vector<float> gate, up, act, dn(hidden_size), kexp, vexp, layer_in(hidden_size);
+            std::vector<float> gate, up, act, dn(hidden_size), kexp, vexp;
 
             for (int L = 0; L < max_layers_override; L++) {
                 const GemmaLayer& gl = gplan[L];
                 const int hd = gl.head_dim;
                 const int qdim = num_heads * hd;
-                std::copy(inp_embd.begin(), inp_embd.end(), layer_in.begin());
 
                 const TensorView* attn_norm_w = find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", L);
                 const TensorView* q_w = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", L);
@@ -1925,6 +1924,13 @@ int main(int argc, char* argv[]) {
                 for (int h = 0; h < num_heads; h++)
                     g_rmsnorm(q.data() + h * hd, q.data() + h * hd, hd, get_float_ptr(qn_w), rms_eps);
                 g_rope(q.data(), num_heads, hd, pos, gl.rope_base);
+                // Gemma4 attention scale is 1.0 (f_attention_scale); the host
+                // flash_attn bakes in 1/sqrt(head_dim), so pre-scale Q by sqrt(hd)
+                // to cancel it back to an effective scale of 1.0.
+                {
+                    const float qs = std::sqrt(static_cast<float>(hd));
+                    for (int i = 0; i < qdim; i++) q[i] *= qs;
+                }
 
                 // K/V: compute + append if this layer owns them, else reuse the source layer's store.
                 if (gl.kv_src == L) {
@@ -1936,8 +1942,16 @@ int main(int argc, char* argv[]) {
                     mul_mat_weight(xn.data(), k_w, kbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd);
                     mul_mat_weight(xn.data(), v_w, vbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd);
                     backend->sync();
+                    // K: RMSNorm with attn_k_norm weight, then RoPE.
                     g_rmsnorm(kbuf.data(), kbuf.data(), hd, get_float_ptr(kn_w), rms_eps);
                     g_rope(kbuf.data(), 1, hd, pos, gl.rope_base);
+                    // V: plain RMSNorm (no weight, no RoPE) — Vcur = ggml_rms_norm(Vcur, eps).
+                    {
+                        double ss = 0.0;
+                        for (int i = 0; i < hd; i++) ss += static_cast<double>(vbuf[i]) * vbuf[i];
+                        float vs = 1.0f / std::sqrt(static_cast<float>(ss / hd) + rms_eps);
+                        for (int i = 0; i < hd; i++) vbuf[i] *= vs;
+                    }
                     gk_store[L].insert(gk_store[L].end(), kbuf.begin(), kbuf.end());
                     gv_store[L].insert(gv_store[L].end(), vbuf.begin(), vbuf.end());
                 }
@@ -2020,13 +2034,12 @@ int main(int argc, char* argv[]) {
                     for (int i = 0; i < hidden_size; i++) inp_embd[i] += inj[i];
                 }
 
-                // Per-layer output scale: scale this layer's net contribution
-                // (delta over the layer input), preserving the residual stream.
+                // Per-layer output scale: multiply the full hidden state (cur *= out_scale).
+                // Magnitude is renormalized by the next layer's RMSNorm.
                 const TensorView* outscale_w = find_tensor_pattern(model, "blk.{layer}.layer_output_scale.weight", L);
                 if (outscale_w) {
                     const float os = get_float_ptr(outscale_w)[0];
-                    for (int i = 0; i < hidden_size; i++)
-                        inp_embd[i] = layer_in[i] + os * (inp_embd[i] - layer_in[i]);
+                    for (int i = 0; i < hidden_size; i++) inp_embd[i] *= os;
                 }
             }
 
