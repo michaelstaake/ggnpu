@@ -1744,16 +1744,24 @@ int main(int argc, char* argv[]) {
         gk_store.resize(num_layers);
         gv_store.resize(num_layers);
         gemma_embd_scale = std::sqrt(static_cast<float>(hidden_size));
-        std::cout << "gemma4 forward (G2 skeleton): " << num_layers << " layers, "
+        std::cout << "gemma4 forward: " << num_layers << " layers, "
                   << "num_heads=" << num_heads << ", softcap=" << gemma_logit_softcap << "\n";
     }
+    // Per-Layer Embeddings (PLE) — Phase G3. Two paths per token combine into a
+    // 256-dim auxiliary signal per layer, injected at the end of each block.
+    const int gemma_ple_dim =
+        static_cast<int>(model.gguf().get_int("gemma4.embedding_length_per_layer_input", 256));
+    const TensorView* ple_tok_embd = is_gemma ? find_tensor(model, "per_layer_token_embd.weight") : nullptr;
+    const TensorView* ple_model_proj = is_gemma ? find_tensor(model, "per_layer_model_proj.weight") : nullptr;
+    const TensorView* ple_proj_norm = is_gemma ? find_tensor(model, "per_layer_proj_norm.weight") : nullptr;
 
-    // Gemma RMSNorm with the (1+w) weight convention (host; sizes 256/512/1536).
+    // Gemma4 RMSNorm: raw weight (this arch stores the full scale, no (1+w)
+    // offset — verified against the reference graph). Host; sizes 256/512/1536.
     auto g_rmsnorm = [](float* out, const float* in, int n, const float* w, float eps) {
         double ss = 0.0;
         for (int i = 0; i < n; i++) ss += static_cast<double>(in[i]) * in[i];
         float scale = 1.0f / std::sqrt(static_cast<float>(ss / n) + eps);
-        for (int i = 0; i < n; i++) out[i] = in[i] * scale * (1.0f + w[i]);
+        for (int i = 0; i < n; i++) out[i] = in[i] * scale * w[i];
     };
     // Gemma NeoX RoPE (rotate halves i, i+hd/2), per-layer freq base, over full head_dim.
     auto g_rope = [](float* v, int n_heads, int hd, int64_t pos, float base) {
@@ -1820,17 +1828,48 @@ int main(int argc, char* argv[]) {
             dequant_tensor_row(tok_embd, tok, inp_embd.data(), hidden_size);
         }
 
-        // ---- Gemma 4 forward (G2 skeleton) ----
+        // ---- Gemma 4 forward ----
         if (is_gemma) {
             for (int i = 0; i < hidden_size; i++) inp_embd[i] *= gemma_embd_scale;
 
+            // Per-Layer Embeddings (PLE, G3): build one ple_dim vector per layer.
+            //   token-identity: per_layer_token_embd[tok] * sqrt(ple_dim)
+            //   context-aware:  RMSNorm(per_layer_model_proj(embed) / sqrt(hidden))
+            //   combined:       (token + context) / sqrt(2)
+            const int ple_dim = gemma_ple_dim;
+            const int ple_total = num_layers * ple_dim;
+            std::vector<float> pli(static_cast<size_t>(ple_total), 0.0f);
+            std::vector<float> pgate(static_cast<size_t>(ple_dim), 0.0f);
+            std::vector<float> inj(hidden_size, 0.0f);
+            {
+                std::vector<float> ple_tok(static_cast<size_t>(ple_total), 0.0f);
+                dequant_tensor_row(ple_tok_embd, tok, ple_tok.data(), ple_total);
+                const float tok_scale = std::sqrt(static_cast<float>(ple_dim));
+
+                std::vector<float> ple_ctx(static_cast<size_t>(ple_total), 0.0f);
+                mul_mat_weight(inp_embd.data(), ple_model_proj, ple_ctx.data(),
+                               1, ple_total, hidden_size, hidden_size, ple_total, ple_total);
+                backend->sync();
+                const float ctx_scale = 1.0f / std::sqrt(static_cast<float>(hidden_size));
+                const float* plpn = get_float_ptr(ple_proj_norm);
+                for (int L = 0; L < num_layers; L++) {
+                    float* slice = ple_ctx.data() + static_cast<size_t>(L) * ple_dim;
+                    for (int i = 0; i < ple_dim; i++) slice[i] *= ctx_scale;
+                    g_rmsnorm(slice, slice, ple_dim, plpn, rms_eps);
+                }
+                const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
+                for (int i = 0; i < ple_total; i++)
+                    pli[i] = (ple_tok[i] * tok_scale + ple_ctx[i]) * inv_sqrt2;
+            }
+
             std::vector<float> xn(hidden_size), q, kbuf, vbuf, attn_in, attn_o(hidden_size);
-            std::vector<float> gate, up, act, dn(hidden_size), kexp, vexp;
+            std::vector<float> gate, up, act, dn(hidden_size), kexp, vexp, layer_in(hidden_size);
 
             for (int L = 0; L < max_layers_override; L++) {
                 const GemmaLayer& gl = gplan[L];
                 const int hd = gl.head_dim;
                 const int qdim = num_heads * hd;
+                std::copy(inp_embd.begin(), inp_embd.end(), layer_in.begin());
 
                 const TensorView* attn_norm_w = find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", L);
                 const TensorView* q_w = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", L);
@@ -1850,6 +1889,39 @@ int main(int argc, char* argv[]) {
                 q.assign(qdim, 0.0f);
                 mul_mat_weight(xn.data(), q_w, q.data(), 1, qdim, hidden_size, hidden_size, qdim, qdim);
                 backend->sync();
+
+                // Debug (GGNPU_GEMMA_DEBUG): validate the Q4_0 NPU matmul against a
+                // CPU dequant reference on the real layer-0 first-token activations.
+                if (L == 0 && pos == 0 && std::getenv("GGNPU_GEMMA_DEBUG")) {
+                    std::vector<float> ref(qdim, 0.0f);
+                    std::vector<float> wrow(hidden_size);
+                    constexpr int QK4_0 = 32; constexpr size_t Q4_0_BLK = 18;
+                    const size_t bpr = (hidden_size + QK4_0 - 1) / QK4_0;
+                    for (int n = 0; n < qdim; n++) {
+                        const uint8_t* rd = static_cast<const uint8_t*>(q_w->data) + static_cast<size_t>(n) * bpr * Q4_0_BLK;
+                        std::vector<float> blk(QK4_0);
+                        for (size_t b = 0; b < bpr; b++) {
+                            dequant_q4_0_block(rd + b * Q4_0_BLK, blk.data());
+                            for (int j = 0; j < QK4_0; j++) { size_t k = b*QK4_0+j; if (k < (size_t)hidden_size) wrow[k] = blk[j]; }
+                        }
+                        double acc = 0; for (int k = 0; k < hidden_size; k++) acc += (double)xn[k] * wrow[k];
+                        ref[n] = (float)acc;
+                    }
+                    double num = 0, den = 0; float amax = 0;
+                    for (int n = 0; n < qdim; n++) { double d = q[n]-ref[n]; num += d*d; den += (double)ref[n]*ref[n]; amax = std::max(amax, std::fabs(q[n]-ref[n])); }
+                    std::cerr << "[gemma dbg] attn_q L0: rel_l2=" << std::sqrt(num/(den+1e-12))
+                              << " max_abs_err=" << amax << " q[0..3]=" << q[0] << "," << q[1] << "," << q[2]
+                              << " ref[0..3]=" << ref[0] << "," << ref[1] << "," << ref[2] << "\n";
+                    const float* anw = get_float_ptr(attn_norm_w);
+                    const TensorView* los = find_tensor_pattern(model, "blk.{layer}.layer_output_scale.weight", L);
+                    auto l2v = [](const float* p, int n){ double s=0; for(int i=0;i<n;i++) s+=(double)p[i]*p[i]; return std::sqrt(s); };
+                    std::cerr << "[gemma dbg] attn_norm.w[0..3]=" << anw[0] << "," << anw[1] << "," << anw[2]
+                              << "  layer_output_scale=" << (los ? get_float_ptr(los)[0] : -999.0f)
+                              << "  |embed_scaled|=" << l2v(inp_embd.data(), hidden_size)
+                              << "  |xn|=" << l2v(xn.data(), hidden_size)
+                              << "  |pli_L0|=" << l2v(pli.data(), ple_dim) << "\n";
+                }
+
                 for (int h = 0; h < num_heads; h++)
                     g_rmsnorm(q.data() + h * hd, q.data() + h * hd, hd, get_float_ptr(qn_w), rms_eps);
                 g_rope(q.data(), num_heads, hd, pos, gl.rope_base);
@@ -1927,6 +1999,35 @@ int main(int argc, char* argv[]) {
                 backend->sync();
                 g_rmsnorm(dn.data(), dn.data(), hidden_size, get_float_ptr(postffw_w), rms_eps);
                 for (int i = 0; i < hidden_size; i++) inp_embd[i] += dn[i];
+
+                // Per-Layer Embedding injection (G3):
+                //   inj = post_norm( proj( gelu(inp_gate(h)) * pli[L] ) ); h += inj
+                const TensorView* inpgate_w = find_tensor_pattern(model, "blk.{layer}.inp_gate.weight", L);
+                const TensorView* proj_w = find_tensor_pattern(model, "blk.{layer}.proj.weight", L);
+                const TensorView* postnorm_w = find_tensor_pattern(model, "blk.{layer}.post_norm.weight", L);
+                if (inpgate_w && proj_w && postnorm_w) {
+                    std::fill(pgate.begin(), pgate.end(), 0.0f);
+                    mul_mat_weight(inp_embd.data(), inpgate_w, pgate.data(),
+                                   1, ple_dim, hidden_size, hidden_size, ple_dim, ple_dim);
+                    backend->sync();
+                    const float* pli_L = pli.data() + static_cast<size_t>(L) * ple_dim;
+                    for (int i = 0; i < ple_dim; i++) pgate[i] = g_gelu(pgate[i]) * pli_L[i];
+                    std::fill(inj.begin(), inj.end(), 0.0f);
+                    mul_mat_weight(pgate.data(), proj_w, inj.data(),
+                                   1, hidden_size, ple_dim, ple_dim, hidden_size, hidden_size);
+                    backend->sync();
+                    g_rmsnorm(inj.data(), inj.data(), hidden_size, get_float_ptr(postnorm_w), rms_eps);
+                    for (int i = 0; i < hidden_size; i++) inp_embd[i] += inj[i];
+                }
+
+                // Per-layer output scale: scale this layer's net contribution
+                // (delta over the layer input), preserving the residual stream.
+                const TensorView* outscale_w = find_tensor_pattern(model, "blk.{layer}.layer_output_scale.weight", L);
+                if (outscale_w) {
+                    const float os = get_float_ptr(outscale_w)[0];
+                    for (int i = 0; i < hidden_size; i++)
+                        inp_embd[i] = layer_in[i] + os * (inp_embd[i] - layer_in[i]);
+                }
             }
 
             // Final norm into inp_norm (fed to logits below).
