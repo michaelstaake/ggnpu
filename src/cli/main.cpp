@@ -1770,20 +1770,26 @@ int main(int argc, char* argv[]) {
         }
         return true;
     };
-    // Gemma NeoX RoPE (rotate halves i, i+hd/2), per-layer freq base, over full head_dim.
-    auto g_rope = [](float* v, int n_heads, int hd, int64_t pos, float base) {
-        int half = hd / 2;
-        for (int h = 0; h < n_heads; h++) {
-            float* p = v + static_cast<size_t>(h) * hd;
-            for (int i = 0; i < half; i++) {
-                float freq = std::pow(base, -(2.0f * i) / hd);
-                float ang = static_cast<float>(pos) * freq;
-                float c = std::cos(ang), s = std::sin(ang);
-                float x0 = p[i], x1 = p[i + half];
-                p[i] = x0 * c - x1 * s;
-                p[i + half] = x0 * s + x1 * c;
-            }
+    // Gemma NeoX RoPE (rotate halves i, i+hd/2), per-layer freq base, over full
+    // head_dim. NPU-dispatched via rope_batched() (neox_split_half=true); the
+    // underlying kernel is a pure elementwise vector-add — only host
+    // (de)interleave indexing differs from Llama's adjacent-pair layout.
+    auto g_rope = [&](float* v, int n_heads, int hd, int64_t pos, float base) -> bool {
+        RopeBatchedParams rp;
+        rp.data = v;
+        rp.n_heads = n_heads;
+        rp.n_dims = hd;
+        rp.rope_dims = hd;
+        rp.offset = pos;
+        rp.freq_scale = 1.0f;
+        rp.freq_base = base;
+        rp.neox_split_half = true;
+        if (backend->rope_batched(rp) != Status::OK) {
+            std::cerr << "Error: gemma RoPE failed\n";
+            model.unload();
+            return false;
         }
+        return true;
     };
     // Gemma GeGLU activation (tanh-approx GELU on the gate).
     auto g_gelu = [](float x) {
@@ -1930,7 +1936,7 @@ int main(int argc, char* argv[]) {
 
                 for (int h = 0; h < num_heads; h++)
                     if (!g_rmsnorm(q.data() + h * hd, q.data() + h * hd, hd, get_float_ptr(qn_w), rms_eps)) return 1;
-                g_rope(q.data(), num_heads, hd, pos, gl.rope_base);
+                if (!g_rope(q.data(), num_heads, hd, pos, gl.rope_base)) return 1;
                 // Gemma4 attention scale is 1.0 (f_attention_scale); the host
                 // flash_attn bakes in 1/sqrt(head_dim), so pre-scale Q by sqrt(hd)
                 // to cancel it back to an effective scale of 1.0.
@@ -1951,7 +1957,7 @@ int main(int argc, char* argv[]) {
                     backend->sync();
                     // K: RMSNorm with attn_k_norm weight, then RoPE.
                     if (!g_rmsnorm(kbuf.data(), kbuf.data(), hd, get_float_ptr(kn_w), rms_eps)) return 1;
-                    g_rope(kbuf.data(), 1, hd, pos, gl.rope_base);
+                    if (!g_rope(kbuf.data(), 1, hd, pos, gl.rope_base)) return 1;
                     // V: plain RMSNorm (no weight, no RoPE) — Vcur = ggml_rms_norm(Vcur, eps).
                     if (!g_rmsnorm(vbuf.data(), vbuf.data(), hd, nullptr, rms_eps)) return 1;
                     gk_store[L].insert(gk_store[L].end(), kbuf.begin(), kbuf.end());

@@ -1187,12 +1187,19 @@ public:
         if (!buf_rope_bf16_out_ || buf_rope_bf16_out_->size() < buf_bytes)
             buf_rope_bf16_out_ = buf_mgr_->alloc(buf_bytes, true);
 
-        // Deinterleave x: x_e = data[2i], x_o = data[2i+1]
+        // Deinterleave x: adjacent pairs x_e=data[2i]/x_o=data[2i+1] (Llama), or
+        // NeoX split-half x_e=data[i]/x_o=data[i+n_pairs] (Gemma4). Same rotation
+        // math either way — only which two elements form a rotated pair changes.
         std::vector<float> x_e(n_pairs), x_o(n_pairs);
         std::vector<float> cos_vals(n_pairs), sin_vals(n_pairs);
         for (int i = 0; i < n_pairs; i++) {
-            x_e[i] = params.data[2 * i];
-            x_o[i] = params.data[2 * i + 1];
+            if (params.neox_split_half) {
+                x_e[i] = params.data[i];
+                x_o[i] = params.data[i + n_pairs];
+            } else {
+                x_e[i] = params.data[2 * i];
+                x_o[i] = params.data[2 * i + 1];
+            }
         }
 
         if (params.cos_table && params.sin_table) {
@@ -1257,10 +1264,15 @@ public:
             return last_status_;
         }
 
-        // Reinterleave into params.data
+        // Reinterleave into params.data (same layout choice as deinterleave above).
         for (int i = 0; i < n_pairs; i++) {
-            params.data[2 * i]     = out_e[i];
-            params.data[2 * i + 1] = out_o[i];
+            if (params.neox_split_half) {
+                params.data[i]           = out_e[i];
+                params.data[i + n_pairs] = out_o[i];
+            } else {
+                params.data[2 * i]     = out_e[i];
+                params.data[2 * i + 1] = out_o[i];
+            }
         }
 
         return Status::OK;
@@ -1330,13 +1342,15 @@ public:
             // Pack: [even (g_cur*n_pairs)] then [odd (g_cur*n_pairs)].
             //   t1 = [x_e*cos | x_e*sin],  t2 = [-x_o*sin | x_o*cos]
             //   out = t1+t2 = [out_e | out_o]
+            // Pair source: adjacent hd[2i]/hd[2i+1] (Llama) or NeoX split-half
+            // hd[i]/hd[i+n_pairs] (Gemma4) — see rope() for the same choice.
             for (int g = 0; g < g_cur; g++) {
                 const float* hd = params.data + static_cast<size_t>(h0 + g) * n_dims;
                 int even = g * n_pairs;
                 int odd  = g_cur * n_pairs + g * n_pairs;
                 for (int i = 0; i < n_pairs; i++) {
-                    float xe = hd[2 * i];
-                    float xo = hd[2 * i + 1];
+                    float xe = params.neox_split_half ? hd[i] : hd[2 * i];
+                    float xo = params.neox_split_half ? hd[i + n_pairs] : hd[2 * i + 1];
                     t1_pad[even + i] =  xe * cos_vals[i];
                     t2_pad[even + i] = -xo * sin_vals[i];
                     t1_pad[odd  + i] =  xe * sin_vals[i];
@@ -1367,8 +1381,13 @@ public:
                 int even = g * n_pairs;
                 int odd  = g_cur * n_pairs + g * n_pairs;
                 for (int i = 0; i < n_pairs; i++) {
-                    hd[2 * i]     = out[even + i];
-                    hd[2 * i + 1] = out[odd  + i];
+                    if (params.neox_split_half) {
+                        hd[i]           = out[even + i];
+                        hd[i + n_pairs] = out[odd  + i];
+                    } else {
+                        hd[2 * i]     = out[even + i];
+                        hd[2 * i + 1] = out[odd  + i];
+                    }
                 }
             }
         }
@@ -2426,6 +2445,14 @@ private:
         // Reuse preloaded xclbin for the default shape (n_pairs=kRopePairs → n_dims=64)
         if (n_dims == kRopePairs * 2 && hw_ctx_rope_) {
             return create_rope_kernel_from_loaded_xclbin(n_dims, cache_key);
+        }
+
+        // Shape-specific prebuilt (e.g. rope_256_npu6.xclbin, rope_512_npu6.xclbin
+        // from ./scripts/build-kernels.sh npu6 rope_<n_dims>).
+        std::string shaped_name = "rope_" + std::to_string(n_dims) + "_" + profile_str_ + ".xclbin";
+        std::string shaped_path = detail::find_prebuilt_xclbin(shaped_name, cache_dir_);
+        if (!shaped_path.empty()) {
+            return load_rope_kernel_for_shape(shaped_path, n_dims, N, cache_key);
         }
 
         // Try JIT compilation for non-standard shapes
