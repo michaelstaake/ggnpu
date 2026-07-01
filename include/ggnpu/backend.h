@@ -53,11 +53,18 @@ struct RopeParams {
     // When null the backend derives angles from offset/freq_base/freq_scale.
     const float* cos_table = nullptr;
     const float* sin_table = nullptr;
+    // Pair layout: false (default) = adjacent pairs (data[2i], data[2i+1]),
+    // Llama's GGML_ROPE_TYPE_NORMAL rotation. true = NeoX split-half
+    // (data[i], data[i+n_dims/2]), used by Gemma4. The underlying NPU kernel
+    // is a pure elementwise vector-add either way; only host (de)interleave
+    // indexing changes.
+    bool neox_split_half = false;
 };
 
 // Batched RoPE: apply rotary embedding to all heads of one token at once.
-// data layout is [n_heads][n_dims] interleaved (2i, 2i+1 pairs), rotated in place.
-// cos/sin tables are shared across heads (depend only on offset and pair index).
+// data layout is [n_heads][n_dims]; pair layout controlled by
+// neox_split_half (see RopeParams), rotated in place. cos/sin tables are
+// shared across heads (depend only on offset and pair index).
 struct RopeBatchedParams {
     float* data;
     int n_heads;
@@ -68,6 +75,7 @@ struct RopeBatchedParams {
     int64_t rope_dims;
     const float* cos_table = nullptr;  // [rope_dims/2]
     const float* sin_table = nullptr;  // [rope_dims/2]
+    bool neox_split_half = false;
 };
 
 struct SoftmaxParams {
@@ -78,6 +86,12 @@ struct SoftmaxParams {
 };
 
 struct SiluParams {
+    const float* input;
+    float* output;
+    int size;
+};
+
+struct GeluParams {
     const float* input;
     float* output;
     int size;
@@ -117,6 +131,7 @@ public:
             rp.freq_base = params.freq_base;
             rp.cos_table = params.cos_table;
             rp.sin_table = params.sin_table;
+            rp.neox_split_half = params.neox_split_half;
             Status s = rope(rp);
             if (s != Status::OK) return s;
         }
@@ -135,6 +150,7 @@ public:
 
     virtual Status softmax(const SoftmaxParams& params) = 0;
     virtual Status silu(const SiluParams& params) = 0;
+    virtual Status gelu(const GeluParams& params) = 0;
     virtual Status flash_attn(const AttnParams& params) = 0;
     virtual void sync() = 0;
 
