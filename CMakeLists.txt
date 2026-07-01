@@ -153,6 +153,16 @@ if(GGNPU_BUILD_TESTS)
     set_tests_properties(test_e2e_logits PROPERTIES
         SKIP_RETURN_CODE 77
         LABELS "e2e")
+
+    # E2E: gemma4 France prompt → greedy top-1 is Paris (skips if model absent)
+    add_test(
+        NAME test_e2e_gemma
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/test-gemma-e2e.sh
+                $<TARGET_FILE:ggnpu>
+                ${CMAKE_SOURCE_DIR}/models/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf)
+    set_tests_properties(test_e2e_gemma PROPERTIES
+        SKIP_RETURN_CODE 77
+        LABELS "e2e")
 endif()
 
 # Install

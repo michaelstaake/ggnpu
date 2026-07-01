@@ -8,10 +8,14 @@ Run GGUF models on AMD NPUs (Krackan / XDNA2).
 |---------|--------|
 | AMD NPU | Work in progress |
 
-Validated models (Q4_K_M, on `npu6` / Krackan): **Llama 3.2 1B**, **Qwen2.5-Coder
-1.5B**. Architecture support is metadata-driven (`general.architecture`), so other
-`llama`/`qwen2`-family GGUFs should load; non-pow2 hidden sizes and arbitrary FFN
-widths are handled by RMSNorm pad-to-pow2 and SiLU host-tiling.
+Validated models (on `npu6` / Krackan): **Llama 3.2 1B** (Q4_K_M), **Qwen2.5-Coder
+1.5B** (Q4_K_M), **Gemma 4 E2B** (`gemma4`, Q4_0). Architecture support is
+metadata-driven (`general.architecture`), so other `llama`/`qwen2`-family GGUFs
+should load; non-pow2 hidden sizes and arbitrary FFN widths are handled by RMSNorm
+pad-to-pow2 and SiLU host-tiling. The `gemma4` path adds the full Gemma 4
+(MatFormer) feature set — SentencePiece-unigram tokenizer, Per-Layer Embeddings,
+QK-norm, sandwich norms, shared-KV, sliding-window attention, and logit soft-cap —
+plus a Q4_0 quantization datapath.
 
 ## Native host setup
 
