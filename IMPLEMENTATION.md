@@ -1055,6 +1055,125 @@ Each phase is independently verifiable; do not start a phase before the prior on
 
 ---
 
+### 7.4 New-model bring-up survey (2026-07-02)
+
+A batch of GGUFs was staged in `models/`. Each was inspected (`--dump-tensors`) and
+run (`-c 512 -n 2`) to capture the **actual** failure mode, not a guess. **None of
+the new models run yet.** They fall into two new architectures — `lfm2` and
+`qwen35` — both of which are **hybrid (non-pure-transformer)** and need a dedicated
+forward path, plus several unsupported quant formats. Summary first, then per-arch
+work.
+
+**Baseline the code supports today:** arch branches = `llama`, `qwen2` (generic
+transformer path), `gemma4` (dedicated). Quant *decoders for NPU matmul* =
+**`Q4_0`, `Q8_0`, `Q4_K`, `Q6_K`** only (`src/quant/quant.cpp`); anything else warns
+"unsupported quant type … falling back to F32" and then dies at
+`matmul B_type not supported on NPU path yet` (`amd_xdna.cpp:725`) — there is **no
+F32 matmul fallback**. NPU RMSNorm has prebuilt xclbins for N ∈ {256, 512, 2048};
+other sizes need JIT (`triton-xdna`, not installed) or a prebuilt build.
+
+| Model file | Arch | Quant(s) | Loads? | Furthest point reached | Immediate blocker |
+|---|---|---|---|---|---|
+| `LFM2.5-230M-Q6_K` | `lfm2` | Q6_K ✅ | yes | first RMSNorm of layer 0 | **no `rmsnorm_1024` kernel** (hidden=1024 is already pow2, so it does *not* free-ride the 2048 kernel; JIT absent) |
+| `LFM2.5-230M-Q8_0` | `lfm2` | Q8_0 ✅ | yes | first RMSNorm | same `rmsnorm_1024` wall (quant is fine) |
+| `LFM2.5-230M-Q5_K_M` | `lfm2` | Q5_K ❌ | yes | first RMSNorm | `rmsnorm_1024` wall; **behind it: no Q5_K decoder** |
+| `LFM2.5-230M-IQ4_NL` | `lfm2` | IQ4_NL ❌ | yes | first RMSNorm | `rmsnorm_1024` wall; **behind it: no IQ4_NL decoder** |
+| `LFM2.5-230M-BF16` | `lfm2` | BF16 ❌ | yes | first RMSNorm | `rmsnorm_1024` wall; **behind it: no BF16 weight path** |
+| `Qwen3.5-9B-UD-IQ2_XXS` | `qwen35` | IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S/Q2_K/Q3_K/Q4_K/Q5_K/Q8_0 ❌ | yes | first matmul | **i-quant weights undecodable** (IQ2_XXS…) → F32 fallback → no F32 matmul |
+| `ornith-9b-mtp-kl-IQ2_M` | `qwen35` | IQ2_S/IQ3_S/Q4_K/Q5_K/Q8_0 ❌ | yes | first matmul | same i-quant wall; also has an MTP/`nextn` head (blk.32) |
+
+**Important:** because `lfm2` and `qwen35` are not `gemma4`, they currently run
+through the **generic transformer loop**, which assumes every block is
+attn_norm→Q/K/V→attention→FFN. That is **wrong** for both archs (see below), so even
+after the immediate blocker is cleared they will produce garbage or crash on the
+first non-attention block. The generic path only *happens* to enter generation
+because the crash comes earlier (RMSNorm size / quant decode).
+
+#### 7.4.1 `lfm2` — LiquidAI LFM2.5 230M (hybrid ShortConv + attention)
+
+14 blocks, hidden 1024, FFN 2560, vocab 65536, 16 attn heads, `rms_eps=1e-5`,
+`token_embd_norm` (embedding-output norm), `shortconv.l_cache=3`,
+`attention.head_count_kv` is a **per-layer array** (0 for conv layers). Block layout
+(from tensor dump): **ShortConv blocks** = 0,1,3,5,7,9,11,13; **attention blocks** =
+2,4,6,8,10,12 (GQA q=1024/16h, k=v=512/8h, per-head QK-norm dim 64). Every block has
+a standard SwiGLU FFN (`ffn_gate`/`up`/`down`).
+
+- **New operator — gated short convolution.** ShortConv block tensors:
+  `shortconv.in_proj` [1024→3072] (projects to 3 gates B, C, x), `shortconv.conv.weight`
+  [3,1024] (**depthwise causal conv1d**, kernel = `l_cache`=3), `shortconv.out_proj`
+  [1024→1024]. Reference math (LFM2): `BCx = in_proj(h)`; split into B,C,x; depthwise
+  causal conv over x gated by B; multiply by C; `out = out_proj(...)`. This is a new
+  forward substructure the codebase has never had (like Gemma's PLE was). Conv is
+  tiny — do it on the host first (correctness), NPU-offload later if it matters.
+- **Work to make it run, in order:**
+  1. **Unblock RMSNorm at N=1024** — either build a prebuilt `rmsnorm_1024_npu6.xclbin`
+     (`./scripts/build-kernels.sh npu6 rmsnorm_1024`) or generalize the free-ride
+     logic so already-pow2 sizes below 2048 pad *up to* the 2048 kernel (cf. the
+     gemma4 1536→2048 free-ride). Second option is cheaper and unblocks any future
+     pow2 hidden ≤ 2048.
+  2. **Add an `lfm2` arch branch** in `src/cli/main.cpp` (mirror the `is_gemma`
+     guard). Per-layer dispatch on block type (ShortConv vs attention), read the
+     per-layer `head_count_kv` array to distinguish, wire `token_embd_norm`.
+  3. **Implement the ShortConv operator** (host first). Depthwise causal conv1d,
+     kernel 3, with the B/C gating; keep a per-layer conv state cache of width
+     `l_cache` for decode.
+  4. Quants: **Q6_K and Q8_0 already decode** — use one of those to validate
+     correctness first. Q5_K / IQ4_NL / BF16 are separate decoder work (below), not
+     needed for first light.
+- **Verdict:** most tractable of the new models (small, supported quant available,
+  only one new host-side operator). Good candidate for the next model-breadth phase.
+
+#### 7.4.2 `qwen35` — Qwen3.5 9B & Ornith 9B (hybrid SSM + gated attention)
+
+Both 9B files report `general.architecture = qwen35`. 32 blocks (Ornith: 33, extra
+is an MTP head), hidden 4096, FFN 12288, 16 attn / 4 KV heads, head_dim 256,
+`rope.freq_base=1e7`, vocab 248320. This is **not a normal transformer** — blk.0 has
+a full **selective-SSM / gated-delta block**: `ssm_a` [32], `ssm_alpha`/`ssm_beta`
+[4096×32], `ssm_conv1d` [4×8192], `ssm_dt.bias` [32], `ssm_norm` [128], `ssm_out`
+[4096×4096], with **fused `attn_qkv`** [4096→8192] and **`attn_gate`** [4096→4096].
+Only every 4th block (3,7,11,15,19,23,27,31) carries `attn_output` → **full-attention
+layers are ~1:4**, the rest are SSM (Qwen3-Next / gated-delta-net style hybrid).
+
+- **Two independent, large blockers:**
+  1. **i-quant decode.** Weights are IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S/Q2_K/Q3_K (plus
+     some Q4_K/Q5_K/Q8_0). The NPU path decodes only Q4_0/Q8_0/Q4_K/Q6_K, so the very
+     first matmul fails. i-quants use codebook/superblock layouts substantially more
+     complex than k-quants — each is a real decoder (`src/quant/`). This is the wall
+     hit at runtime today.
+  2. **SSM arch.** Even with quants decoded, the generic loop can't run qwen35: it
+     needs a dedicated branch with a **selective state-space operator** (Mamba2/
+     gated-delta recurrence: `ssm_conv1d` → `dt`/`alpha`/`beta` gating → state scan →
+     `ssm_norm` → `ssm_out`), **fused QKV split**, **gated attention** (`attn_gate`),
+     and the 1:4 attn/SSM interleave. SSM state adds a per-layer recurrent cache
+     distinct from the KV cache. This is a multi-session effort on par with (or beyond)
+     gemma4.
+- **Ornith extra:** `qwen35.nextn_predict_layers=1`; blk.32 is a Multi-Token-Prediction
+  head (`nextn.eh_proj`, `enorm`, `hnorm`, `shared_head_norm`). Ignore it for plain
+  autoregressive inference — just skip block 32.
+- **Memory:** 3.0–3.9 GB files at IQ2; 9B params. On the 16 GB dev box this is tight
+  even before KV — validate at `-c 512` and expect swapping. A smaller `qwen35` GGUF
+  in a supported quant would be a far better bring-up vehicle if one exists.
+- **Verdict:** blocked on **two** big items (i-quant decoders **and** an SSM forward
+  path). Lower priority than `lfm2` unless a hybrid-SSM arch is specifically wanted;
+  if pursued, get a smaller and/or k-quant `qwen35` file first to decouple the arch
+  work from i-quant work.
+
+#### 7.4.3 Cross-cutting gaps this batch exposes
+
+- **RMSNorm size coverage.** N=1024 (and any pow2 ≤ 2048 that isn't 2048) has no
+  kernel and doesn't free-ride 2048. Generalize the pad-up logic (cheap) or ship more
+  prebuilt shapes.
+- **Quant decoders.** Missing: **Q5_K, IQ4_NL, BF16** (LFM2 breadth) and the i-quant
+  family **IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S, Q2_K, Q3_K** (qwen35). Q5_K and Q2_K/Q3_K are
+  standard k-quants (moderate); i-quants are codebook-based (harder); BF16 is a direct
+  no-decode path (would need a bf16→int8 pack or a bf16 matmul route).
+- **No F32 matmul fallback.** The "falling back to F32" warning is misleading — there
+  is no F32 NPU matmul, so an unsupported quant is fatal, not slow. Either implement a
+  true host-F32 fallback (lets *any* GGUF at least run slowly) or change the message to
+  a hard "unsupported quant" error at load time.
+
+---
+
 ## 8. CLI reference
 
 Implement all flags below. `ggnpu --help` must match `docs/usage.md`.
