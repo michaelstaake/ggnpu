@@ -65,10 +65,13 @@ set(LIB_SOURCES
     src/gguf/tensor.cpp
     src/quant/q4_0.cpp
     src/quant/q8_0.cpp
+    src/quant/q2_k.cpp
+    src/quant/q3_k.cpp
     src/quant/q4_k.cpp
     src/quant/q5_k.cpp
     src/quant/q6_k.cpp
     src/quant/iq4_nl.cpp
+    src/quant/iq4_xs.cpp
     src/quant/quant.cpp
     src/arch/llama/llama.cpp
     src/runtime/kv_cache.cpp

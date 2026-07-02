@@ -64,7 +64,7 @@ void test_q4_0_block_structure() {
     ASSERT_TRUE(sizeof(block) >= 18, "Q4_0Block size >= 18 bytes");
 
     ASSERT_EQ(ggnpu::ggml_blck_size(ggnpu::GgmlType::Q4_0), 32, "Q4_0 block size is 32 elements");
-    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_0), 16, "Q4_0 type size is 16 bytes");
+    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_0), 18, "Q4_0 type size is 18 bytes");
 }
 
 void test_q8_0_block_structure() {
@@ -107,24 +107,23 @@ void test_q4_0_decode_basic() {
     uint8_t block_data[sizeof(ggnpu::Q4_0Block)];
     memset(block_data, 0, sizeof(block_data));
     ggnpu::Q4_0Block* block = reinterpret_cast<ggnpu::Q4_0Block*>(block_data);
-    block->d = 1;
+    block->d = 0x3C00;  // fp16 1.0
     block->qs[0] = 0x11;
     memset(block->qs + 1, 0, 15);
 
     std::vector<int8_t> int8_out;
     std::vector<float> scales_out;
 
-    ggnpu::decode_q4_0_for_npu(block_data, 16, int8_out, scales_out);
+    ggnpu::decode_q4_0_for_npu(block_data, 18, 1, 32, int8_out, scales_out);
 
     ASSERT_EQ(int8_out.size(), 32, "Q4_0 decode produces 32 int8 values");
     ASSERT_EQ(scales_out.size(), 1, "Q4_0 decode produces 1 scale");
 
-    // With scale=1, nibble 0x11 gives values 1 and 0
-    // But the decode function uses val = nibble - 8, so:
-    // int8_out[0] = 1 - 8 = -7
-    // int8_out[1] = 0 - 8 = -8
-    ASSERT_EQ(int8_out[0], -7, "Q4_0 decode value[0]");
-    ASSERT_EQ(int8_out[1], -7, "Q4_0 decode value[1]");
+    // ggml Q4_0 layout: value[i]=qs[i]&0xF, value[i+16]=qs[i]>>4, val=(nibble-8)*d.
+    // qs[0]=0x11 -> value[0]=(1-8)=-7; qs[1]=0 -> value[1]=(0-8)=-8 (times d=1.0).
+    // Decode requantizes per row, so check the reconstruction int8*scale ≈ value.
+    ASSERT_NEAR(int8_out[0] * scales_out[0], -7.0f, 0.05f, "Q4_0 reconstruct value[0]");
+    ASSERT_NEAR(int8_out[1] * scales_out[0], -8.0f, 0.05f, "Q4_0 reconstruct value[1]");
 }
 
 void test_q8_0_decode_basic() {
@@ -132,7 +131,7 @@ void test_q8_0_decode_basic() {
 
     uint8_t block_data[34];
     ggnpu::Q8_0Block* block = reinterpret_cast<ggnpu::Q8_0Block*>(block_data);
-    block->d = 2;
+    block->d = 0x3C00;  // fp16 1.0
     memset(block->qs, 0, 32);
     block->qs[0] = 3;
     block->qs[31] = 1;
@@ -140,13 +139,15 @@ void test_q8_0_decode_basic() {
     std::vector<int8_t> int8_out;
     std::vector<float> scales_out;
 
-    ggnpu::decode_q8_0_for_npu(block_data, 34, int8_out, scales_out);
+    // New signature: decode to per-row int8 + one scale/row (n_rows=1, n_cols=32).
+    ggnpu::decode_q8_0_for_npu(block_data, 34, 1, 32, int8_out, scales_out);
 
     ASSERT_EQ(int8_out.size(), 32, "Q8_0 decode produces 32 int8 values");
     ASSERT_EQ(scales_out.size(), 1, "Q8_0 decode produces 1 scale");
 
-    ASSERT_EQ(int8_out[0], 3, "Q8_0 decode value[0]");
-    ASSERT_EQ(int8_out[31], 1, "Q8_0 decode value[31]");
+    // Decode requantizes per row, so verify the reconstruction int8*scale ≈ d*qs.
+    ASSERT_NEAR(int8_out[0] * scales_out[0], 3.0f, 0.05f, "Q8_0 reconstruct value[0]");
+    ASSERT_NEAR(int8_out[31] * scales_out[0], 1.0f, 0.05f, "Q8_0 reconstruct value[31]");
 }
 
 void test_decode_dispatch() {
@@ -162,31 +163,31 @@ void test_decode_dispatch() {
 
     uint8_t q8_block[34];
     ggnpu::Q8_0Block* q8b = reinterpret_cast<ggnpu::Q8_0Block*>(q8_block);
-    q8b->d = 1;
+    q8b->d = 0x3C00;  // fp16 1.0
     q8b->qs[0] = 5;
     memset(q8b->qs + 1, 0, 31);
 
     int8_out.clear();
     scales_out.clear();
-    ggnpu::decode_for_npu(ggnpu::GgmlType::Q8_0, q8_block, 34, 0, 0, int8_out, scales_out);
+    ggnpu::decode_for_npu(ggnpu::GgmlType::Q8_0, q8_block, 34, 1, 32, int8_out, scales_out);
     ASSERT_EQ(int8_out.size(), 32, "Q8_0 dispatch produces 32 values");
-    ASSERT_EQ(int8_out[0], 5, "Q8_0 dispatch value[0]");
+    // Per-row requant: verify reconstruction rather than the raw int8 value.
+    ASSERT_NEAR(int8_out[0] * scales_out[0], 5.0f, 0.05f, "Q8_0 dispatch reconstruct value[0]");
 
     uint8_t q4_block[sizeof(ggnpu::Q4_0Block)];
     memset(q4_block, 0, sizeof(q4_block));
     ggnpu::Q4_0Block* q4b = reinterpret_cast<ggnpu::Q4_0Block*>(q4_block);
-    q4b->d = 1;
+    q4b->d = 0x3C00;  // fp16 1.0
     q4b->qs[0] = 0x12;
     memset(q4b->qs + 1, 0, 15);
 
     int8_out.clear();
     scales_out.clear();
-    ggnpu::decode_for_npu(ggnpu::GgmlType::Q4_0, q4_block, 16, 0, 0, int8_out, scales_out);
+    ggnpu::decode_for_npu(ggnpu::GgmlType::Q4_0, q4_block, 18, 1, 32, int8_out, scales_out);
     ASSERT_EQ(int8_out.size(), 32, "Q4_0 dispatch produces 32 values");
-   // qs[0] = 0x12, so nibbles are 2 and 1
-    // val = nibble - 8, so 2-8=-6, 1-8=-7
-    ASSERT_EQ(int8_out[0], -6, "Q4_0 dispatch value[0]");
-    ASSERT_EQ(int8_out[1], -7, "Q4_0 dispatch value[1]");
+    // qs[0]=0x12 -> value[0]=(2-8)=-6; qs[1]=0 -> value[1]=(0-8)=-8 (times d=1.0).
+    ASSERT_NEAR(int8_out[0] * scales_out[0], -6.0f, 0.05f, "Q4_0 dispatch reconstruct value[0]");
+    ASSERT_NEAR(int8_out[1] * scales_out[0], -8.0f, 0.05f, "Q4_0 dispatch reconstruct value[1]");
 }
 
 void test_block_size_consistency() {

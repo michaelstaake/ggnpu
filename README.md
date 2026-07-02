@@ -8,18 +8,35 @@ Run GGUF models on AMD NPUs (Krackan / XDNA2).
 |---------|--------|
 | AMD NPU | Work in progress |
 
-Validated models (on `npu6` / Krackan): **Llama 3.2 1B** (Q4_K_M), **Qwen2.5-Coder
-1.5B** (Q4_K_M), **Gemma 4 E2B** (`gemma4`, Q4_0), **LFM2.5 230M** (`lfm2`; validated
-across Q6_K, Q8_0, Q5_K, IQ4_NL, and BF16). Supported weight formats: Q4_0, Q8_0,
-Q4_K, Q5_K, Q6_K, IQ4_NL, and BF16 (all decoded to per-row int8 for the NPU matmul).
-Architecture support is metadata-driven (`general.architecture`), so other
-`llama`/`qwen2`-family GGUFs should load; non-pow2 hidden sizes and arbitrary FFN
-widths are handled by RMSNorm pad-to-pow2 and SiLU host-tiling. The `gemma4` path
-adds the full Gemma 4 (MatFormer) feature set — SentencePiece-unigram tokenizer,
-Per-Layer Embeddings, QK-norm, sandwich norms, shared-KV, sliding-window attention,
-and logit soft-cap — plus a Q4_0 quantization datapath. The `lfm2` path adds
-LiquidAI's hybrid architecture: gated ShortConv (depthwise causal conv1d) blocks
-interleaved with GQA attention, per-head QK-norm, NeoX RoPE, and a tied output head.
+**Most GGUF models run unmodified.** Point `ggnpu` at a `.gguf` file for any
+supported architecture in any supported quantization and it just runs on the NPU —
+no conversion, re-quantization, or per-model tweaking. Architecture support is
+metadata-driven (`general.architecture`); non-pow2 hidden sizes and arbitrary FFN
+widths are handled automatically (RMSNorm pad-to-pow2, SiLU host-tiling).
+
+### Confirmed models (validated end-to-end on `npu6` / Krackan)
+
+| Model | `architecture` | Notes |
+|-------|----------------|-------|
+| **Llama 3.2 1B** | `llama` | |
+| **Qwen2.5 / Qwen2.5-Coder 1.5B** | `qwen2` | QKV bias, GQA |
+| **DeepSeek-R1-Distill-Qwen 1.5B** | `qwen2` | validated across Q2_K → Q8_0, IQ4_XS, BF16 |
+| **Gemma 3n E2B** | `gemma4` | MatFormer: SentencePiece-unigram tokenizer, Per-Layer Embeddings, QK-norm, sandwich norms, shared-KV, sliding-window attention, logit soft-cap |
+| **LFM2.5 230M** | `lfm2` | hybrid gated ShortConv (depthwise causal conv1d) + GQA attention, per-head QK-norm, NeoX RoPE, tied output head |
+
+Any other `llama`- or `qwen2`-family GGUF loads through the same path.
+
+### Supported quantizations
+
+`Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ4_NL`, `IQ4_XS`, and
+`BF16` — all decoded to per-row int8 for the NPU matmul, and to reference float for
+the embedding/output paths. Mixed-precision GGUFs (e.g. a `Q4_K_M` file with `Q6_K`
+attention/FFN tensors) are handled tensor-by-tensor. Full-precision `F16`/`F32`
+tensors (norms, biases) pass through directly.
+
+Not yet supported: the codebook i-quants `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`/`IQ2_M`/
+`IQ3_XXS`/`IQ3_S`, and architectures beyond those above (e.g. `qwen3`, and
+selective-SSM hybrids such as `qwen35`).
 
 ## Native host setup
 

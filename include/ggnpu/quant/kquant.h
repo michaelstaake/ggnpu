@@ -21,6 +21,8 @@
 namespace ggnpu {
 
 constexpr size_t QK_K = 256;
+constexpr size_t Q2_K_BLOCK_BYTES = 84;
+constexpr size_t Q3_K_BLOCK_BYTES = 110;
 constexpr size_t Q4_K_BLOCK_BYTES = 144;
 constexpr size_t Q5_K_BLOCK_BYTES = 176;
 constexpr size_t Q6_K_BLOCK_BYTES = 210;
@@ -58,6 +60,72 @@ inline void q4k_get_scale_min(int j, const uint8_t* q, uint8_t* sc, uint8_t* m) 
     } else {
         *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
         *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+// Dequantize one 84-byte Q2_K block to 256 floats (matches llama.cpp
+// dequant_row_q2_K). Layout: scales[16] (4-bit scale, 4-bit min each) at
+// offset 0, qs[64] (2-bit quants) at offset 16, d(fp16) at offset 80,
+// dmin(fp16) at offset 82.
+inline void dequant_q2_k_block(const uint8_t* block, float* out) {
+    const uint8_t* scales = block;
+    const uint8_t* qs = block + 16;
+    float d = fp16_to_f32(static_cast<uint16_t>(block[80] | (block[81] << 8)));
+    float dmin = fp16_to_f32(static_cast<uint16_t>(block[82] | (block[83] << 8)));
+
+    int is = 0;
+    float* y = out;
+    for (int n = 0; n < 256; n += 128) {
+        const uint8_t* q = qs + (n / 128) * 32;
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            uint8_t sc = scales[is++];
+            float dl = d * (sc & 0xF), ml = dmin * (sc >> 4);
+            for (int l = 0; l < 16; ++l) *y++ = dl * ((q[l] >> shift) & 3) - ml;
+            sc = scales[is++];
+            dl = d * (sc & 0xF); ml = dmin * (sc >> 4);
+            for (int l = 0; l < 16; ++l) *y++ = dl * ((q[l + 16] >> shift) & 3) - ml;
+            shift += 2;
+        }
+    }
+}
+
+// Dequantize one 110-byte Q3_K block to 256 floats (matches llama.cpp
+// dequant_row_q3_K). Layout: hmask[32] at offset 0, qs[64] at offset 32,
+// scales[12] (6-bit, packed) at offset 96, d(fp16) at offset 108.
+inline void dequant_q3_k_block(const uint8_t* block, float* out) {
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+
+    const uint8_t* hm = block;          // hmask[32]
+    const uint8_t* qs = block + 32;     // qs[64]
+    float d_all = fp16_to_f32(static_cast<uint16_t>(block[108] | (block[109] << 8)));
+
+    uint32_t aux[4];
+    std::memcpy(aux, block + 96, 12);
+    uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
+
+    int is = 0;
+    uint8_t m = 1;
+    float* y = out;
+    for (int n = 0; n < 256; n += 128) {
+        const uint8_t* q = qs + (n / 128) * 32;
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            float dl = d_all * (scales[is++] - 32);
+            for (int l = 0; l < 16; ++l)
+                *y++ = dl * (static_cast<int8_t>((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+            dl = d_all * (scales[is++] - 32);
+            for (int l = 0; l < 16; ++l)
+                *y++ = dl * (static_cast<int8_t>((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+            shift += 2;
+            m <<= 1;
+        }
     }
 }
 

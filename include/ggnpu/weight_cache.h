@@ -33,8 +33,15 @@ struct DecodedWeight {
 // On cache miss: dispatches to correct decode function, stores result
 class WeightCache {
 public:
-    explicit WeightCache(CompileCache& compile_cache)
-        : cache_(compile_cache) {}
+    // model_id: a per-model fingerprint (e.g. "<path>:<file_size>") folded into
+    // every cache key. Without it, two models that share an architecture have
+    // identical (tensor_name, type, data_size) tuples and collide on the
+    // persistent disk cache — the second model silently runs on the first
+    // model's decoded weights. Always pass a distinct id per model file.
+    explicit WeightCache(CompileCache& compile_cache, const std::string& model_id = "")
+        : cache_(compile_cache), model_id_(model_id) {}
+
+    void set_model_id(const std::string& model_id) { model_id_ = model_id; }
 
     // Get decoded INT8 weights for a tensor.
     // On cache miss: decodes from GGUF format and stores.
@@ -133,7 +140,9 @@ public:
 private:
     std::string make_key(const std::string& tensor_name, GgmlType type, size_t data_size = 0) {
         std::hash<std::string> hasher;
-        size_t hash = hasher(tensor_name);
+        // Fold the model fingerprint into the name hash so tensors with the same
+        // name/type/size in different model files never collide on disk.
+        size_t hash = hasher(model_id_ + "\x1f" + tensor_name);
         // Versioned prefixes bust stale on-disk decodes after a decoder change.
         // Q4_0 bumped to w4_ (per-row int8 rewrite; earlier per-block was broken).
         const char* ver = (type == GgmlType::Q4_K || type == GgmlType::Q6_K) ? "w3_"
@@ -143,6 +152,7 @@ private:
     }
 
     CompileCache& cache_;
+    std::string model_id_;
     std::map<std::string, DecodedWeight> memory_cache_;
     mutable std::mutex mutex_;
 };

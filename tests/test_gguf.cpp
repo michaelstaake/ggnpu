@@ -45,7 +45,7 @@ void test_ggml_type_functions() {
     ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::F32), 4, "F32 size");
     ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::F16), 2, "F16 size");
     ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q8_0), 34, "Q8_0 size");
-    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_0), 16, "Q4_0 size");
+    ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_0), 18, "Q4_0 size");
     ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q4_K), 144, "Q4_K size");
     ASSERT_EQ(ggnpu::ggml_type_size(ggnpu::GgmlType::Q6_K), 210, "Q6_K size");
 
@@ -93,7 +93,7 @@ void test_tensor_view() {
     ASSERT_EQ(q4_count, 1024, "Q4_0 element count 32x32");
 
     size_t q4_data_size = tv_q4.data_size();
-    ASSERT_EQ(q4_data_size, 512, "Q4_0 data size (1024/32 * 16 = 512)");
+    ASSERT_EQ(q4_data_size, 576, "Q4_0 data size (1024/32 * 18 = 576)");
 
     ggnpu::TensorView tv_q8;
     tv_q8.dims = {64, 64};
