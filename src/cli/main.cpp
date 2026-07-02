@@ -23,6 +23,7 @@
 #include "quant/kquant.h"
 #include "quant/q4_0.h"
 #include "quant/q8_0.h"
+#include "quant/iq4_nl.h"
 
 namespace ggnpu {
 
@@ -35,6 +36,12 @@ void dequant_tensor_row(const TensorView* tv, int row, float* out, int row_dim) 
     if (tv->type == GgmlType::F32) {
         const float* src = reinterpret_cast<const float*>(tv->data);
         std::memcpy(out, src + static_cast<size_t>(row) * row_dim, static_cast<size_t>(row_dim) * sizeof(float));
+        return;
+    }
+
+    if (tv->type == GgmlType::BF16) {
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(tv->data) + static_cast<size_t>(row) * row_dim;
+        for (int k = 0; k < row_dim; k++) out[k] = bf16_to_f32(src[k]);
         return;
     }
 
@@ -70,6 +77,25 @@ void dequant_tensor_row(const TensorView* tv, int row, float* out, int row_dim) 
             dequant_q8_0_block(row_data + b * Q8_0_BLOCK_BYTES, block_f32.data());
             for (int j = 0; j < QK8_0; j++) {
                 size_t k = b * QK8_0 + j;
+                if (k < static_cast<size_t>(row_dim)) out[k] = block_f32[j];
+            }
+        }
+        return;
+    }
+
+    if (tv->type == GgmlType::IQ4_NL) {
+        constexpr int QK4_NL = 32;
+        constexpr size_t IQ4_NL_BLOCK_BYTES = 18;
+        const size_t blocks_per_row =
+            (static_cast<size_t>(row_dim) + QK4_NL - 1) / QK4_NL;
+        const size_t row_bytes = blocks_per_row * IQ4_NL_BLOCK_BYTES;
+        const uint8_t* row_data =
+            static_cast<const uint8_t*>(tv->data) + static_cast<size_t>(row) * row_bytes;
+        std::vector<float> block_f32(QK4_NL);
+        for (size_t b = 0; b < blocks_per_row; b++) {
+            dequant_iq4_nl_block(row_data + b * IQ4_NL_BLOCK_BYTES, block_f32.data());
+            for (int j = 0; j < QK4_NL; j++) {
+                size_t k = b * QK4_NL + j;
                 if (k < static_cast<size_t>(row_dim)) out[k] = block_f32[j];
             }
         }
@@ -146,7 +172,8 @@ void compute_logits(const float* hidden, const TensorView* weight, float* logits
 
     if (npu_path && (weight->type == GgmlType::Q4_K || weight->type == GgmlType::Q6_K ||
                      weight->type == GgmlType::Q4_0 || weight->type == GgmlType::Q8_0 ||
-                     weight->type == GgmlType::Q5_K)) {
+                     weight->type == GgmlType::Q5_K || weight->type == GgmlType::BF16 ||
+                     weight->type == GgmlType::IQ4_NL)) {
         const int8_t* decoded = weight_cache.get_or_decode(*weight);
         if (!decoded) goto cpu_fallback;
 
@@ -504,7 +531,8 @@ bool report_compare(const char* label, const CompareResult& r, int n,
 bool attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cache) {
     if (!w || (w->type != GgmlType::Q4_K && w->type != GgmlType::Q6_K &&
                w->type != GgmlType::Q4_0 && w->type != GgmlType::Q8_0 &&
-               w->type != GgmlType::Q5_K)) {
+               w->type != GgmlType::Q5_K && w->type != GgmlType::BF16 &&
+               w->type != GgmlType::IQ4_NL)) {
         return true;
     }
     const auto& scales = cache.get_scales(*w);

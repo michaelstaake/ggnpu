@@ -1077,8 +1077,8 @@ other sizes need JIT (`triton-xdna`, not installed) or a prebuilt build.
 | `LFM2.5-230M-Q6_K` | `lfm2` | Q6_K ✅ | yes | **WORKS — coherent, validated** *(2026-07-02)* | — (`test_e2e_lfm2` green: France → " Paris") |
 | `LFM2.5-230M-Q8_0` | `lfm2` | Q8_0 ✅ | yes | **WORKS** *(2026-07-02)* | fixed: Q8_0 `d` was read as int16 not fp16, and decode emitted per-block not per-row scales — rewrote to mirror Q4_0 + wired into all four type-gates (France → " Paris") |
 | `LFM2.5-230M-Q5_K_M` | `lfm2` | Q5_K ✅ | yes | **WORKS** *(2026-07-02)* | added `dequant_q5_k_block` + `decode_q5_k_for_npu` (Q4_K + 5th `qh` bit) and wired the type-gates (France → " Paris") |
-| `LFM2.5-230M-IQ4_NL` | `lfm2` | IQ4_NL ❌ | yes | matmul/embed decode | arch works; **no IQ4_NL decoder** (non-linear codebook 4-bit) |
-| `LFM2.5-230M-BF16` | `lfm2` | BF16 ❌ | yes | matmul/embed decode | arch works; **no BF16 weight path** (needs a bf16→int8 per-row requantize, cf. the F16 case in `decode_for_npu`) |
+| `LFM2.5-230M-IQ4_NL` | `lfm2` | IQ4_NL ✅ | yes | **WORKS** *(2026-07-02)* | added `dequant_iq4_nl_block` + `decode_iq4_nl_for_npu` (Q4_0 nibble layout + 16-entry non-linear codebook) and wired the type-gates (France → " Paris") |
+| `LFM2.5-230M-BF16` | `lfm2` | BF16 ✅ | yes | **WORKS** *(2026-07-02)* | added a BF16 case in `decode_for_npu` (per-row bf16→int8 requantize) + `dequant_tensor_row` and the type-gates (France → " Paris") |
 | `Qwen3.5-9B-UD-IQ2_XXS` | `qwen35` | IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S/Q2_K/Q3_K/Q4_K/Q5_K/Q8_0 ❌ | yes | first matmul | **i-quant weights undecodable** (IQ2_XXS…) → F32 fallback → no F32 matmul |
 | `ornith-9b-mtp-kl-IQ2_M` | `qwen35` | IQ2_S/IQ3_S/Q4_K/Q5_K/Q8_0 ❌ | yes | first matmul | same i-quant wall; also has an MTP/`nextn` head (blk.32) |
 
@@ -1148,9 +1148,9 @@ a standard SwiGLU FFN (`ffn_gate`/`up`/`down`).
     2+2 → "4", story continuation agrees for the first several greedy tokens before
     bf16/INT8 drift, same fidelity as the Llama/Gemma paths). Llama/Qwen2/Gemma
     unregressed.
-- **Verdict:** **DONE for Q6_K** — 4th architecture (hybrid ShortConv+attention) runs
-  coherently on the NPU. Remaining LFM2 work is quant breadth only: **Q8_0**
-  (half-wired — see table), then Q5_K / IQ4_NL / BF16 decoders (§7.4.3).
+- **Verdict:** **DONE** — 4th architecture (hybrid ShortConv+attention) runs coherently
+  on the NPU across **all five staged quant variants** (Q6_K/Q8_0/Q5_K/BF16/IQ4_NL, each
+  France → " Paris"). Quant work completed 2026-07-02 (§7.4.3).
 
 #### 7.4.2 `qwen35` — Qwen3.5 9B & Ornith 9B (hybrid SSM + gated attention)
 
@@ -1192,14 +1192,15 @@ layers are ~1:4**, the rest are SSM (Qwen3-Next / gated-delta-net style hybrid).
 - **RMSNorm size coverage.** ✅ *fixed 2026-07-02* — `rmsnorm_pad_width` rounds up to
   an available prebuilt width (256/512/2048) instead of `next_pow2`, so N=1024 (and any
   pow2 ≤ 2048 that isn't 2048) now free-rides 2048.
-- **Quant decoders.** Supported set is now **Q4_0, Q8_0, Q4_K, Q5_K, Q6_K** (Q8_0
-  fixed + Q5_K added 2026-07-02; all decode to per-row int8 + per-row scale and share
-  the matmul `kq_path`). Still missing: **IQ4_NL, BF16** (LFM2 breadth) and the i-quant
-  family **IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S, Q2_K, Q3_K** (qwen35). Q2_K/Q3_K are standard
-  k-quants (moderate); i-quants are codebook-based (harder); BF16 is a direct
-  no-decode path (needs a bf16→int8 per-row pack, cf. the F16 case in `decode_for_npu`).
-  **Any new quant needs wiring into five sites**: `decode_for_npu` dispatch,
-  `dequant_tensor_row` (embedding), the matmul `kq_path` + int8-base gate
+- **Quant decoders.** Supported set is now **Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL,
+  BF16** (Q8_0 fixed, Q5_K/IQ4_NL/BF16 added 2026-07-02; all decode to per-row int8 +
+  per-row scale and share the matmul `kq_path`). **All five staged LFM2 quant variants
+  now run.** Still missing: the i-quant family **IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S, Q2_K,
+  Q3_K** (needed by qwen35 — but qwen35 also needs the SSM arch, so these don't yield a
+  running model alone). Q2_K/Q3_K are standard k-quants (moderate); the IQ2/IQ3 family
+  is codebook/superblock-based (harder — IQ4_NL's fixed 16-entry codebook is the simple
+  case already done). **Any new quant needs wiring into five sites**: `decode_for_npu`
+  dispatch, `dequant_tensor_row` (embedding), the matmul `kq_path` + int8-base gate
   (`amd_xdna.cpp`), `attach_kquant_scales`, and `compute_logits`.
 - **No F32 matmul fallback.** The "falling back to F32" warning is misleading — there
   is no F32 NPU matmul, so an unsupported quant is fatal, not slow. Either implement a

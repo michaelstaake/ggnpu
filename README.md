@@ -9,7 +9,9 @@ Run GGUF models on AMD NPUs (Krackan / XDNA2).
 | AMD NPU | Work in progress |
 
 Validated models (on `npu6` / Krackan): **Llama 3.2 1B** (Q4_K_M), **Qwen2.5-Coder
-1.5B** (Q4_K_M), **Gemma 4 E2B** (`gemma4`, Q4_0), **LFM2.5 230M** (`lfm2`, Q6_K).
+1.5B** (Q4_K_M), **Gemma 4 E2B** (`gemma4`, Q4_0), **LFM2.5 230M** (`lfm2`; validated
+across Q6_K, Q8_0, Q5_K, IQ4_NL, and BF16). Supported weight formats: Q4_0, Q8_0,
+Q4_K, Q5_K, Q6_K, IQ4_NL, and BF16 (all decoded to per-row int8 for the NPU matmul).
 Architecture support is metadata-driven (`general.architecture`), so other
 `llama`/`qwen2`-family GGUFs should load; non-pow2 hidden sizes and arbitrary FFN
 widths are handled by RMSNorm pad-to-pow2 and SiLU host-tiling. The `gemma4` path

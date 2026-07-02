@@ -588,7 +588,9 @@ public:
                               params.B_type == GgmlType::Q6_K ||
                               params.B_type == GgmlType::Q4_0 ||
                               params.B_type == GgmlType::Q8_0 ||
-                              params.B_type == GgmlType::Q5_K) && params.scales;
+                              params.B_type == GgmlType::Q5_K ||
+                              params.B_type == GgmlType::BF16 ||
+                              params.B_type == GgmlType::IQ4_NL) && params.scales;
         const float* wscales = kq_path ? static_cast<const float*>(params.scales) : nullptr;
         const bool per_row_w = kq_path && params.n_weight_scales > 1;
 
@@ -631,7 +633,8 @@ public:
         const int8_t* B_int8_base = nullptr;
         if (params.B_type == GgmlType::I8 || params.B_type == GgmlType::Q4_0 ||
             params.B_type == GgmlType::Q4_K || params.B_type == GgmlType::Q6_K ||
-            params.B_type == GgmlType::Q8_0 || params.B_type == GgmlType::Q5_K) {
+            params.B_type == GgmlType::Q8_0 || params.B_type == GgmlType::Q5_K ||
+            params.B_type == GgmlType::BF16 || params.B_type == GgmlType::IQ4_NL) {
             B_int8_base = static_cast<const int8_t*>(params.B);
         }
 

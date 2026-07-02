@@ -1,4 +1,6 @@
 #include "quant/quant.h"
+#include "quant/iq4_nl.h"
+#include "bf16.h"
 #include <cstring>
 #include <iostream>
 #include <algorithm>
@@ -27,6 +29,10 @@ void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
 
         case GgmlType::Q5_K:
             decode_q5_k_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
+            break;
+
+        case GgmlType::IQ4_NL:
+            decode_iq4_nl_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
             break;
 
         case GgmlType::Q6_K:
@@ -70,6 +76,37 @@ void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
                 }
             }
             break;
+
+        case GgmlType::BF16: {
+            // bf16 weights (2 bytes/value, no blocks). Requantize per row to
+            // symmetric int8 + one scale/row, matching the kq_path convention
+            // (the F16/F32 case above uses a fixed 1/127 scale, which clips real
+            // weight magnitudes > 1 — fine for norms, wrong for matmul weights).
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(gguf_data);
+            int64_t rows = n_rows, cols = n_cols;
+            if (rows <= 0 || cols <= 0 ||
+                static_cast<size_t>(rows) * static_cast<size_t>(cols) * sizeof(uint16_t) != data_size) {
+                rows = 1;
+                cols = static_cast<int64_t>(data_size / sizeof(uint16_t));
+            }
+            int8_output.assign(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
+            scales_output.assign(static_cast<size_t>(rows), 1.0f);
+            for (int64_t r = 0; r < rows; r++) {
+                const uint16_t* row = src + static_cast<size_t>(r) * cols;
+                float max_abs = 0.0f;
+                for (int64_t k = 0; k < cols; k++)
+                    max_abs = std::max(max_abs, std::fabs(bf16_to_f32(row[k])));
+                float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+                float inv = 1.0f / scale;
+                scales_output[static_cast<size_t>(r)] = scale;
+                for (int64_t k = 0; k < cols; k++) {
+                    float q = std::nearbyint(bf16_to_f32(row[k]) * inv);
+                    int8_output[static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(k)] =
+                        static_cast<int8_t>(std::clamp(q, -128.0f, 127.0f));
+                }
+            }
+            break;
+        }
 
         default:
             std::cerr << "Warning: unsupported quant type " << ggml_type_name(type)
