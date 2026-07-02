@@ -880,6 +880,11 @@ int main(int argc, char* argv[]) {
     // Tokenize prompt
     std::vector<int> input_tokens = tokenizer.encode(params.prompt, true, false);
     std::cout << "Input tokens: " << input_tokens.size() << "\n";
+    if (std::getenv("GGNPU_DEBUG_TOKENS")) {
+        std::cout << "  ids:";
+        for (int id : input_tokens) std::cout << " " << id;
+        std::cout << "\n";
+    }
     std::cout << "Prompt: " << params.prompt << "\n\n";
 
     // Weight cache: decode GGUF quantized weights to INT8 for NPU
@@ -1759,6 +1764,37 @@ int main(int argc, char* argv[]) {
     const TensorView* ple_model_proj = is_gemma ? find_tensor(model, "per_layer_model_proj.weight") : nullptr;
     const TensorView* ple_proj_norm = is_gemma ? find_tensor(model, "per_layer_proj_norm.weight") : nullptr;
 
+    // ---- LFM2 (lfm2) forward path ----
+    // LiquidAI LFM2.5: a hybrid that interleaves gated ShortConv blocks with GQA
+    // attention blocks; both are followed by a SwiGLU FFN. Per-layer type is read
+    // from tensor presence (recurrent/conv layers carry shortconv.* and no attn_*;
+    // this matches llama.cpp's is_recr = n_head_kv(il)==0). Norms are plain
+    // RMSNorm, RoPE is NeoX, and — an LFM2 quirk — the final norm is stored as
+    // `token_embd_norm` while the output projection is tied to the token embedding.
+    const bool is_lfm2 = (model.gguf().arch() == "lfm2");
+    const int lfm2_d_conv =
+        static_cast<int>(model.gguf().get_int("lfm2.shortconv.l_cache", 3));
+    const float lfm2_rope_base =
+        static_cast<float>(model.gguf().get_float("lfm2.rope.freq_base", 1e6));
+    std::vector<char> lfm2_is_conv(num_layers, 0);              // 1 = ShortConv layer
+    std::vector<int>  lfm2_kv_heads(num_layers, 0);             // n_head_kv (attn layers)
+    // Per-layer recurrent/attention state, persistent across token steps.
+    std::vector<std::vector<float>> lconv_state(num_layers);    // [(d_conv-1)*hidden] per conv layer
+    std::vector<std::vector<float>> lk_store(num_layers), lv_store(num_layers);  // [pos*kvh*head_dim] per attn layer
+    if (is_lfm2) {
+        for (int L = 0; L < num_layers; L++) {
+            if (find_tensor_pattern(model, "blk.{layer}.shortconv.in_proj.weight", L)) {
+                lfm2_is_conv[L] = 1;
+                lconv_state[L].assign(static_cast<size_t>(lfm2_d_conv - 1) * hidden_size, 0.0f);
+            } else {
+                const TensorView* kw = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", L);
+                lfm2_kv_heads[L] = (kw && head_dim > 0) ? static_cast<int>(kw->dims[1] / head_dim) : num_heads;
+            }
+        }
+        std::cout << "lfm2 forward: " << num_layers << " layers, d_conv=" << lfm2_d_conv
+                  << ", rope_base=" << lfm2_rope_base << "\n";
+    }
+
     // Per-op timing accumulator for the gemma4 path (-v/--verbose), mirroring
     // the Llama path's step_timings. Declared here (stable address) rather
     // than freshly per-iteration so the g_rmsnorm/g_rope/g_gelu lambdas below
@@ -2104,8 +2140,189 @@ int main(int argc, char* argv[]) {
             if (!g_rmsnorm(inp_norm.data(), inp_embd.data(), hidden_size, get_float_ptr(out_norm_w), rms_eps)) return 1;
         }
 
-        // Transformer layers (non-gemma path)
-        for (int layer = 0; !is_gemma && layer < max_layers_override; layer++) {
+        // ---- LFM2 forward ----
+        // Single token per step; inp_embd carries the running hidden state and the
+        // final normalized state is written into inp_norm for the logits below.
+        else if (is_lfm2) {
+            std::vector<float> xn(hidden_size);
+            std::vector<float> bcx(static_cast<size_t>(3) * hidden_size), yconv(hidden_size);
+            std::vector<float> q, kbuf, vbuf, kexp, vexp, attn_in, attn_o(hidden_size);
+            std::vector<float> gate(ffn_size), up(ffn_size), act(ffn_size), dn(hidden_size);
+
+            for (int L = 0; L < max_layers_override; L++) {
+                const TensorView* attn_norm_w = find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", L);
+                const TensorView* ffn_norm_w  = find_tensor_pattern(model, "blk.{layer}.ffn_norm.weight", L);
+
+                // operator_norm: pre-block RMSNorm (plain weight).
+                if (!g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(attn_norm_w), rms_eps)) return 1;
+
+                if (lfm2_is_conv[L]) {
+                    // --- Gated short convolution ---
+                    // bcx = in_proj(xn) -> split B, C, x (each `hidden`); bx = B*x;
+                    // depthwise causal conv over the last d_conv taps; y = C*conv(bx);
+                    // out = out_proj(y).
+                    const TensorView* inproj_w  = find_tensor_pattern(model, "blk.{layer}.shortconv.in_proj.weight", L);
+                    const TensorView* outproj_w = find_tensor_pattern(model, "blk.{layer}.shortconv.out_proj.weight", L);
+                    const TensorView* conv_w    = find_tensor_pattern(model, "blk.{layer}.shortconv.conv.weight", L);
+                    std::fill(bcx.begin(), bcx.end(), 0.0f);
+                    mul_mat_weight(xn.data(), inproj_w, bcx.data(), 1, 3 * hidden_size, hidden_size,
+                                   hidden_size, 3 * hidden_size, 3 * hidden_size,
+                                   params.verbose ? &step_timings.matmul_ms : nullptr);
+                    backend->sync();
+                    const float* b = bcx.data();                    // [0, hidden)
+                    const float* c = bcx.data() + hidden_size;      // [hidden, 2*hidden)
+                    const float* x = bcx.data() + 2 * hidden_size;  // [2*hidden, 3*hidden)
+
+                    // conv.weight is F32, tap-contiguous {d_conv, hidden}: w[tap,ch] = cw[ch*d_conv + tap].
+                    // State holds the previous (d_conv-1) bx vectors, oldest first.
+                    const float* cw = get_float_ptr(conv_w);
+                    std::vector<float>& st = lconv_state[L];
+                    const int dcm1 = lfm2_d_conv - 1;
+                    for (int ch = 0; ch < hidden_size; ch++) {
+                        const float bx = b[ch] * x[ch];
+                        float acc = cw[ch * lfm2_d_conv + dcm1] * bx;  // newest tap = current token
+                        for (int k = 0; k < dcm1; k++)
+                            acc += cw[ch * lfm2_d_conv + k] * st[static_cast<size_t>(k) * hidden_size + ch];
+                        yconv[ch] = c[ch] * acc;
+                        // roll the conv state: drop oldest, append current bx
+                        for (int k = 0; k < dcm1 - 1; k++)
+                            st[static_cast<size_t>(k) * hidden_size + ch] =
+                                st[static_cast<size_t>(k + 1) * hidden_size + ch];
+                        st[static_cast<size_t>(dcm1 - 1) * hidden_size + ch] = bx;
+                    }
+                    std::fill(attn_o.begin(), attn_o.end(), 0.0f);
+                    mul_mat_weight(yconv.data(), outproj_w, attn_o.data(), 1, hidden_size, hidden_size,
+                                   hidden_size, hidden_size, hidden_size,
+                                   params.verbose ? &step_timings.matmul_ms : nullptr);
+                    backend->sync();
+                    for (int i = 0; i < hidden_size; i++) inp_embd[i] += attn_o[i];
+                } else {
+                    // --- GQA attention ---
+                    const int kvh   = lfm2_kv_heads[L];
+                    const int qdim  = num_heads * head_dim;
+                    const int kvdim = kvh * head_dim;
+                    const TensorView* q_w  = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", L);
+                    const TensorView* k_w  = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", L);
+                    const TensorView* v_w  = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", L);
+                    const TensorView* o_w  = find_tensor_pattern(model, "blk.{layer}.attn_output.weight", L);
+                    const TensorView* qn_w = find_tensor_pattern(model, "blk.{layer}.attn_q_norm.weight", L);
+                    const TensorView* kn_w = find_tensor_pattern(model, "blk.{layer}.attn_k_norm.weight", L);
+
+                    q.assign(qdim, 0.0f);
+                    kbuf.assign(kvdim, 0.0f);
+                    vbuf.assign(kvdim, 0.0f);
+                    mul_mat_weight(xn.data(), q_w, q.data(), 1, qdim, hidden_size, hidden_size, qdim, qdim,
+                                   params.verbose ? &step_timings.matmul_ms : nullptr);
+                    mul_mat_weight(xn.data(), k_w, kbuf.data(), 1, kvdim, hidden_size, hidden_size, kvdim, kvdim,
+                                   params.verbose ? &step_timings.matmul_ms : nullptr);
+                    mul_mat_weight(xn.data(), v_w, vbuf.data(), 1, kvdim, hidden_size, hidden_size, kvdim, kvdim,
+                                   params.verbose ? &step_timings.matmul_ms : nullptr);
+                    backend->sync();
+
+                    // Per-head QK-norm (RMSNorm over head_dim) then NeoX RoPE.
+                    for (int h = 0; h < num_heads; h++)
+                        if (!g_rmsnorm(q.data() + h * head_dim, q.data() + h * head_dim, head_dim,
+                                       get_float_ptr(qn_w), rms_eps)) return 1;
+                    for (int h = 0; h < kvh; h++)
+                        if (!g_rmsnorm(kbuf.data() + h * head_dim, kbuf.data() + h * head_dim, head_dim,
+                                       get_float_ptr(kn_w), rms_eps)) return 1;
+                    if (!g_rope(q.data(), num_heads, head_dim, pos, lfm2_rope_base)) return 1;
+                    if (!g_rope(kbuf.data(), kvh, head_dim, pos, lfm2_rope_base)) return 1;
+
+                    lk_store[L].insert(lk_store[L].end(), kbuf.begin(), kbuf.end());
+                    lv_store[L].insert(lv_store[L].end(), vbuf.begin(), vbuf.end());
+                    const int64_t ctx_len = pos + 1;
+                    const int group = num_heads / kvh;
+
+                    // Expand K/V from kvh to num_heads (GQA: query head h -> kv head h/group).
+                    kexp.assign(static_cast<size_t>(num_heads) * ctx_len * head_dim, 0.0f);
+                    vexp.assign(static_cast<size_t>(num_heads) * ctx_len * head_dim, 0.0f);
+                    {
+                        std::unique_ptr<ScopedTimer> t;
+                        if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.kv_expand_ms);
+                        for (int h = 0; h < num_heads; h++) {
+                            const int kh = h / group;
+                            for (int64_t j = 0; j < ctx_len; j++) {
+                                std::memcpy(kexp.data() + (static_cast<size_t>(h) * ctx_len + j) * head_dim,
+                                            lk_store[L].data() + (static_cast<size_t>(j) * kvh + kh) * head_dim,
+                                            head_dim * sizeof(float));
+                                std::memcpy(vexp.data() + (static_cast<size_t>(h) * ctx_len + j) * head_dim,
+                                            lv_store[L].data() + (static_cast<size_t>(j) * kvh + kh) * head_dim,
+                                            head_dim * sizeof(float));
+                            }
+                        }
+                    }
+
+                    attn_in.assign(qdim, 0.0f);
+                    AttnParams fa;
+                    fa.Q = q.data();
+                    fa.K = kexp.data();
+                    fa.V = vexp.data();
+                    fa.output = attn_in.data();
+                    fa.batch_size = 1;
+                    fa.n_head = num_heads;
+                    fa.head_dim = head_dim;
+                    fa.ctx_len = ctx_len;
+                    fa.query_pos = pos;
+                    fa.freq_factors = nullptr;
+                    {
+                        std::unique_ptr<ScopedTimer> t;
+                        if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.flash_attn_ms);
+                        if (backend->flash_attn(fa) != Status::OK) {
+                            std::cerr << "Error: lfm2 flash_attn failed at layer " << L << "\n";
+                            model.unload();
+                            return 1;
+                        }
+                    }
+
+                    std::fill(attn_o.begin(), attn_o.end(), 0.0f);
+                    mul_mat_weight(attn_in.data(), o_w, attn_o.data(), 1, hidden_size, qdim,
+                                   qdim, hidden_size, hidden_size,
+                                   params.verbose ? &step_timings.matmul_ms : nullptr);
+                    backend->sync();
+                    for (int i = 0; i < hidden_size; i++) inp_embd[i] += attn_o[i];
+                }
+
+                // --- SwiGLU FFN (both block types) ---
+                if (!g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(ffn_norm_w), rms_eps)) return 1;
+                const TensorView* gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", L);
+                const TensorView* up_w   = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", L);
+                const TensorView* down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", L);
+                std::fill(gate.begin(), gate.end(), 0.0f);
+                std::fill(up.begin(), up.end(), 0.0f);
+                mul_mat_weight(xn.data(), gate_w, gate.data(), 1, ffn_size, hidden_size,
+                               hidden_size, ffn_size, ffn_size,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
+                mul_mat_weight(xn.data(), up_w, up.data(), 1, ffn_size, hidden_size,
+                               hidden_size, ffn_size, ffn_size,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
+                backend->sync();
+                {
+                    std::unique_ptr<ScopedTimer> t;
+                    if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.silu_ms);
+                    SiluParams sp; sp.input = gate.data(); sp.output = act.data(); sp.size = ffn_size;
+                    if (backend->silu(sp) != Status::OK) {
+                        std::cerr << "Error: lfm2 silu failed at layer " << L << "\n";
+                        model.unload();
+                        return 1;
+                    }
+                }
+                for (int i = 0; i < ffn_size; i++) act[i] *= up[i];
+                std::fill(dn.begin(), dn.end(), 0.0f);
+                mul_mat_weight(act.data(), down_w, dn.data(), 1, hidden_size, ffn_size,
+                               ffn_size, hidden_size, hidden_size,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
+                backend->sync();
+                for (int i = 0; i < hidden_size; i++) inp_embd[i] += dn[i];
+            }
+
+            // Final norm (LFM2 stores it as token_embd_norm) into inp_norm.
+            const TensorView* out_norm_w = find_tensor(model, "token_embd_norm.weight");
+            if (!g_rmsnorm(inp_norm.data(), inp_embd.data(), hidden_size, get_float_ptr(out_norm_w), rms_eps)) return 1;
+        }
+
+        // Transformer layers (non-gemma, non-lfm2 path)
+        for (int layer = 0; !is_gemma && !is_lfm2 && layer < max_layers_override; layer++) {
             const TensorView* attn_norm_w =
                 find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", layer);
             const TensorView* ffn_norm_w =
@@ -2304,9 +2521,9 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Final normalization (output_norm before logits) — non-gemma path
-        // (the gemma branch above already wrote inp_norm with its (1+w) norm).
-        if (!is_gemma) {
+        // Final normalization (output_norm before logits) — non-gemma, non-lfm2
+        // path (those branches already wrote inp_norm with their own final norm).
+        if (!is_gemma && !is_lfm2) {
             const TensorView* output_norm_w = find_tensor(model, "output_norm.weight");
             ScopedTimer t(step_timings.rms_norm_ms);
             if (!rms_norm(inp_norm.data(), inp_embd.data(), n_tokens, hidden_size, rms_eps,

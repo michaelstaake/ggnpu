@@ -311,6 +311,21 @@ static int next_pow2(int n) {
     return p;
 }
 
+// Width of the RMSNorm kernel used to service a hidden size N. The kernel's
+// BLOCK_N must be a power of 2 (Triton tl.arange), and zero-padding N up to a
+// wider power of 2 is exact (the extra columns are 0 → contribute nothing to
+// the sum-of-squares; the divisor/eps mismatch is corrected host-side). We only
+// have reliably-available xclbins at 256, 512 and 2048, so round *up to one of
+// those* rather than to next_pow2(N) — otherwise an already-pow2 hidden that
+// isn't one of those (e.g. lfm2's 1024) asks for a kernel that was never built
+// and there's no JIT. Above 2048 we fall back to next_pow2 (needs JIT).
+static int rmsnorm_pad_width(int n) {
+    if (n <= 256) return 256;
+    if (n <= 512) return 512;
+    if (n <= 2048) return 2048;
+    return next_pow2(n);
+}
+
 static void rms_norm_cpu_ref(const RmsNormParams& params) {
     float variance = 0.0f;
     for (int i = 0; i < params.size; i++) variance += params.input[i] * params.input[i];
@@ -889,8 +904,10 @@ public:
         }
 
         // The BF16 kernel's BLOCK_N must be a power of 2 (Triton tl.arange). For
-        // non-pow2 hidden sizes (e.g. 1536) pad up to N_pad = next_pow2(N) and use
-        // the N_pad kernel. The kernel divides the sum-of-squares by N_pad, so its
+        // hidden sizes without a same-width kernel (e.g. 1536, or 1024 with no
+        // rmsnorm_1024 built) pad up to N_pad = rmsnorm_pad_width(N) — the nearest
+        // *available* kernel width (256/512/2048) — and use that kernel. The
+        // kernel divides the sum-of-squares by N_pad, so its
         // rstd is too large by sqrt(N_pad/N); zero padding contributes nothing to
         // the sum, so this is corrected with an output factor computed below.
         // The input is NOT scaled, so it stays on the same bf16 grid as the
@@ -907,7 +924,7 @@ public:
         // in double precision); it reduces to the old sqrt(N/N_pad) formula
         // whenever eps is negligible next to mean-of-squares (the Llama/Qwen2
         // regime), so it's a strict improvement, not a behavior change there.
-        const int N_pad = next_pow2(N);
+        const int N_pad = rmsnorm_pad_width(N);
         constexpr float kRmsnormBakedEps = 1e-5f;
 
         std::string cache_key = "rmsnorm_" + std::to_string(N_pad) + "_" + profile_str_;

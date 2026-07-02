@@ -163,6 +163,16 @@ if(GGNPU_BUILD_TESTS)
     set_tests_properties(test_e2e_gemma PROPERTIES
         SKIP_RETURN_CODE 77
         LABELS "e2e")
+
+    # E2E: lfm2 (LFM2.5) France prompt → greedy top-1 is Paris (skips if model absent)
+    add_test(
+        NAME test_e2e_lfm2
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/test-lfm2-e2e.sh
+                $<TARGET_FILE:ggnpu>
+                ${CMAKE_SOURCE_DIR}/models/LFM2.5-230M-Q6_K.gguf)
+    set_tests_properties(test_e2e_lfm2 PROPERTIES
+        SKIP_RETURN_CODE 77
+        LABELS "e2e")
 endif()
 
 # Install

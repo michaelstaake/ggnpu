@@ -1074,8 +1074,8 @@ other sizes need JIT (`triton-xdna`, not installed) or a prebuilt build.
 
 | Model file | Arch | Quant(s) | Loads? | Furthest point reached | Immediate blocker |
 |---|---|---|---|---|---|
-| `LFM2.5-230M-Q6_K` | `lfm2` | Q6_K ✅ | yes | first RMSNorm of layer 0 | **no `rmsnorm_1024` kernel** (hidden=1024 is already pow2, so it does *not* free-ride the 2048 kernel; JIT absent) |
-| `LFM2.5-230M-Q8_0` | `lfm2` | Q8_0 ✅ | yes | first RMSNorm | same `rmsnorm_1024` wall (quant is fine) |
+| `LFM2.5-230M-Q6_K` | `lfm2` | Q6_K ✅ | yes | **WORKS — coherent, validated** *(2026-07-02)* | — (`test_e2e_lfm2` green: France → " Paris") |
+| `LFM2.5-230M-Q8_0` | `lfm2` | Q8_0 ⚠️ | yes | garbage (`<pad>`) | arch works, but **Q8_0 is only half-wired**: no `dequant_tensor_row` case (embedding→zeros) and Q8_0 absent from matmul `kq_path`/scale-attach. Separate quant task. |
 | `LFM2.5-230M-Q5_K_M` | `lfm2` | Q5_K ❌ | yes | first RMSNorm | `rmsnorm_1024` wall; **behind it: no Q5_K decoder** |
 | `LFM2.5-230M-IQ4_NL` | `lfm2` | IQ4_NL ❌ | yes | first RMSNorm | `rmsnorm_1024` wall; **behind it: no IQ4_NL decoder** |
 | `LFM2.5-230M-BF16` | `lfm2` | BF16 ❌ | yes | first RMSNorm | `rmsnorm_1024` wall; **behind it: no BF16 weight path** |
@@ -1106,22 +1106,51 @@ a standard SwiGLU FFN (`ffn_gate`/`up`/`down`).
   forward substructure the codebase has never had (like Gemma's PLE was). Conv is
   tiny — do it on the host first (correctness), NPU-offload later if it matters.
 - **Work to make it run, in order:**
-  1. **Unblock RMSNorm at N=1024** — either build a prebuilt `rmsnorm_1024_npu6.xclbin`
-     (`./scripts/build-kernels.sh npu6 rmsnorm_1024`) or generalize the free-ride
-     logic so already-pow2 sizes below 2048 pad *up to* the 2048 kernel (cf. the
-     gemma4 1536→2048 free-ride). Second option is cheaper and unblocks any future
-     pow2 hidden ≤ 2048.
-  2. **Add an `lfm2` arch branch** in `src/cli/main.cpp` (mirror the `is_gemma`
-     guard). Per-layer dispatch on block type (ShortConv vs attention), read the
-     per-layer `head_count_kv` array to distinguish, wire `token_embd_norm`.
-  3. **Implement the ShortConv operator** (host first). Depthwise causal conv1d,
-     kernel 3, with the B/C gating; keep a per-layer conv state cache of width
-     `l_cache` for decode.
-  4. Quants: **Q6_K and Q8_0 already decode** — use one of those to validate
-     correctness first. Q5_K / IQ4_NL / BF16 are separate decoder work (below), not
-     needed for first light.
-- **Verdict:** most tractable of the new models (small, supported quant available,
-  only one new host-side operator). Good candidate for the next model-breadth phase.
+  1. [x] **Unblock RMSNorm at N=1024** *(done 2026-07-02)* — generalized the pad-up
+     logic in `amd_xdna.cpp`: new `rmsnorm_pad_width(N)` rounds N up to the nearest
+     *available* prebuilt kernel width (256/512/2048) instead of `next_pow2(N)`, which
+     had asked for a never-built `rmsnorm_1024`. The existing exact host-side
+     correction (divisor + eps) already handles any `N_pad ≥ N`, so 1024→2048 is
+     exact. **Identical output to before for every existing model** (2048→2048,
+     1536→2048, 256→256, 512→512 all unchanged); only previously-*failing* sizes move.
+     Verified: LFM2 clears RMSNorm; Llama ("Paris. The French government is") and
+     Gemma4 ("Paris.") unregressed. *Next blocker surfaced immediately:* **SIGFPE
+     (integer div-by-zero)** at generation start — the generic transformer loop divides
+     by `num_kv_heads`, which is **0** for lfm2 (the scalar `head_count_kv` getter
+     returns 0 because it's a per-layer array). Confirms step 2 is required.
+  2. [x] **Add an `lfm2` arch branch** in `src/cli/main.cpp` *(done 2026-07-02)* —
+     a dedicated single-token forward parallel to the `is_gemma` branch. Per-layer
+     type comes from tensor presence (`shortconv.in_proj` ⇒ conv, else attention;
+     matches llama.cpp `is_recr = n_head_kv(il)==0`). Reuses the gemma path's
+     `g_rmsnorm` (plain weight) and `g_rope` (NeoX split-half, base 1e6). Attention
+     blocks: GQA (16 q / 8 kv heads, head_dim 64), per-head QK-norm, per-layer KV
+     store + GQA expand, host flash_attn. **Final norm is `token_embd_norm`** (an
+     LFM2 naming quirk = llama.cpp `LLM_TENSOR_OUTPUT_NORM_LFM2`), output tied to
+     `token_embd`. SwiGLU FFN on every block. Generic loop guarded with `!is_lfm2`.
+  3. [x] **Implement the ShortConv operator** (host) *(done 2026-07-02)* —
+     `bcx = in_proj(x)` → split B,C,x (each `hidden`); `bx = B*x`; depthwise causal
+     conv1d over the last `l_cache`(=3) taps (weight is F32, tap-contiguous
+     `cw[ch*d_conv+tap]`); `y = C*conv`; `out = out_proj(y)`. A per-layer conv-state
+     ring of the previous `d_conv-1` `bx` vectors carries history across decode steps
+     (matches ggml `ssm_conv` semantics, verified against `ggml-cpu/ops.cpp`).
+  4. [x] **Tokenizer fix** *(done 2026-07-02, the actual blocker to coherence)* — the
+     first run produced *coherent-but-wrong* output (France → "the capital of the
+     country" instead of "Paris"). Root cause was **not** the forward math: `lfm2`'s
+     pre-tokenizer wasn't mapped, so it fell to `PreType::Default`, which returns the
+     whole prompt unsplit and BPE-merged it wrong. llama.cpp maps `lfm2` to the
+     **Llama3** pre-type (`ignore_merges=true`); mapping it in `tokenizer.cpp` made
+     token IDs match llama.cpp exactly (`1 1098 5706 803 4481 856`) and output flip to
+     " Paris." **Lesson: validate tokenization against a reference *first* — coherent
+     wrong output points at the tokenizer, not the math.** Ground truth via a locally
+     built `llama-simple` (raw completion; `llama-cli` forces its chat template).
+  - **Validated with Q6_K:** `test_e2e_lfm2` (France → top-1 " Paris" id 5242) green,
+    and free-form prompts match the llama-simple reference (opposite-of-hot → "cold",
+    2+2 → "4", story continuation agrees for the first several greedy tokens before
+    bf16/INT8 drift, same fidelity as the Llama/Gemma paths). Llama/Qwen2/Gemma
+    unregressed.
+- **Verdict:** **DONE for Q6_K** — 4th architecture (hybrid ShortConv+attention) runs
+  coherently on the NPU. Remaining LFM2 work is quant breadth only: **Q8_0**
+  (half-wired — see table), then Q5_K / IQ4_NL / BF16 decoders (§7.4.3).
 
 #### 7.4.2 `qwen35` — Qwen3.5 9B & Ornith 9B (hybrid SSM + gated attention)
 

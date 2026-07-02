@@ -132,7 +132,11 @@ bool Tokenizer::load_from_gguf(const std::map<std::string, GgufKV>& kv_pairs) {
     auto pre_it = kv_pairs.find("tokenizer.ggml.pre");
     if (pre_it != kv_pairs.end()) {
         const std::string& pre = pre_it->second.string_value;
-        if (pre == "llama-bpe" || pre == "llama3" || pre == "llama-v3") {
+        // llama.cpp groups these under LLAMA_VOCAB_PRE_TYPE_LLAMA3 (same regex,
+        // ignore_merges=true) — notably lfm2, which otherwise fell through to the
+        // Default pretype and tokenized the whole prompt as one word.
+        if (pre == "llama-bpe" || pre == "llama3" || pre == "llama-v3" ||
+            pre == "lfm2") {
             pre_type_ = PreType::Llama3;
         } else if (pre == "gpt-2" || pre == "default") {
             pre_type_ = PreType::Gpt2;

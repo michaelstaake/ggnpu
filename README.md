@@ -9,13 +9,15 @@ Run GGUF models on AMD NPUs (Krackan / XDNA2).
 | AMD NPU | Work in progress |
 
 Validated models (on `npu6` / Krackan): **Llama 3.2 1B** (Q4_K_M), **Qwen2.5-Coder
-1.5B** (Q4_K_M), **Gemma 4 E2B** (`gemma4`, Q4_0). Architecture support is
-metadata-driven (`general.architecture`), so other `llama`/`qwen2`-family GGUFs
-should load; non-pow2 hidden sizes and arbitrary FFN widths are handled by RMSNorm
-pad-to-pow2 and SiLU host-tiling. The `gemma4` path adds the full Gemma 4
-(MatFormer) feature set — SentencePiece-unigram tokenizer, Per-Layer Embeddings,
-QK-norm, sandwich norms, shared-KV, sliding-window attention, and logit soft-cap —
-plus a Q4_0 quantization datapath.
+1.5B** (Q4_K_M), **Gemma 4 E2B** (`gemma4`, Q4_0), **LFM2.5 230M** (`lfm2`, Q6_K).
+Architecture support is metadata-driven (`general.architecture`), so other
+`llama`/`qwen2`-family GGUFs should load; non-pow2 hidden sizes and arbitrary FFN
+widths are handled by RMSNorm pad-to-pow2 and SiLU host-tiling. The `gemma4` path
+adds the full Gemma 4 (MatFormer) feature set — SentencePiece-unigram tokenizer,
+Per-Layer Embeddings, QK-norm, sandwich norms, shared-KV, sliding-window attention,
+and logit soft-cap — plus a Q4_0 quantization datapath. The `lfm2` path adds
+LiquidAI's hybrid architecture: gated ShortConv (depthwise causal conv1d) blocks
+interleaved with GQA attention, per-head QK-norm, NeoX RoPE, and a tied output head.
 
 ## Native host setup
 
