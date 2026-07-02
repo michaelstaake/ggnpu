@@ -18,11 +18,15 @@ void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
             break;
 
         case GgmlType::Q8_0:
-            decode_q8_0_for_npu(gguf_data, data_size, int8_output, scales_output);
+            decode_q8_0_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
             break;
 
         case GgmlType::Q4_K:
             decode_q4_k_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
+            break;
+
+        case GgmlType::Q5_K:
+            decode_q5_k_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
             break;
 
         case GgmlType::Q6_K:

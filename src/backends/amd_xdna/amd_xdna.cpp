@@ -582,11 +582,13 @@ public:
         // K-quants are decoded host-side to int8 with one per-tensor weight
         // scale. Activations get a per-call dynamic scale; the product of
         // both scales converts the raw INT32 accumulators back to float.
-        // Q4_0/Q4_K/Q6_K are all decoded host-side to per-row int8 [N][K] with one
-        // scale per output row, so they share the same tile-gather + scale path.
+        // Q4_0/Q8_0/Q4_K/Q5_K/Q6_K are all decoded host-side to per-row int8 [N][K]
+        // with one scale per output row, so they share the same tile-gather + scale path.
         const bool kq_path = (params.B_type == GgmlType::Q4_K ||
                               params.B_type == GgmlType::Q6_K ||
-                              params.B_type == GgmlType::Q4_0) && params.scales;
+                              params.B_type == GgmlType::Q4_0 ||
+                              params.B_type == GgmlType::Q8_0 ||
+                              params.B_type == GgmlType::Q5_K) && params.scales;
         const float* wscales = kq_path ? static_cast<const float*>(params.scales) : nullptr;
         const bool per_row_w = kq_path && params.n_weight_scales > 1;
 
@@ -629,7 +631,7 @@ public:
         const int8_t* B_int8_base = nullptr;
         if (params.B_type == GgmlType::I8 || params.B_type == GgmlType::Q4_0 ||
             params.B_type == GgmlType::Q4_K || params.B_type == GgmlType::Q6_K ||
-            params.B_type == GgmlType::Q8_0) {
+            params.B_type == GgmlType::Q8_0 || params.B_type == GgmlType::Q5_K) {
             B_int8_base = static_cast<const int8_t*>(params.B);
         }
 

@@ -66,6 +66,7 @@ set(LIB_SOURCES
     src/quant/q4_0.cpp
     src/quant/q8_0.cpp
     src/quant/q4_k.cpp
+    src/quant/q5_k.cpp
     src/quant/q6_k.cpp
     src/quant/quant.cpp
     src/arch/llama/llama.cpp

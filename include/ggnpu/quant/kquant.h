@@ -22,6 +22,7 @@ namespace ggnpu {
 
 constexpr size_t QK_K = 256;
 constexpr size_t Q4_K_BLOCK_BYTES = 144;
+constexpr size_t Q5_K_BLOCK_BYTES = 176;
 constexpr size_t Q6_K_BLOCK_BYTES = 210;
 
 inline float fp16_to_f32(uint16_t h) {
@@ -78,6 +79,34 @@ inline void dequant_q4_k_block(const uint8_t* block, float* out) {
         for (int l = 0; l < 32; l++) out[idx + 32 + l] = d2 * (qs[l] >> 4) - min2;
         idx += 64;
         qs += 32;
+    }
+}
+
+// Dequantize one 176-byte Q5_K block to 256 floats.
+// Layout: d(fp16) dmin(fp16) scales[12] qh[32] qs[128]. Same 6-bit scale/min
+// packing as Q4_K, plus a 5th bit per value taken from qh (matches llama.cpp
+// dequant_row_q5_K: value = (qs_nibble + (qh_bit ? 16 : 0)) scaled).
+inline void dequant_q5_k_block(const uint8_t* block, float* out) {
+    float d = fp16_to_f32(static_cast<uint16_t>(block[0] | (block[1] << 8)));
+    float dmin = fp16_to_f32(static_cast<uint16_t>(block[2] | (block[3] << 8)));
+    const uint8_t* scales = block + 4;
+    const uint8_t* qh = block + 16;
+    const uint8_t* ql = block + 48;
+
+    int is = 0, idx = 0;
+    uint8_t u1 = 1, u2 = 2;
+    for (int j = 0; j < 256; j += 64) {
+        uint8_t sc, m;
+        q4k_get_scale_min(is + 0, scales, &sc, &m);
+        float d1 = d * sc, m1 = dmin * m;
+        q4k_get_scale_min(is + 1, scales, &sc, &m);
+        float d2 = d * sc, m2 = dmin * m;
+        for (int l = 0; l < 32; l++)
+            out[idx + l] = d1 * ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+        for (int l = 0; l < 32; l++)
+            out[idx + 32 + l] = d2 * ((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+        ql += 32; idx += 64; is += 2;
+        u1 <<= 2; u2 <<= 2;
     }
 }
 

@@ -1075,10 +1075,10 @@ other sizes need JIT (`triton-xdna`, not installed) or a prebuilt build.
 | Model file | Arch | Quant(s) | Loads? | Furthest point reached | Immediate blocker |
 |---|---|---|---|---|---|
 | `LFM2.5-230M-Q6_K` | `lfm2` | Q6_K ✅ | yes | **WORKS — coherent, validated** *(2026-07-02)* | — (`test_e2e_lfm2` green: France → " Paris") |
-| `LFM2.5-230M-Q8_0` | `lfm2` | Q8_0 ⚠️ | yes | garbage (`<pad>`) | arch works, but **Q8_0 is only half-wired**: no `dequant_tensor_row` case (embedding→zeros) and Q8_0 absent from matmul `kq_path`/scale-attach. Separate quant task. |
-| `LFM2.5-230M-Q5_K_M` | `lfm2` | Q5_K ❌ | yes | first RMSNorm | `rmsnorm_1024` wall; **behind it: no Q5_K decoder** |
-| `LFM2.5-230M-IQ4_NL` | `lfm2` | IQ4_NL ❌ | yes | first RMSNorm | `rmsnorm_1024` wall; **behind it: no IQ4_NL decoder** |
-| `LFM2.5-230M-BF16` | `lfm2` | BF16 ❌ | yes | first RMSNorm | `rmsnorm_1024` wall; **behind it: no BF16 weight path** |
+| `LFM2.5-230M-Q8_0` | `lfm2` | Q8_0 ✅ | yes | **WORKS** *(2026-07-02)* | fixed: Q8_0 `d` was read as int16 not fp16, and decode emitted per-block not per-row scales — rewrote to mirror Q4_0 + wired into all four type-gates (France → " Paris") |
+| `LFM2.5-230M-Q5_K_M` | `lfm2` | Q5_K ✅ | yes | **WORKS** *(2026-07-02)* | added `dequant_q5_k_block` + `decode_q5_k_for_npu` (Q4_K + 5th `qh` bit) and wired the type-gates (France → " Paris") |
+| `LFM2.5-230M-IQ4_NL` | `lfm2` | IQ4_NL ❌ | yes | matmul/embed decode | arch works; **no IQ4_NL decoder** (non-linear codebook 4-bit) |
+| `LFM2.5-230M-BF16` | `lfm2` | BF16 ❌ | yes | matmul/embed decode | arch works; **no BF16 weight path** (needs a bf16→int8 per-row requantize, cf. the F16 case in `decode_for_npu`) |
 | `Qwen3.5-9B-UD-IQ2_XXS` | `qwen35` | IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S/Q2_K/Q3_K/Q4_K/Q5_K/Q8_0 ❌ | yes | first matmul | **i-quant weights undecodable** (IQ2_XXS…) → F32 fallback → no F32 matmul |
 | `ornith-9b-mtp-kl-IQ2_M` | `qwen35` | IQ2_S/IQ3_S/Q4_K/Q5_K/Q8_0 ❌ | yes | first matmul | same i-quant wall; also has an MTP/`nextn` head (blk.32) |
 
@@ -1189,13 +1189,18 @@ layers are ~1:4**, the rest are SSM (Qwen3-Next / gated-delta-net style hybrid).
 
 #### 7.4.3 Cross-cutting gaps this batch exposes
 
-- **RMSNorm size coverage.** N=1024 (and any pow2 ≤ 2048 that isn't 2048) has no
-  kernel and doesn't free-ride 2048. Generalize the pad-up logic (cheap) or ship more
-  prebuilt shapes.
-- **Quant decoders.** Missing: **Q5_K, IQ4_NL, BF16** (LFM2 breadth) and the i-quant
-  family **IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S, Q2_K, Q3_K** (qwen35). Q5_K and Q2_K/Q3_K are
-  standard k-quants (moderate); i-quants are codebook-based (harder); BF16 is a direct
-  no-decode path (would need a bf16→int8 pack or a bf16 matmul route).
+- **RMSNorm size coverage.** ✅ *fixed 2026-07-02* — `rmsnorm_pad_width` rounds up to
+  an available prebuilt width (256/512/2048) instead of `next_pow2`, so N=1024 (and any
+  pow2 ≤ 2048 that isn't 2048) now free-rides 2048.
+- **Quant decoders.** Supported set is now **Q4_0, Q8_0, Q4_K, Q5_K, Q6_K** (Q8_0
+  fixed + Q5_K added 2026-07-02; all decode to per-row int8 + per-row scale and share
+  the matmul `kq_path`). Still missing: **IQ4_NL, BF16** (LFM2 breadth) and the i-quant
+  family **IQ2_XXS/IQ2_S/IQ3_XXS/IQ3_S, Q2_K, Q3_K** (qwen35). Q2_K/Q3_K are standard
+  k-quants (moderate); i-quants are codebook-based (harder); BF16 is a direct
+  no-decode path (needs a bf16→int8 per-row pack, cf. the F16 case in `decode_for_npu`).
+  **Any new quant needs wiring into five sites**: `decode_for_npu` dispatch,
+  `dequant_tensor_row` (embedding), the matmul `kq_path` + int8-base gate
+  (`amd_xdna.cpp`), `attach_kquant_scales`, and `compute_logits`.
 - **No F32 matmul fallback.** The "falling back to F32" warning is misleading — there
   is no F32 NPU matmul, so an unsupported quant is fatal, not slow. Either implement a
   true host-F32 fallback (lets *any* GGUF at least run slowly) or change the message to
