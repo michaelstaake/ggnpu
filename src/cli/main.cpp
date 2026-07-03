@@ -1244,6 +1244,21 @@ int main(int argc, char* argv[]) {
         std::unique_ptr<ScopedTimer> matmul_timer;
         if (matmul_ms) matmul_timer = std::make_unique<ScopedTimer>(*matmul_ms);
 
+        // Diagnostic: high-precision CPU fp32 reference matmul (dequant weight to
+        // f32, exact dot product). Isolates NPU int8 quantization error. M is 1
+        // in the qwen35/decode paths. Enable with GGNPU_FP32_MATMUL=1.
+        static const bool fp32_matmul = std::getenv("GGNPU_FP32_MATMUL") != nullptr;
+        if (fp32_matmul && M == 1) {
+            std::vector<float> wr(static_cast<size_t>(K));
+            for (int n = 0; n < N; n++) {
+                dequant_tensor_row(weight, n, wr.data(), K);
+                float acc = 0.0f;
+                for (int k = 0; k < K; k++) acc += A[k] * wr[static_cast<size_t>(k)];
+                C[static_cast<size_t>(n)] = acc;
+            }
+            return true;
+        }
+
         MulMatParams mat_params;
         mat_params.A = A;
         mat_params.C = C;
@@ -2594,6 +2609,14 @@ int main(int argc, char* argv[]) {
             auto vnorm = [](const std::vector<float>& v, int n) {
                 double s = 0; for (int i = 0; i < n; i++) s += (double)v[i] * v[i]; return std::sqrt(s / n);
             };
+            // Compare against llama.cpp eval-callback row-0 values (first prompt token,
+            // empty conv/recurrent state ⇒ our pos==0 == llama token-0). Prints [0,1,2 ... n-3,n-2,n-1].
+            auto dbg6 = [&](const char* label, const float* v, int n) {
+                if (!q35dbg) return;
+                double s = 0; for (int i = 0; i < n; i++) s += v[i];
+                std::cerr << "  [q35cmp] " << label << " sum=" << s << " = [" << v[0] << ", " << v[1]
+                          << ", " << v[2] << ", ..., " << v[n-3] << ", " << v[n-2] << ", " << v[n-1] << "]\n";
+            };
             if (q35dbg) std::cerr << "[dbg] embed rms=" << vnorm(inp_embd, hidden_size) << "\n";
             for (int L = 0; L < max_layers_override; L++) {
                 const TensorView* attn_norm_w = find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", L);
@@ -2647,6 +2670,15 @@ int main(int argc, char* argv[]) {
                     const float* qc = conv.data();                    // q: nKH heads x sk
                     const float* kc = conv.data() + q35_key_dim;      // k: nKH heads x sk
                     const float* vc = conv.data() + 2 * q35_key_dim;  // v: nVH heads x sk
+                    if (L == 0) {
+                        dbg6("xn", xn.data(), hidden_size);
+                        dbg6("mixed(qkv)", mixed.data(), q35_conv_dim);
+                        dbg6("conv_q", qc, q35_key_dim);
+                        dbg6("conv_v", vc, q35_value_dim);
+                        dbg6("araw", araw.data(), nVH);
+                        dbg6("braw", braw.data(), nVH);
+                        dbg6("zgate", zgate.data(), q35_value_dim);
+                    }
 
                     // L2-normalize q,k per key head (over sk).
                     for (int h = 0; h < nKH; h++) {
@@ -2654,9 +2686,16 @@ int main(int argc, char* argv[]) {
                         const float* kh = kc + h * sk;
                         float sq = 0.0f, s2 = 0.0f;
                         for (int i = 0; i < sk; i++) { sq += qh[i] * qh[i]; s2 += kh[i] * kh[i]; }
-                        const float rq = 1.0f / std::sqrt(sq + 1e-6f), rk = 1.0f / std::sqrt(s2 + 1e-6f);
+                        // q additionally carries the delta-net 1/sqrt(head_k_dim) scale
+                        // (llama.cpp build_delta_net: `q = ggml_scale(q, 1/sqrtf(S_k))`).
+                        // It cancels in the per-head gated RMSNorm, but we apply it to
+                        // match the reference exactly.
+                        const float rq = (1.0f / std::sqrt(sq + 1e-6f)) / std::sqrt((float)sk);
+                        const float rk = 1.0f / std::sqrt(s2 + 1e-6f);
                         for (int i = 0; i < sk; i++) { qn[h * sk + i] = qh[i] * rq; kn[h * sk + i] = kh[i] * rk; }
                     }
+                    if (L == 0) { dbg6("qn(q_predelta)", qn.data(), q35_key_dim);
+                                  dbg6("kn(k_predelta)", kn.data(), q35_key_dim); }
 
                     // Per value-head gated delta rule recurrence. S[v_head] is [sk_k x sk_v].
                     const float* A_log = get_float_ptr(a_w);
@@ -2693,29 +2732,29 @@ int main(int argc, char* argv[]) {
                             float* row = Sh + static_cast<size_t>(kk) * sk;
                             for (int v = 0; v < sk; v++) { row[v] += kval * delta[v]; oh[v] += row[v] * qval; }
                         }
-                        // Gated RMSNorm (Mamba2/Qwen3-Next RMSNormGated): the gate is
-                        // applied BEFORE the norm — o *= silu(z), then rmsnorm over the
-                        // gated value, then * weight. (Was norm-first, which excludes the
-                        // gate from the variance denominator → wrong scale.)
+                        // Gated RMSNorm (qwen35 build_norm_gated): norm FIRST, then gate.
+                        // rmsnorm(o) over sk, * ssm_norm weight, then * silu(z). Verified
+                        // against llama.cpp models/qwen35.cpp build_norm_gated (norm then
+                        // ggml_mul with silu(gate)) — NOT the HF/Mamba2 gate-before-norm.
                         const float* snw = get_float_ptr(snorm_w);
                         const float* zh = zgate.data() + h * sk;
                         float ss = 0.0f;
-                        for (int v = 0; v < sk; v++) {
-                            oh[v] *= zh[v] / (1.0f + std::exp(-zh[v]));  // gate in place
-                            ss += oh[v] * oh[v];
-                        }
+                        for (int v = 0; v < sk; v++) ss += oh[v] * oh[v];
                         const float r = 1.0f / std::sqrt(ss / static_cast<float>(sk) + rms_eps);
                         float* od = o_all.data() + h * sk;
                         for (int v = 0; v < sk; v++)
-                            od[v] = oh[v] * r * snw[v];
+                            od[v] = (oh[v] * r * snw[v]) * (zh[v] / (1.0f + std::exp(-zh[v])));
                     }
 
+                    if (L == 0) dbg6("final_output(o_all)", o_all.data(), q35_value_dim);
                     std::fill(ssm_o.begin(), ssm_o.end(), 0.0f);
                     mul_mat_weight(o_all.data(), out_w, ssm_o.data(), 1, hidden_size, q35_value_dim,
                                    q35_value_dim, hidden_size, hidden_size, mm);
                     backend->sync();
+                    if (L == 0) dbg6("linear_attn_out(ssm_o)", ssm_o.data(), hidden_size);
                     if (!std::getenv("GGNPU_Q35_SKIP_SSM"))
                         for (int i = 0; i < hidden_size; i++) inp_embd[i] += ssm_o[i];
+                    if (L == 0) dbg6("attn_residual(l0)", inp_embd.data(), hidden_size);
                 } else {
                     // ===== Gated full attention =====
                     const TensorView* q_w  = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", L);
@@ -2816,6 +2855,10 @@ int main(int argc, char* argv[]) {
                 backend->sync();
                 for (int i = 0; i < hidden_size; i++) inp_embd[i] += dn[i];
                 if (q35dbg && L < 5) std::cerr << " post_ffn_rms=" << vnorm(inp_embd, hidden_size) << "\n";
+                if (q35dbg && L < 6) {
+                    double s = 0; for (int i = 0; i < hidden_size; i++) s += inp_embd[i];
+                    std::cerr << "  [q35cmp] l_out-" << L << " sum=" << s << "\n";
+                }
             }
             // Final output_norm handled by the shared (non-gemma, non-lfm2) path below.
         }
