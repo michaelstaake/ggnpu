@@ -147,6 +147,19 @@ bool Tokenizer::load_from_gguf(const std::map<std::string, GgufKV>& kv_pairs) {
             // to PreType::Default (whole prompt as one word) → mis-tokenized
             // prompt and dropped spaces in output (same trap as lfm2).
             pre_type_ = PreType::Tekken;
+        } else if (pre == "qwen35") {
+            // Qwen3.5 (qwen35 arch: Qwen3.5-9B, ornith-9b) byte-level BPE. Its own
+            // split regex (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN35): letters include
+            // combining marks \p{M}, single-digit \p{N}, no \p{N}{1,3} run. Falling
+            // to PreType::Default tokenized the whole prompt as one word → every
+            // token past the first was wrong → garbage generation (same trap as
+            // lfm2/tekken). This was THE qwen35 bug, not the SSM math.
+            pre_type_ = PreType::Qwen35;
+        } else if (pre == "qwen2") {
+            // Qwen2/Qwen3 (pre="qwen2"): GPT-2-style byte-level BPE with the Qwen2
+            // split regex (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2). Distinct from
+            // qwen35 (\p{L}+ vs [\p{L}\p{M}]+, different negated symbol class).
+            pre_type_ = PreType::Qwen2;
         } else if (pre == "gpt-2" || pre == "default") {
             pre_type_ = PreType::Gpt2;
         }
@@ -219,6 +232,19 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
         case PreType::Gpt2:
             regex_exprs = {
                 "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+            };
+            break;
+        case PreType::Qwen2:
+            // llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2 regex (verbatim).
+            regex_exprs = {
+                "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+            };
+            break;
+        case PreType::Qwen35:
+            // llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN35 regex (verbatim): letters
+            // include combining marks \p{M}; the symbol run excludes \p{M} too.
+            regex_exprs = {
+                "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
             };
             break;
         case PreType::Tekken:

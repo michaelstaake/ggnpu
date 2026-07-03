@@ -27,7 +27,7 @@ public:
     bool is_unigram() const { return model_type_ == ModelType::Unigram; }
 
 private:
-    enum class PreType { Default, Gpt2, Llama3, Tekken };
+    enum class PreType { Default, Gpt2, Llama3, Tekken, Qwen2, Qwen35 };
     // BPE (Llama/Qwen merge-rank) vs Unigram (SentencePiece score-max, e.g. gemma).
     enum class ModelType { Bpe, Unigram };
 
