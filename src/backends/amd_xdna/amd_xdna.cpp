@@ -457,7 +457,7 @@ public:
         else if (npu_profile_ == 5) profile_str_ = "npu5";
         else profile_str_ = "npu6";
 
-        std::cout << "NPU device opened: profile=" << profile_str_ << "\n";
+        std::cerr << "NPU device opened: profile=" << profile_str_ << "\n";
 
         // Initialize buffer manager
         buf_mgr_ = std::make_shared<BufferMgr>(*device_);
@@ -2092,7 +2092,7 @@ private:
 
             hw_ctx_matmul_ = register_xclbin_from_data(*device_, xclbin_data_);
             matmul_hw_ready_ = true;
-            std::cout << "Loaded xclbin: " << xclbin_path << "\n";
+            std::cerr << "Loaded xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to load xclbin: " << e.what() << "\n";
@@ -2324,7 +2324,7 @@ private:
 
             hw_ctx_rmsnorm_ = register_xclbin_from_data(*device_, xclbin_data_rmsnorm_);
             rmsnorm_xclbin_name_ = fs::path(xclbin_path).filename().string();
-            std::cout << "Loaded rmsnorm xclbin: " << xclbin_path << "\n";
+            std::cerr << "Loaded rmsnorm xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to load rmsnorm xclbin: " << e.what() << "\n";
@@ -2462,7 +2462,7 @@ private:
             }
 
             hw_ctx_softmax_ = register_xclbin_from_data(*device_, xclbin_data_softmax_);
-            std::cout << "Loaded softmax xclbin: " << xclbin_path << "\n";
+            std::cerr << "Loaded softmax xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to load softmax xclbin: " << e.what() << "\n";
@@ -2586,7 +2586,7 @@ private:
             }
 
             hw_ctx_silu_ = register_xclbin_from_data(*device_, xclbin_data_silu_);
-            std::cout << "Loaded silu xclbin: " << xclbin_path << "\n";
+            std::cerr << "Loaded silu xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to load silu xclbin: " << e.what() << "\n";
@@ -2804,7 +2804,7 @@ private:
             if (xclbin_data_rope_.empty()) return false;
 
             hw_ctx_rope_ = register_xclbin_from_data(*device_, xclbin_data_rope_);
-            std::cout << "Loaded rope xclbin: " << xclbin_path << "\n";
+            std::cerr << "Loaded rope xclbin: " << xclbin_path << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "Error: failed to load rope xclbin: " << e.what() << "\n";
