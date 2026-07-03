@@ -766,6 +766,35 @@ inline float* get_float_ptr_mut(std::vector<float>& buf) {
     return buf.data();
 }
 
+// Host RMSNorm over exactly `n` elements (no NPU pad). Used for qwen35's small
+// per-head norms (QK-norm over head_dim, ssm gated-norm over head_v_dim) where
+// the NPU kernel's pow2 padding would mis-scale a non-256 width.
+inline void host_rmsnorm(float* dst, const float* src, int n, const float* w, float eps) {
+    float ss = 0.0f;
+    for (int i = 0; i < n; i++) ss += src[i] * src[i];
+    const float r = 1.0f / std::sqrt(ss / static_cast<float>(n) + eps);
+    for (int i = 0; i < n; i++) dst[i] = src[i] * r * (w ? w[i] : 1.0f);
+}
+
+// Partial NEOX RoPE: rotate only the first `rope_dim` of each `head_dim`-wide
+// head (pairs i, i+rope_dim/2), leaving dims [rope_dim, head_dim) unchanged.
+// Matches ggml_rope_ext(NEOX) with n_dims=rope_dim (Qwen3.5 rotary_factor 0.25).
+inline void rope_neox_partial(float* vec, int n_heads, int head_dim, int rope_dim,
+                              int64_t pos, float base) {
+    const int half = rope_dim / 2;
+    for (int h = 0; h < n_heads; h++) {
+        float* p = vec + static_cast<size_t>(h) * head_dim;
+        for (int i = 0; i < half; i++) {
+            const float theta =
+                static_cast<float>(pos) * std::pow(base, -2.0f * static_cast<float>(i) / static_cast<float>(rope_dim));
+            const float c = std::cos(theta), s = std::sin(theta);
+            const float x0 = p[i], x1 = p[i + half];
+            p[i] = x0 * c - x1 * s;
+            p[i + half] = x0 * s + x1 * c;
+        }
+    }
+}
+
 } // namespace
 
 } // namespace ggnpu
@@ -1971,6 +2000,42 @@ int main(int argc, char* argv[]) {
                   << ", rope_base=" << lfm2_rope_base << "\n";
     }
 
+    // ---- Qwen3.5 (qwen35) forward path ----
+    // Qwen3-Next-style hybrid: a 3:1 interleave of gated-DeltaNet linear-attention
+    // (SSM) blocks and gated full-attention blocks. SSM blocks carry ssm_*, fused
+    // attn_qkv[hidden->2*key_dim+value_dim] and a separate attn_gate; full-attn
+    // blocks (every `full_attention_interval`-th) carry attn_q/k/v/output with the
+    // output gate fused into the tail half of attn_q. Both blocks use attn_norm
+    // (pre-mixer) + post_attention_norm (pre-FFN) + SwiGLU FFN. Attention head_dim
+    // is key_length(256) with partial NEOX RoPE over rope.dimension_count(64).
+    const bool is_qwen35 = (model.gguf().arch() == "qwen35");
+    const int q35_head_dim = static_cast<int>(model.gguf().get_int("qwen35.attention.key_length", 256));
+    const int q35_rope_dim = static_cast<int>(model.gguf().get_int("qwen35.rope.dimension_count", 64));
+    const float q35_rope_base = static_cast<float>(model.gguf().get_float("qwen35.rope.freq_base", 1e7));
+    const int q35_conv_k   = static_cast<int>(model.gguf().get_int("qwen35.ssm.conv_kernel", 4));
+    const int q35_ssm_hd   = static_cast<int>(model.gguf().get_int("qwen35.ssm.state_size", 128));   // head dim (k==v)
+    const int q35_value_dim = static_cast<int>(model.gguf().get_int("qwen35.ssm.inner_size", 4096)); // v_heads*hd
+    const int q35_k_heads  = static_cast<int>(model.gguf().get_int("qwen35.ssm.group_count", 16));   // key/query heads
+    const int q35_v_heads  = (q35_ssm_hd > 0) ? q35_value_dim / q35_ssm_hd : 32;                     // value heads
+    const int q35_key_dim  = q35_k_heads * q35_ssm_hd;                                                // 2048
+    const int q35_conv_dim = 2 * q35_key_dim + q35_value_dim;                                         // 8192
+    std::vector<char> q35_is_ssm(num_layers, 0);
+    std::vector<std::vector<float>> q35_conv_state(num_layers);   // [(conv_k-1)*conv_dim] per SSM layer
+    std::vector<std::vector<float>> q35_rec_state(num_layers);    // [v_heads*hd*hd] per SSM layer
+    std::vector<std::vector<float>> q35_k_store(num_layers), q35_v_store(num_layers);  // full-attn KV
+    if (is_qwen35) {
+        for (int L = 0; L < num_layers; L++) {
+            if (find_tensor_pattern(model, "blk.{layer}.ssm_conv1d.weight", L)) {
+                q35_is_ssm[L] = 1;
+                q35_conv_state[L].assign(static_cast<size_t>(q35_conv_k - 1) * q35_conv_dim, 0.0f);
+                q35_rec_state[L].assign(static_cast<size_t>(q35_v_heads) * q35_ssm_hd * q35_ssm_hd, 0.0f);
+            }
+        }
+        std::cout << "qwen35 forward: " << num_layers << " layers, head_dim=" << q35_head_dim
+                  << ", rope_dim=" << q35_rope_dim << ", v_heads=" << q35_v_heads
+                  << ", k_heads=" << q35_k_heads << ", ssm_hd=" << q35_ssm_hd << "\n";
+    }
+
     // Per-op timing accumulator for the gemma4 path (-v/--verbose), mirroring
     // the Llama path's step_timings. Declared here (stable address) rather
     // than freshly per-iteration so the g_rmsnorm/g_rope/g_gelu lambdas below
@@ -2497,8 +2562,255 @@ int main(int argc, char* argv[]) {
             if (!g_rmsnorm(inp_norm.data(), inp_embd.data(), hidden_size, get_float_ptr(out_norm_w), rms_eps)) return 1;
         }
 
-        // Transformer layers (non-gemma, non-lfm2 path)
-        for (int layer = 0; !is_gemma && !is_lfm2 && layer < max_layers_override; layer++) {
+        // ---- Qwen3.5 (qwen35) forward ----
+        else if (is_qwen35) {
+            const int Hd    = q35_head_dim;          // attention head dim (256)
+            const int nQ    = num_heads;             // 16 query heads
+            const int nKV   = num_kv_heads;          // 4 kv heads
+            const int qdim  = nQ * Hd;               // 4096
+            const int kvdim = nKV * Hd;              // 1024
+            const int sk    = q35_ssm_hd;            // 128 SSM head dim
+            const int nVH   = q35_v_heads;           // 32 value heads
+            const int nKH   = q35_k_heads;           // 16 key heads
+            const int vgroup = (nKH > 0) ? nVH / nKH : 1;  // 2 value heads per key head
+            double* mm = params.verbose ? &step_timings.matmul_ms : nullptr;
+
+            std::vector<float> xn(hidden_size);
+            // SSM scratch
+            std::vector<float> mixed(q35_conv_dim), zgate(q35_value_dim), conv(q35_conv_dim);
+            std::vector<float> araw(nVH), braw(nVH), qn(q35_key_dim), kn(q35_key_dim), o_all(q35_value_dim);
+            std::vector<float> ssm_o(hidden_size);
+            // Full-attn scratch
+            std::vector<float> qg(2 * qdim), kbuf(kvdim), vbuf(kvdim), kexp, vexp, attn_in(qdim), attn_o(hidden_size);
+            // FFN scratch
+            std::vector<float> gate(ffn_size), up(ffn_size), act(ffn_size), dn(hidden_size);
+
+            const bool q35dbg = std::getenv("GGNPU_DBG") && pos == 0;
+            auto vnorm = [](const std::vector<float>& v, int n) {
+                double s = 0; for (int i = 0; i < n; i++) s += (double)v[i] * v[i]; return std::sqrt(s / n);
+            };
+            if (q35dbg) std::cerr << "[dbg] embed rms=" << vnorm(inp_embd, hidden_size) << "\n";
+            for (int L = 0; L < max_layers_override; L++) {
+                const TensorView* attn_norm_w = find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", L);
+                const TensorView* post_norm_w = find_tensor_pattern(model, "blk.{layer}.post_attention_norm.weight", L);
+                if (!g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(attn_norm_w), rms_eps)) return 1;
+                if (q35dbg && L < 5) std::cerr << "[dbg L" << L << (q35_is_ssm[L] ? " SSM" : " ATT")
+                    << "] xn_rms=" << vnorm(xn, hidden_size);
+
+                if (q35_is_ssm[L]) {
+                    // ===== Gated DeltaNet linear attention =====
+                    const TensorView* qkv_w   = find_tensor_pattern(model, "blk.{layer}.attn_qkv.weight", L);
+                    const TensorView* gate_w  = find_tensor_pattern(model, "blk.{layer}.attn_gate.weight", L);
+                    const TensorView* alpha_w = find_tensor_pattern(model, "blk.{layer}.ssm_alpha.weight", L);
+                    const TensorView* beta_w  = find_tensor_pattern(model, "blk.{layer}.ssm_beta.weight", L);
+                    const TensorView* conv_w  = find_tensor_pattern(model, "blk.{layer}.ssm_conv1d.weight", L);
+                    const TensorView* a_w     = find_tensor_pattern(model, "blk.{layer}.ssm_a", L);
+                    const TensorView* dt_w    = find_tensor_pattern(model, "blk.{layer}.ssm_dt.bias", L);
+                    const TensorView* snorm_w = find_tensor_pattern(model, "blk.{layer}.ssm_norm.weight", L);
+                    const TensorView* out_w   = find_tensor_pattern(model, "blk.{layer}.ssm_out.weight", L);
+
+                    std::fill(mixed.begin(), mixed.end(), 0.0f);
+                    std::fill(zgate.begin(), zgate.end(), 0.0f);
+                    std::fill(araw.begin(), araw.end(), 0.0f);
+                    std::fill(braw.begin(), braw.end(), 0.0f);
+                    mul_mat_weight(xn.data(), qkv_w, mixed.data(), 1, q35_conv_dim, hidden_size,
+                                   hidden_size, q35_conv_dim, q35_conv_dim, mm);
+                    mul_mat_weight(xn.data(), gate_w, zgate.data(), 1, q35_value_dim, hidden_size,
+                                   hidden_size, q35_value_dim, q35_value_dim, mm);
+                    mul_mat_weight(xn.data(), alpha_w, araw.data(), 1, nVH, hidden_size,
+                                   hidden_size, nVH, nVH, mm);
+                    mul_mat_weight(xn.data(), beta_w, braw.data(), 1, nVH, hidden_size,
+                                   hidden_size, nVH, nVH, mm);
+                    backend->sync();
+
+                    // Causal depthwise conv1d over conv_dim channels (kernel conv_k) + SiLU.
+                    // conv weight is tap-contiguous {conv_k, conv_dim}: cw[ch*conv_k + tap];
+                    // newest tap = current token. State holds the previous conv_k-1 inputs.
+                    const float* cw = get_float_ptr(conv_w);
+                    std::vector<float>& cst = q35_conv_state[L];
+                    const int ckm1 = q35_conv_k - 1;
+                    for (int ch = 0; ch < q35_conv_dim; ch++) {
+                        float acc = cw[ch * q35_conv_k + ckm1] * mixed[ch];
+                        for (int t = 0; t < ckm1; t++)
+                            acc += cw[ch * q35_conv_k + t] * cst[static_cast<size_t>(t) * q35_conv_dim + ch];
+                        conv[ch] = acc / (1.0f + std::exp(-acc));  // SiLU
+                        for (int t = 0; t < ckm1 - 1; t++)
+                            cst[static_cast<size_t>(t) * q35_conv_dim + ch] =
+                                cst[static_cast<size_t>(t + 1) * q35_conv_dim + ch];
+                        if (ckm1 > 0) cst[static_cast<size_t>(ckm1 - 1) * q35_conv_dim + ch] = mixed[ch];
+                    }
+                    const float* qc = conv.data();                    // q: nKH heads x sk
+                    const float* kc = conv.data() + q35_key_dim;      // k: nKH heads x sk
+                    const float* vc = conv.data() + 2 * q35_key_dim;  // v: nVH heads x sk
+
+                    // L2-normalize q,k per key head (over sk).
+                    for (int h = 0; h < nKH; h++) {
+                        const float* qh = qc + h * sk;
+                        const float* kh = kc + h * sk;
+                        float sq = 0.0f, s2 = 0.0f;
+                        for (int i = 0; i < sk; i++) { sq += qh[i] * qh[i]; s2 += kh[i] * kh[i]; }
+                        const float rq = 1.0f / std::sqrt(sq + 1e-6f), rk = 1.0f / std::sqrt(s2 + 1e-6f);
+                        for (int i = 0; i < sk; i++) { qn[h * sk + i] = qh[i] * rq; kn[h * sk + i] = kh[i] * rk; }
+                    }
+
+                    // Per value-head gated delta rule recurrence. S[v_head] is [sk_k x sk_v].
+                    const float* A_log = get_float_ptr(a_w);
+                    const float* dt_b  = get_float_ptr(dt_w);
+                    std::vector<float>& S = q35_rec_state[L];
+                    for (int h = 0; h < nVH; h++) {
+                        const int kh = h / vgroup;
+                        const float* qh = qn.data() + kh * sk;
+                        const float* khp = kn.data() + kh * sk;
+                        const float* vh = vc + h * sk;
+                        const float beta = 1.0f / (1.0f + std::exp(-braw[h]));           // sigmoid
+                        const float a = araw[h] + dt_b[h];
+                        const float sp = (a > 20.0f) ? a : std::log1p(std::exp(a));      // softplus
+                        // ssm_a is stored pre-transformed as -exp(A_log) (llama.cpp applies
+                        // no exp/neg): log-decay = softplus(alpha+dt)*ssm_a, decay = exp(that).
+                        const float g = std::exp(A_log[h] * sp);                         // decay in (0,1]
+                        if (std::getenv("GGNPU_DBG") && L == 0 && h < 3 && pos == 0)
+                            std::cerr << "[dbg L0 h" << h << "] ssm_a=" << A_log[h]
+                                      << " araw=" << araw[h] << " dt=" << dt_b[h]
+                                      << " sp=" << sp << " g=" << g << " beta=" << beta << "\n";
+                        float* Sh = S.data() + static_cast<size_t>(h) * sk * sk;
+
+                        // decay S and compute prediction pred[v] = sum_k S[k,v]*k[k].
+                        std::vector<float> pred(sk, 0.0f), delta(sk), oh(sk, 0.0f);
+                        for (int kk = 0; kk < sk; kk++) {
+                            const float kval = khp[kk];
+                            float* row = Sh + static_cast<size_t>(kk) * sk;
+                            for (int v = 0; v < sk; v++) { row[v] *= g; pred[v] += row[v] * kval; }
+                        }
+                        for (int v = 0; v < sk; v++) delta[v] = beta * (vh[v] - pred[v]);
+                        // write correction (outer product k x delta) and read o[v]=sum_k S[k,v]*q[k].
+                        for (int kk = 0; kk < sk; kk++) {
+                            const float kval = khp[kk], qval = qh[kk];
+                            float* row = Sh + static_cast<size_t>(kk) * sk;
+                            for (int v = 0; v < sk; v++) { row[v] += kval * delta[v]; oh[v] += row[v] * qval; }
+                        }
+                        // Gated RMSNorm (norm first, then x silu(z)) over sk, per head.
+                        const float* snw = get_float_ptr(snorm_w);
+                        const float* zh = zgate.data() + h * sk;
+                        float ss = 0.0f;
+                        for (int v = 0; v < sk; v++) ss += oh[v] * oh[v];
+                        const float r = 1.0f / std::sqrt(ss / static_cast<float>(sk) + rms_eps);
+                        float* od = o_all.data() + h * sk;
+                        for (int v = 0; v < sk; v++)
+                            od[v] = (oh[v] * r * snw[v]) * (zh[v] / (1.0f + std::exp(-zh[v])));
+                    }
+
+                    std::fill(ssm_o.begin(), ssm_o.end(), 0.0f);
+                    mul_mat_weight(o_all.data(), out_w, ssm_o.data(), 1, hidden_size, q35_value_dim,
+                                   q35_value_dim, hidden_size, hidden_size, mm);
+                    backend->sync();
+                    if (!std::getenv("GGNPU_Q35_SKIP_SSM"))
+                        for (int i = 0; i < hidden_size; i++) inp_embd[i] += ssm_o[i];
+                } else {
+                    // ===== Gated full attention =====
+                    const TensorView* q_w  = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", L);
+                    const TensorView* k_w  = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", L);
+                    const TensorView* v_w  = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", L);
+                    const TensorView* o_w  = find_tensor_pattern(model, "blk.{layer}.attn_output.weight", L);
+                    const TensorView* qn_w = find_tensor_pattern(model, "blk.{layer}.attn_q_norm.weight", L);
+                    const TensorView* kn_w = find_tensor_pattern(model, "blk.{layer}.attn_k_norm.weight", L);
+
+                    std::fill(qg.begin(), qg.end(), 0.0f);
+                    std::fill(kbuf.begin(), kbuf.end(), 0.0f);
+                    std::fill(vbuf.begin(), vbuf.end(), 0.0f);
+                    mul_mat_weight(xn.data(), q_w, qg.data(), 1, 2 * qdim, hidden_size,
+                                   hidden_size, 2 * qdim, 2 * qdim, mm);
+                    mul_mat_weight(xn.data(), k_w, kbuf.data(), 1, kvdim, hidden_size,
+                                   hidden_size, kvdim, kvdim, mm);
+                    mul_mat_weight(xn.data(), v_w, vbuf.data(), 1, kvdim, hidden_size,
+                                   hidden_size, kvdim, kvdim, mm);
+                    backend->sync();
+                    // attn_q output is per-head interleaved [query(Hd)|gate(Hd)] x nQ heads
+                    // (ggml reshapes to [Hd*2, n_head]); gather into contiguous query / gate.
+                    std::vector<float> q(qdim), fgate(qdim);
+                    for (int h = 0; h < nQ; h++) {
+                        std::memcpy(q.data() + h * Hd, qg.data() + static_cast<size_t>(h) * 2 * Hd, Hd * sizeof(float));
+                        std::memcpy(fgate.data() + h * Hd, qg.data() + static_cast<size_t>(h) * 2 * Hd + Hd, Hd * sizeof(float));
+                    }
+
+                    // Per-head QK-norm (host, exact Hd) then partial NEOX RoPE.
+                    for (int h = 0; h < nQ; h++)
+                        host_rmsnorm(q.data() + h * Hd, q.data() + h * Hd, Hd, get_float_ptr(qn_w), rms_eps);
+                    for (int h = 0; h < nKV; h++)
+                        host_rmsnorm(kbuf.data() + h * Hd, kbuf.data() + h * Hd, Hd, get_float_ptr(kn_w), rms_eps);
+                    rope_neox_partial(q.data(), nQ, Hd, q35_rope_dim, pos, q35_rope_base);
+                    rope_neox_partial(kbuf.data(), nKV, Hd, q35_rope_dim, pos, q35_rope_base);
+
+                    q35_k_store[L].insert(q35_k_store[L].end(), kbuf.begin(), kbuf.end());
+                    q35_v_store[L].insert(q35_v_store[L].end(), vbuf.begin(), vbuf.end());
+                    const int64_t ctx_len = pos + 1;
+                    const int group = nQ / nKV;
+                    kexp.assign(static_cast<size_t>(nQ) * ctx_len * Hd, 0.0f);
+                    vexp.assign(static_cast<size_t>(nQ) * ctx_len * Hd, 0.0f);
+                    for (int h = 0; h < nQ; h++) {
+                        const int kh = h / group;
+                        for (int64_t j = 0; j < ctx_len; j++) {
+                            std::memcpy(kexp.data() + (static_cast<size_t>(h) * ctx_len + j) * Hd,
+                                        q35_k_store[L].data() + (static_cast<size_t>(j) * nKV + kh) * Hd,
+                                        Hd * sizeof(float));
+                            std::memcpy(vexp.data() + (static_cast<size_t>(h) * ctx_len + j) * Hd,
+                                        q35_v_store[L].data() + (static_cast<size_t>(j) * nKV + kh) * Hd,
+                                        Hd * sizeof(float));
+                        }
+                    }
+                    std::fill(attn_in.begin(), attn_in.end(), 0.0f);
+                    AttnParams fa;
+                    fa.Q = q.data(); fa.K = kexp.data(); fa.V = vexp.data(); fa.output = attn_in.data();
+                    fa.batch_size = 1; fa.n_head = nQ; fa.head_dim = Hd; fa.ctx_len = ctx_len;
+                    fa.query_pos = pos; fa.freq_factors = nullptr;
+                    if (backend->flash_attn(fa) != Status::OK) {
+                        std::cerr << "Error: qwen35 flash_attn failed at layer " << L << "\n";
+                        model.unload();
+                        return 1;
+                    }
+                    // Output gate: attn_out *= sigmoid(gate).
+                    for (int i = 0; i < qdim; i++) attn_in[i] *= 1.0f / (1.0f + std::exp(-fgate[i]));
+                    std::fill(attn_o.begin(), attn_o.end(), 0.0f);
+                    mul_mat_weight(attn_in.data(), o_w, attn_o.data(), 1, hidden_size, qdim,
+                                   qdim, hidden_size, hidden_size, mm);
+                    backend->sync();
+                    if (!std::getenv("GGNPU_Q35_SKIP_ATT"))
+                        for (int i = 0; i < hidden_size; i++) inp_embd[i] += attn_o[i];
+                }
+
+                if (q35dbg && L < 5) std::cerr << " post_mix_rms=" << vnorm(inp_embd, hidden_size);
+                // ===== SwiGLU FFN (post_attention_norm as the FFN norm) =====
+                if (!g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(post_norm_w), rms_eps)) return 1;
+                const TensorView* gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", L);
+                const TensorView* up_w   = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", L);
+                const TensorView* down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", L);
+                std::fill(gate.begin(), gate.end(), 0.0f);
+                std::fill(up.begin(), up.end(), 0.0f);
+                mul_mat_weight(xn.data(), gate_w, gate.data(), 1, ffn_size, hidden_size,
+                               hidden_size, ffn_size, ffn_size, mm);
+                mul_mat_weight(xn.data(), up_w, up.data(), 1, ffn_size, hidden_size,
+                               hidden_size, ffn_size, ffn_size, mm);
+                backend->sync();
+                {
+                    SiluParams sp; sp.input = gate.data(); sp.output = act.data(); sp.size = ffn_size;
+                    if (backend->silu(sp) != Status::OK) {
+                        std::cerr << "Error: qwen35 silu failed at layer " << L << "\n";
+                        model.unload();
+                        return 1;
+                    }
+                }
+                for (int i = 0; i < ffn_size; i++) act[i] *= up[i];
+                std::fill(dn.begin(), dn.end(), 0.0f);
+                mul_mat_weight(act.data(), down_w, dn.data(), 1, hidden_size, ffn_size,
+                               ffn_size, hidden_size, hidden_size, mm);
+                backend->sync();
+                for (int i = 0; i < hidden_size; i++) inp_embd[i] += dn[i];
+                if (q35dbg && L < 5) std::cerr << " post_ffn_rms=" << vnorm(inp_embd, hidden_size) << "\n";
+            }
+            // Final output_norm handled by the shared (non-gemma, non-lfm2) path below.
+        }
+
+        // Transformer layers (non-gemma, non-lfm2, non-qwen35 path)
+        for (int layer = 0; !is_gemma && !is_lfm2 && !is_qwen35 && layer < max_layers_override; layer++) {
             const TensorView* attn_norm_w =
                 find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", layer);
             const TensorView* ffn_norm_w =
