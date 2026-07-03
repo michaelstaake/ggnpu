@@ -2693,15 +2693,21 @@ int main(int argc, char* argv[]) {
                             float* row = Sh + static_cast<size_t>(kk) * sk;
                             for (int v = 0; v < sk; v++) { row[v] += kval * delta[v]; oh[v] += row[v] * qval; }
                         }
-                        // Gated RMSNorm (norm first, then x silu(z)) over sk, per head.
+                        // Gated RMSNorm (Mamba2/Qwen3-Next RMSNormGated): the gate is
+                        // applied BEFORE the norm — o *= silu(z), then rmsnorm over the
+                        // gated value, then * weight. (Was norm-first, which excludes the
+                        // gate from the variance denominator → wrong scale.)
                         const float* snw = get_float_ptr(snorm_w);
                         const float* zh = zgate.data() + h * sk;
                         float ss = 0.0f;
-                        for (int v = 0; v < sk; v++) ss += oh[v] * oh[v];
+                        for (int v = 0; v < sk; v++) {
+                            oh[v] *= zh[v] / (1.0f + std::exp(-zh[v]));  // gate in place
+                            ss += oh[v] * oh[v];
+                        }
                         const float r = 1.0f / std::sqrt(ss / static_cast<float>(sk) + rms_eps);
                         float* od = o_all.data() + h * sk;
                         for (int v = 0; v < sk; v++)
-                            od[v] = (oh[v] * r * snw[v]) * (zh[v] / (1.0f + std::exp(-zh[v])));
+                            od[v] = oh[v] * r * snw[v];
                     }
 
                     std::fill(ssm_o.begin(), ssm_o.end(), 0.0f);
