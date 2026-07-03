@@ -138,6 +138,15 @@ bool Tokenizer::load_from_gguf(const std::map<std::string, GgufKV>& kv_pairs) {
         if (pre == "llama-bpe" || pre == "llama3" || pre == "llama-v3" ||
             pre == "lfm2") {
             pre_type_ = PreType::Llama3;
+        } else if (pre == "tekken") {
+            // Mistral "tekken" byte-level BPE (Ministral / Mistral 3). Uses a
+            // case-aware, single-digit split regex distinct from llama3 (no
+            // contraction rule, \p{N} not \p{N}{1,3}). llama.cpp has no custom
+            // fast splitter for it either — it runs through the generic
+            // std::regex path in unicode_regex_split. Leaving it unmapped fell
+            // to PreType::Default (whole prompt as one word) → mis-tokenized
+            // prompt and dropped spaces in output (same trap as lfm2).
+            pre_type_ = PreType::Tekken;
         } else if (pre == "gpt-2" || pre == "default") {
             pre_type_ = PreType::Gpt2;
         }
@@ -210,6 +219,15 @@ std::vector<std::string> Tokenizer::pretokenize(const std::string& text) const {
         case PreType::Gpt2:
             regex_exprs = {
                 "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)",
+            };
+            break;
+        case PreType::Tekken:
+            // Verbatim tekken regex from tokenizer.json (as in llama.cpp's
+            // LLAMA_VOCAB_PRE_TYPE_TEKKEN): case-run split, single-digit \p{N},
+            // and `/` allowed after a symbol run. No custom splitter — resolved
+            // by the generic engine in unicode_regex_split.
+            regex_exprs = {
+                "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
             };
             break;
         default:
