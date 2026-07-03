@@ -33,6 +33,7 @@ ggnpu --version
 | `--npu-device` | | `0` | NPU device index |
 | `--no-cache` | | off | Disable compile/cache |
 | `--cache-dir` | | `~/.cache/ggnpu` | Cache directory path |
+| `--quiet` | | off | Status to stderr; generated text only on stdout |
 | `--verbose` | `-v` | off | Per-operation timings |
 | `--help` | `-h` | | Print help |
 | `--version` | | | Print version |

@@ -414,6 +414,7 @@ struct CliParams {
     int bench_layer_num = 0;
     bool bench_logits = false;
     bool show_version = false;
+    bool quiet = false;
 };
 
 void print_help() {
@@ -442,6 +443,7 @@ void print_help() {
     std::cout << "      --no-cache                     Disable caches\n";
     std::cout << "      --cache-dir <path>             Cache directory (default: ~/.cache/ggnpu)\n";
     std::cout << "  -v, --verbose                      Per-op timings\n";
+    std::cout << "      --quiet                        Status to stderr; generated text only on stdout\n";
     std::cout << "      --layer <n>                    Layer number for bench-layer (default: 0)\n";
     std::cout << "  -h, --help                         Print help\n";
     std::cout << "      --version                      Print version\n\n";
@@ -492,6 +494,8 @@ CliParams parse_args(int argc, char* argv[]) {
             if (i + 1 < argc) params.cache_dir = argv[++i];
         } else if (arg == "-v" || arg == "--verbose") {
             params.verbose = true;
+        } else if (arg == "--quiet") {
+            params.quiet = true;
         } else if (arg == "--layer") {
             if (i + 1 < argc) params.bench_layer_num = std::atoi(argv[++i]);
         } else {
@@ -995,7 +999,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "GGNPU - GGUF NPU Inference Engine v" << VERSION << "\n\n";
+    std::ostream& info = params.quiet ? std::cerr : std::cout;
+    info << "GGNPU - GGUF NPU Inference Engine v" << VERSION << "\n\n";
 
     std::shared_ptr<Backend> backend;
 #ifdef GGNPU_HAS_NPU_BACKEND
@@ -1011,7 +1016,7 @@ int main(int argc, char* argv[]) {
     return 1;
 #endif
 
-    std::cout << "Backend: " << backend->name() << "\n";
+    info << "Backend: " << backend->name() << "\n";
 
     std::string cache_dir = params.cache_dir;
     if (cache_dir.empty()) {
@@ -1019,7 +1024,7 @@ int main(int argc, char* argv[]) {
         cache_dir = home ? std::string(home) + "/.cache/ggnpu" : "~/.cache/ggnpu";
     }
 
-    std::cout << "Loading model: " << params.model_path << "\n";
+    info << "Loading model: " << params.model_path << "\n";
     Model model;
     if (!model.load(params.model_path)) {
         std::cerr << "Error: failed to load model\n";
@@ -1032,26 +1037,26 @@ int main(int argc, char* argv[]) {
     // Cap context to avoid multi-GB KV allocation on models with huge metadata ctx
     if (params.ctx_size > 0) {
         model.set_context_length(static_cast<uint64_t>(params.ctx_size));
-        std::cout << "  Context size overridden to: " << params.ctx_size << "\n";
+        info << "  Context size overridden to: " << params.ctx_size << "\n";
         // Reinitialize KV cache to respect overridden context size
         if (!model.reinit_kv_cache(params.ctx_size)) {
             std::cerr << "  Warning: failed to reinitialize KV cache with overridden context size\n";
         }
     } else if (hparams.context_length > 2048) {
         model.set_context_length(2048);
-        std::cout << "  Context capped to 2048 (model reports "
+        info << "  Context capped to 2048 (model reports "
                   << hparams.context_length << "; use -c to override)\n";
     }
-    std::cout << "  Architecture: " << model.gguf().architecture() << "\n";
-    std::cout << "  Context: " << hparams.context_length << "\n";
-    std::cout << "  Layers: " << hparams.block_count << "\n";
-    std::cout << "  Hidden: " << hparams.embedding_length << "\n";
-    std::cout << "  Heads: " << hparams.attention_head_count << " (KV: " << hparams.attention_head_count_kv << ")\n";
-    std::cout << "  FFN: " << hparams.feed_forward_length << "\n\n";
+    info << "  Architecture: " << model.gguf().architecture() << "\n";
+    info << "  Context: " << hparams.context_length << "\n";
+    info << "  Layers: " << hparams.block_count << "\n";
+    info << "  Hidden: " << hparams.embedding_length << "\n";
+    info << "  Heads: " << hparams.attention_head_count << " (KV: " << hparams.attention_head_count_kv << ")\n";
+    info << "  FFN: " << hparams.feed_forward_length << "\n\n";
 
     // bench-layer generates its own test input — skip the prompt requirement
     if (params.prompt.empty() && !params.bench_layer && !params.bench_logits) {
-        std::cout << "No prompt provided. Use --prompt or -p to specify input.\n";
+        info << "No prompt provided. Use --prompt or -p to specify input.\n";
         model.unload();
         return 0;
     }
@@ -1059,17 +1064,17 @@ int main(int argc, char* argv[]) {
     // Load tokenizer
     Tokenizer tokenizer;
     tokenizer.load_from_gguf(model.gguf().kv_pairs());
-    std::cout << "Tokenizer: " << tokenizer.vocab_size() << " tokens\n";
+    info << "Tokenizer: " << tokenizer.vocab_size() << " tokens\n";
 
     // Tokenize prompt
     std::vector<int> input_tokens = tokenizer.encode(params.prompt, true, false);
-    std::cout << "Input tokens: " << input_tokens.size() << "\n";
+    info << "Input tokens: " << input_tokens.size() << "\n";
     if (std::getenv("GGNPU_DEBUG_TOKENS")) {
-        std::cout << "  ids:";
-        for (int id : input_tokens) std::cout << " " << id;
-        std::cout << "\n";
+        info << "  ids:";
+        for (int id : input_tokens) info << " " << id;
+        info << "\n";
     }
-    std::cout << "Prompt: " << params.prompt << "\n\n";
+    info << "Prompt: " << params.prompt << "\n\n";
 
     // Weight cache: decode GGUF quantized weights to INT8 for NPU.
     // Fingerprint the cache by model path + file size so two models that share
@@ -1083,7 +1088,7 @@ int main(int argc, char* argv[]) {
         if (!ec) model_id += ":" + std::to_string(sz);
     }
     WeightCache weight_cache(compile_cache, model_id);
-    std::cout << "Weight cache initialized\n";
+    info << "Weight cache initialized\n";
 
     // Setup working buffers
     int hidden_size = static_cast<int>(hparams.embedding_length);
@@ -1271,8 +1276,8 @@ int main(int argc, char* argv[]) {
     // bench-layer: Validate one decoder layer on NPU vs CPU reference
     //====//
     if (params.bench_layer) {
-        std::cout << "GGNPU Layer Benchmark\n";
-        std::cout << "=====================\n\n";
+        info << "GGNPU Layer Benchmark\n";
+        info << "=====================\n\n";
 
         std::shared_ptr<Backend> npu_backend;
 #ifdef GGNPU_HAS_NPU_BACKEND
@@ -1295,10 +1300,10 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        std::cout << "Model: " << params.model_path << "\n";
-        std::cout << "Layer: " << layer_idx << "\n";
-        std::cout << "Hidden: " << hidden_size << "\n";
-        std::cout << "FFN size: " << ffn_size << "\n\n";
+        info << "Model: " << params.model_path << "\n";
+        info << "Layer: " << layer_idx << "\n";
+        info << "Hidden: " << hidden_size << "\n";
+        info << "FFN size: " << ffn_size << "\n\n";
 
         // Single test token activations (random but deterministic)
         std::mt19937 rng(42);
@@ -1322,7 +1327,7 @@ int main(int argc, char* argv[]) {
         Status st;
 
         // Test 0a: RMSNorm — NPU vs CPU (Phase 4)
-        std::cout << "Testing RMSNorm (Phase 4)...\n";
+        info << "Testing RMSNorm (Phase 4)...\n";
         {
             std::vector<float> npu_normed(static_cast<size_t>(hidden_size));
             RmsNormParams npu_rms;
@@ -1338,7 +1343,7 @@ int main(int argc, char* argv[]) {
             }
             auto cmp = compare_vectors(normed.data(), npu_normed.data(), hidden_size, 0.01f);
             if (hidden_size != 2048) {
-                std::cout << "    Note: Llama hidden=2048 uses rmsnorm_2048_npu6.xclbin; hidden="
+                info << "    Note: Llama hidden=2048 uses rmsnorm_2048_npu6.xclbin; hidden="
                           << hidden_size << " needs a matching shaped kernel\n";
             }
             if (!report_compare("RMSNorm", cmp, hidden_size, 0.01f, 0.05f, 0.01f)) return 1;
@@ -1347,7 +1352,7 @@ int main(int argc, char* argv[]) {
         // Test 0a2: RMSNorm at non-pow2 / large hidden sizes (pad-to-pow2 path).
         // 1536 (Qwen/Gemma) pads to the existing 2048 kernel; 3072 (future 3B)
         // needs a 4096 kernel. Synthetic data, independent of the loaded model.
-        std::cout << "Testing RMSNorm extra sizes (Phase 6)...\n";
+        info << "Testing RMSNorm extra sizes (Phase 6)...\n";
         for (int test_n : {1536, 3072}) {
             std::vector<float> in(static_cast<size_t>(test_n));
             for (int i = 0; i < test_n; i++)
@@ -1360,7 +1365,7 @@ int main(int argc, char* argv[]) {
             Status rst = npu_backend->rms_norm(np);
             npu_backend->sync();
             if (rst != Status::OK) {
-                std::cout << "  RMSNorm N=" << test_n
+                info << "  RMSNorm N=" << test_n
                           << ": SKIPPED (status=" << status_name(rst) << ")\n";
                 continue;
             }
@@ -1383,7 +1388,7 @@ int main(int argc, char* argv[]) {
 
         // Test 0b–0e: attention matmuls — NPU vs CPU (Phase 4)
         const int kv_dim = num_kv_heads * head_dim;
-        std::cout << "Testing attention matmuls (Phase 4)...\n";
+        info << "Testing attention matmuls (Phase 4)...\n";
         {
             const TensorView* attn_q_w = find_tensor_pattern(model, "blk.{layer}.attn_q.weight", layer_idx);
             const TensorView* attn_k_w = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", layer_idx);
@@ -1409,7 +1414,7 @@ int main(int argc, char* argv[]) {
 
         // Test 0e2: bf16 matmul — NPU vs CPU f32 (decomposed-attention building block).
         // Includes a QK-shaped case (M=ctx, N=1, K=head_dim) to exercise edge padding.
-        std::cout << "Testing bf16 matmul (Phase 6)...\n";
+        info << "Testing bf16 matmul (Phase 6)...\n";
         {
             struct Shape { int M, N, K; const char* label; };
             std::vector<Shape> shapes = {
@@ -1434,7 +1439,7 @@ int main(int argc, char* argv[]) {
                 Status mst = npu_backend->matmul_bf16(A.data(), B.data(), C_npu.data(), s.M, s.N, s.K);
                 npu_backend->sync();
                 if (mst != Status::OK) {
-                    std::cout << "  bf16 matmul " << s.label << ": SKIPPED (status="
+                    info << "  bf16 matmul " << s.label << ": SKIPPED (status="
                               << status_name(mst) << ")\n";
                     continue;
                 }
@@ -1458,7 +1463,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Test 0f: flash attention — NPU vs CPU (Phase 4, single head, ctx=1)
-        std::cout << "Testing flash attention (Phase 4)...\n";
+        info << "Testing flash attention (Phase 4)...\n";
         {
             std::vector<float> Q(static_cast<size_t>(head_dim), 0.1f);
             std::vector<float> K(static_cast<size_t>(head_dim), 0.2f);
@@ -1487,7 +1492,7 @@ int main(int argc, char* argv[]) {
         // Test 0f2: flash attention — multi-head, ctx>1, causal (exercises full
         // QK -> softmax -> AV). NPU vs host f32; only meaningful when the NPU
         // decomposed path is on (GGNPU_NPU_ATTN), else both run the same host code.
-        std::cout << "Testing flash attention (multi-head, ctx>1)...\n";
+        info << "Testing flash attention (multi-head, ctx>1)...\n";
         {
             const int nh = 4, cl = 40;
             const int64_t qpos = cl - 1;
@@ -1523,7 +1528,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Test 0g: RoPE — NPU kernel (Phase 6, pending pre-deinterleaved kernel design).
-        std::cout << "Testing RoPE (Phase 6)...\n";
+        info << "Testing RoPE (Phase 6)...\n";
         {
             std::vector<float> rope_in(static_cast<size_t>(head_dim), 0.5f);
             for (int i = 0; i < head_dim; i++) rope_in[i] = static_cast<float>(i) * 0.01f;
@@ -1540,7 +1545,7 @@ int main(int argc, char* argv[]) {
             st = npu_backend->rope(rp);
             npu_backend->sync();
             if (st != Status::OK) {
-                std::cout << "  RoPE: SKIPPED (no rope xclbin — Phase 6 pending)\n\n";
+                info << "  RoPE: SKIPPED (no rope xclbin — Phase 6 pending)\n\n";
             } else {
                 // CPU reference for validation when xclbin exists
                 std::vector<float> cpu_rope(static_cast<size_t>(head_dim));
@@ -1595,7 +1600,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Test 0c: SiLU — NPU vs CPU (Phase 4)
-        std::cout << "Testing SiLU (Phase 4)...\n";
+        info << "Testing SiLU (Phase 4)...\n";
         {
             std::vector<float> silu_in(static_cast<size_t>(ffn_size));
             for (int i = 0; i < ffn_size; i++) silu_in[i] = test_input[i % hidden_size];
@@ -1623,7 +1628,7 @@ int main(int argc, char* argv[]) {
             if (!report_compare("SiLU", cmp, ffn_size, 0.05f, 0.1f, 0.05f)) return 1;
         }
 
-        std::cout << "Testing FFN gate matmul (Phase 3 E2E gate)...\n";
+        info << "Testing FFN gate matmul (Phase 3 E2E gate)...\n";
         {
             const TensorView* ffn_gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", layer_idx);
             if (!bench_quant_matmul("FFN gate matmul", *cpu_backend, *npu_backend, weight_cache,
@@ -1747,22 +1752,22 @@ int main(int argc, char* argv[]) {
             }
 
             float rel_error = max_cpu > 0.0f ? max_diff / max_cpu : max_diff;
-            std::cout << "  FFN down matmul (SwiGLU, 1 x " << ffn_size << " x " << hidden_size << "):\n";
-            std::cout << "    Type: " << ggml_type_name(ffn_down_w->type) << "\n";
-            std::cout << "    Max absolute diff: " << max_diff << "\n";
-            std::cout << "    Relative error: " << rel_error << "\n";
-            std::cout << "    Mismatches (>2.0): " << mismatches << " / " << hidden_size << "\n";
+            info << "  FFN down matmul (SwiGLU, 1 x " << ffn_size << " x " << hidden_size << "):\n";
+            info << "    Type: " << ggml_type_name(ffn_down_w->type) << "\n";
+            info << "    Max absolute diff: " << max_diff << "\n";
+            info << "    Relative error: " << rel_error << "\n";
+            info << "    Mismatches (>2.0): " << mismatches << " / " << hidden_size << "\n";
 
             if (rel_error < 0.1f && mismatches < hidden_size / 10) {
-                std::cout << "    Result: PASS\n\n";
+                info << "    Result: PASS\n\n";
             } else {
-                std::cout << "    Result: FAIL\n\n";
+                info << "    Result: FAIL\n\n";
                 return 1;
             }
         }
 
         // Test 4: full decoder layer forward — CPU vs NPU (Phase 4)
-        std::cout << "Testing full layer forward (Phase 4)...\n";
+        info << "Testing full layer forward (Phase 4)...\n";
         {
             auto run_layer = [&](Backend* backend, bool use_npu_weights,
                                  const float* in, float* out) -> bool {
@@ -1891,7 +1896,7 @@ int main(int argc, char* argv[]) {
             if (!report_compare("full layer forward", cmp, hidden_size, 0.75f, 1.0f, 2.0f)) return 1;
         }
 
-        std::cout << "All layer tests PASSED.\n";
+        info << "All layer tests PASSED.\n";
         model.unload();
         return 0;
     }
@@ -1949,7 +1954,7 @@ int main(int argc, char* argv[]) {
         gk_store.resize(num_layers);
         gv_store.resize(num_layers);
         gemma_embd_scale = std::sqrt(static_cast<float>(hidden_size));
-        std::cout << "gemma4 forward: " << num_layers << " layers, "
+        info << "gemma4 forward: " << num_layers << " layers, "
                   << "num_heads=" << num_heads << ", softcap=" << gemma_logit_softcap << "\n";
     }
     // Per-Layer Embeddings (PLE) — Phase G3. Two paths per token combine into a
@@ -1996,7 +2001,7 @@ int main(int argc, char* argv[]) {
                 lfm2_kv_heads[L] = (kw && head_dim > 0) ? static_cast<int>(kw->dims[1] / head_dim) : num_heads;
             }
         }
-        std::cout << "lfm2 forward: " << num_layers << " layers, d_conv=" << lfm2_d_conv
+        info << "lfm2 forward: " << num_layers << " layers, d_conv=" << lfm2_d_conv
                   << ", rope_base=" << lfm2_rope_base << "\n";
     }
 
@@ -2031,7 +2036,7 @@ int main(int argc, char* argv[]) {
                 q35_rec_state[L].assign(static_cast<size_t>(q35_v_heads) * q35_ssm_hd * q35_ssm_hd, 0.0f);
             }
         }
-        std::cout << "qwen35 forward: " << num_layers << " layers, head_dim=" << q35_head_dim
+        info << "qwen35 forward: " << num_layers << " layers, head_dim=" << q35_head_dim
                   << ", rope_dim=" << q35_rope_dim << ", v_heads=" << q35_v_heads
                   << ", k_heads=" << q35_k_heads << ", ssm_hd=" << q35_ssm_hd << "\n";
     }
@@ -2097,9 +2102,9 @@ int main(int argc, char* argv[]) {
 
     // Decode-style forward: one token per step (correct KV + causal attention).
     if (!params.bench_logits) {
-        std::cout << "Generating: ";
+        info << "Generating: ";
     } else {
-        std::cout << "bench-logits: " << input_tokens.size() << " prompt tokens\n";
+        info << "bench-logits: " << input_tokens.size() << " prompt tokens\n";
     }
 
     bool first_token = true;
@@ -3100,11 +3105,11 @@ int main(int argc, char* argv[]) {
             if (params.verbose) {
                 total_timings.add(step_timings);
             }
-            std::cout << "Top logits after prompt (pos=" << pos
+            info << "Top logits after prompt (pos=" << pos
                       << ", layers=" << max_layers_override << "):\n";
             for (int paris_id : {12366, 60704}) {
                 if (paris_id < vocab_size) {
-                    std::cout << "    candidate id=" << paris_id << " logit="
+                    info << "    candidate id=" << paris_id << " logit="
                               << logits[static_cast<size_t>(paris_id)]
                               << " text=" << tokenizer.decode(paris_id) << "\n";
                 }
@@ -3140,7 +3145,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::cout << "\n\nGenerated " << generated << " tokens.\n";
+    info << "\n\nGenerated " << generated << " tokens.\n";
 
     if (params.verbose) {
         total_timings.print_summary();
