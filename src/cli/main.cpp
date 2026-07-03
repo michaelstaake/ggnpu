@@ -1026,7 +1026,14 @@ int main(int argc, char* argv[]) {
     // the natural head_dim = embedding / n_head. Both equal 64 for Llama 3.2 1B,
     // and head_dim=128 for Qwen2.5 1.5B (rope is applied over the full head).
     int head_dim = static_cast<int>(hparams.rope_dimension_count);
+    // Some archs set an explicit head_dim via attention.key_length that differs
+    // from embedding/n_head (qwen3: hidden=1024, 16 heads, head_dim=128).
+    if (head_dim == 0)
+        head_dim = static_cast<int>(model.gguf().get_int(model.gguf().arch() + ".attention.key_length", 0));
     if (head_dim == 0 && num_heads > 0) head_dim = hidden_size / num_heads;
+    // Q-side width = n_head * head_dim. This equals hidden_size for llama/qwen2 but
+    // is larger for qwen3 (16*128=2048 vs hidden 1024); K/V use n_kv_head*head_dim.
+    const int q_dim = num_heads * head_dim;
     int ctx_size = static_cast<int>(model.hparams().context_length);
     float rms_eps = 1e-5f;
     if (hparams.attention_layer_norm_rms_epsilon > 0) {
@@ -1895,6 +1902,11 @@ int main(int argc, char* argv[]) {
     // this matches llama.cpp's is_recr = n_head_kv(il)==0). Norms are plain
     // RMSNorm, RoPE is NeoX, and — an LFM2 quirk — the final norm is stored as
     // `token_embd_norm` while the output projection is tied to the token embedding.
+    // qwen3: like qwen2 but with an explicit head_dim (key_length), per-head
+    // QK-norm, tied output, and NEOX (split-half) RoPE. Handled inline in the
+    // generic transformer path via q_dim, the QK-norm block, and the rope branch.
+    const bool is_qwen3 = (model.gguf().arch() == "qwen3");
+
     const bool is_lfm2 = (model.gguf().arch() == "lfm2");
     const int lfm2_d_conv =
         static_cast<int>(model.gguf().get_int("lfm2.shortconv.l_cache", 3));
@@ -2006,11 +2018,11 @@ int main(int argc, char* argv[]) {
 
         inp_embd.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
         inp_norm.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
-        q_proj.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+        q_proj.assign(static_cast<size_t>(n_tokens) * q_dim, 0.0f);
         k_proj.assign(static_cast<size_t>(n_tokens) * num_kv_heads * head_dim, 0.0f);
         v_proj.assign(static_cast<size_t>(n_tokens) * num_kv_heads * head_dim, 0.0f);
         k_rope.assign(static_cast<size_t>(n_tokens) * num_kv_heads * head_dim, 0.0f);
-        q_rope.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+        q_rope.assign(static_cast<size_t>(n_tokens) * q_dim, 0.0f);
         attn_output.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
         ffn_gate.assign(static_cast<size_t>(n_tokens) * ffn_size, 0.0f);
         ffn_up.assign(static_cast<size_t>(n_tokens) * ffn_size, 0.0f);
@@ -2468,8 +2480,8 @@ int main(int argc, char* argv[]) {
             const TensorView* attn_v = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", layer);
 
             mul_mat_weight(inp_norm.data(), attn_q, q_proj.data(),
-                           n_tokens, hidden_size, hidden_size,
-                           hidden_size, hidden_size, hidden_size,
+                           n_tokens, q_dim, hidden_size,
+                           hidden_size, q_dim, q_dim,
                            params.verbose ? &step_timings.matmul_ms : nullptr);
             mul_mat_weight(inp_norm.data(), attn_k, k_proj.data(),
                            n_tokens, num_kv_heads * head_dim, hidden_size,
@@ -2493,16 +2505,66 @@ int main(int argc, char* argv[]) {
                     for (int j = 0; j < dim; j++)
                         proj[static_cast<size_t>(i) * dim + j] += bias[j];
             };
-            add_qkv_bias("blk.{layer}.attn_q.bias", q_proj.data(), hidden_size);
+            add_qkv_bias("blk.{layer}.attn_q.bias", q_proj.data(), q_dim);
             add_qkv_bias("blk.{layer}.attn_k.bias", k_proj.data(), num_kv_heads * head_dim);
             add_qkv_bias("blk.{layer}.attn_v.bias", v_proj.data(), num_kv_heads * head_dim);
 
+            // Per-head QK-norm (qwen3, and any arch that ships attn_q_norm /
+            // attn_k_norm): RMSNorm each head's head_dim slice of Q and K with the
+            // shared norm weight, before RoPE. Absent tensors → no-op (llama/qwen2).
+            {
+                const TensorView* qn_w = find_tensor_pattern(model, "blk.{layer}.attn_q_norm.weight", layer);
+                const TensorView* kn_w = find_tensor_pattern(model, "blk.{layer}.attn_k_norm.weight", layer);
+                // CPU RMSNorm over exactly head_dim (avoids NPU rms_norm pad-to-pow2
+                // scaling issues for the small 128-wide QK-norm).
+                auto rmsnorm_head = [&](float* v, const float* w) {
+                    double ss = 0.0;
+                    for (int i = 0; i < head_dim; i++) ss += static_cast<double>(v[i]) * v[i];
+                    float inv = 1.0f / std::sqrt(static_cast<float>(ss / head_dim) + rms_eps);
+                    for (int i = 0; i < head_dim; i++) v[i] = v[i] * inv * w[i];
+                };
+                if (qn_w) {
+                    const float* qnw = get_float_ptr(qn_w);
+                    for (int tkn = 0; tkn < n_tokens; tkn++)
+                        for (int h = 0; h < num_heads; h++)
+                            rmsnorm_head(q_proj.data() + (static_cast<size_t>(tkn) * q_dim) + static_cast<size_t>(h) * head_dim, qnw);
+                }
+                if (kn_w) {
+                    const float* knw = get_float_ptr(kn_w);
+                    for (int tkn = 0; tkn < n_tokens; tkn++)
+                        for (int h = 0; h < num_kv_heads; h++)
+                            rmsnorm_head(k_proj.data() + (static_cast<size_t>(tkn) * num_kv_heads * head_dim) + static_cast<size_t>(h) * head_dim, knw);
+                }
+            }
+
             {
                 ScopedTimer t(step_timings.rope_ms);
-                // RoPE: NPU when GGNPU_NPU_ROPE=1 (validated, see bench-layer 0g),
-                // else CPU. apply_rope dispatches and falls back to CPU on failure.
-                apply_rope(q_rope.data(), q_proj.data(), num_heads, pos, head_dim);
-                apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos, head_dim);
+                if (is_qwen3) {
+                    // qwen3 uses NEOX (split-half) RoPE: pair element i with i+hd/2
+                    // per head (vs the interleaved pairs apply_rope uses). Done on
+                    // CPU via rope_cache (built with qwen3's freq_base).
+                    auto rope_neox = [&](float* out, const float* in, int nh) {
+                        const int half = head_dim / 2;
+                        for (int h = 0; h < nh; h++) {
+                            const float* ih = in + static_cast<size_t>(h) * head_dim;
+                            float* oh = out + static_cast<size_t>(h) * head_dim;
+                            for (int i = 0; i < half; i++) {
+                                const float c = *rope_cache.cos_ptr(pos, i);
+                                const float s = *rope_cache.sin_ptr(pos, i);
+                                const float v0 = ih[i], v1 = ih[i + half];
+                                oh[i]        = v0 * c - v1 * s;
+                                oh[i + half] = v0 * s + v1 * c;
+                            }
+                        }
+                    };
+                    rope_neox(q_rope.data(), q_proj.data(), num_heads);
+                    rope_neox(k_rope.data(), k_proj.data(), num_kv_heads);
+                } else {
+                    // RoPE: NPU when GGNPU_NPU_ROPE=1 (validated, see bench-layer 0g),
+                    // else CPU. apply_rope dispatches and falls back to CPU on failure.
+                    apply_rope(q_rope.data(), q_proj.data(), num_heads, pos, head_dim);
+                    apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos, head_dim);
+                }
             }
 
             model.kv_cache().update_slab(layer, pos, pos + 1,
@@ -2534,7 +2596,7 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            std::vector<float> attn_out(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+            std::vector<float> attn_out(static_cast<size_t>(n_tokens) * q_dim, 0.0f);
 
             {
                 ScopedTimer t(step_timings.flash_attn_ms);
@@ -2561,8 +2623,8 @@ int main(int argc, char* argv[]) {
             if (attn_output_w) {
                 std::fill(attn_output.begin(), attn_output.end(), 0.0f);
                 mul_mat_weight(attn_out.data(), attn_output_w, attn_output.data(),
-                               n_tokens, hidden_size, hidden_size,
-                               hidden_size, hidden_size, hidden_size,
+                               n_tokens, hidden_size, q_dim,
+                               q_dim, hidden_size, hidden_size,
                                params.verbose ? &step_timings.matmul_ms : nullptr);
                 backend->sync();
 

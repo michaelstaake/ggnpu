@@ -148,6 +148,13 @@ bool Model::init_kv_cache(int64_t ctx_override) {
     if (ctx == 0) ctx = kDefaultCtxCap;
 
     uint64_t head_dim = hparams_.rope_dimension_count;
+    // Some archs (qwen3) set an explicit head_dim via attention.key_length that
+    // differs from embedding/heads; the forward path uses it, so the KV cache
+    // must match or its per-position stride is wrong and attention is corrupted.
+    if (head_dim == 0) {
+        head_dim = static_cast<uint64_t>(
+            gguf().get_int(gguf().arch() + ".attention.key_length", 0));
+    }
     if (head_dim == 0) {
         // Falls back to embedding/heads. Guard against zero head count (e.g. a
         // non-llama arch whose metadata uses a different key prefix) so we fail

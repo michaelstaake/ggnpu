@@ -21,6 +21,7 @@ widths are handled automatically (RMSNorm pad-to-pow2, SiLU host-tiling).
 | **Llama 3.2 1B** | `llama` | |
 | **Qwen2.5 / Qwen2.5-Coder 1.5B** | `qwen2` | QKV bias, GQA |
 | **DeepSeek-R1-Distill-Qwen 1.5B** | `qwen2` | validated across Q2_K → Q8_0, IQ4_XS, BF16 |
+| **Qwen3 0.6B** | `qwen3` | explicit head_dim (key_length), per-head QK-norm, NEOX RoPE, tied output |
 | **Gemma 3n E2B** | `gemma4` | MatFormer: SentencePiece-unigram tokenizer, Per-Layer Embeddings, QK-norm, sandwich norms, shared-KV, sliding-window attention, logit soft-cap |
 | **LFM2.5 230M** | `lfm2` | hybrid gated ShortConv (depthwise causal conv1d) + GQA attention, per-head QK-norm, NeoX RoPE, tied output head |
 
@@ -35,8 +36,8 @@ attention/FFN tensors) are handled tensor-by-tensor. Full-precision `F16`/`F32`
 tensors (norms, biases) pass through directly.
 
 Not yet supported: the codebook i-quants `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`/`IQ2_M`/
-`IQ3_XXS`/`IQ3_S`, and architectures beyond those above (e.g. `qwen3`, and
-selective-SSM hybrids such as `qwen35`).
+`IQ3_XXS`/`IQ3_S`, and architectures beyond those above (e.g. selective-SSM
+hybrids such as `qwen35`).
 
 ## Native host setup
 
