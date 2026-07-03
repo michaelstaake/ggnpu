@@ -10,6 +10,7 @@
 #include "ggnpu/quant/q8_0.h"
 #include "ggnpu/quant/quant.h"
 #include "ggnpu/quant/kquant.h"
+#include "ggnpu/quant/iquants.h"
 
 // fp32 -> fp16 (round to nearest), for building test blocks
 static uint16_t f32_to_fp16(float f) {
@@ -286,6 +287,35 @@ void test_q6_k_decode_golden() {
     }
 }
 
+// Guards the codebook i-quant block layouts (ggml struct sizes) against drift.
+// The exact decode is validated end-to-end + via cross-check vs Q8_0 (see
+// tests/iq_crosscheck.cpp); here we lock the ggml type/block byte sizes so a
+// mismatched struct or grid include is caught cheaply.
+void test_iquant_block_sizes() {
+    std::cout << "  test_iquant_block_sizes\n";
+    using T = ggnpu::GgmlType;
+    // Every codebook i-quant is a 256-value super-block.
+    for (T t : {T::IQ2_XXS, T::IQ2_XS, T::IQ2_S, T::IQ3_XXS, T::IQ3_S, T::IQ1_S, T::IQ1_M})
+        ASSERT_EQ(ggnpu::ggml_blck_size(t), 256, "i-quant block size is 256");
+    ASSERT_EQ(ggnpu::ggml_type_size(T::IQ2_XXS), ggnpu::IQ2_XXS_BLOCK_BYTES, "IQ2_XXS type size");
+    ASSERT_EQ(ggnpu::ggml_type_size(T::IQ2_XS),  ggnpu::IQ2_XS_BLOCK_BYTES,  "IQ2_XS type size");
+    ASSERT_EQ(ggnpu::ggml_type_size(T::IQ2_S),   ggnpu::IQ2_S_BLOCK_BYTES,   "IQ2_S type size");
+    ASSERT_EQ(ggnpu::ggml_type_size(T::IQ3_XXS), ggnpu::IQ3_XXS_BLOCK_BYTES, "IQ3_XXS type size");
+    ASSERT_EQ(ggnpu::ggml_type_size(T::IQ3_S),   ggnpu::IQ3_S_BLOCK_BYTES,   "IQ3_S type size");
+    ASSERT_EQ(ggnpu::ggml_type_size(T::IQ1_S),   ggnpu::IQ1_S_BLOCK_BYTES,   "IQ1_S type size");
+    ASSERT_EQ(ggnpu::ggml_type_size(T::IQ1_M),   ggnpu::IQ1_M_BLOCK_BYTES,   "IQ1_M type size");
+
+    // Dispatch through decode_for_npu produces per-row int8 + one scale/row and
+    // does not throw for a single all-zero super-block of each type.
+    for (T t : {T::IQ2_XXS, T::IQ2_XS, T::IQ2_S, T::IQ3_XXS, T::IQ3_S, T::IQ1_S, T::IQ1_M}) {
+        std::vector<uint8_t> blk(ggnpu::ggml_type_size(t), 0);
+        std::vector<int8_t> q; std::vector<float> sc;
+        ggnpu::decode_for_npu(t, blk.data(), blk.size(), 1, 256, q, sc);
+        ASSERT_EQ(q.size(), 256, "i-quant decode produces 256 int8 values");
+        ASSERT_EQ(sc.size(), 1, "i-quant decode produces 1 per-row scale");
+    }
+}
+
 void run_tests() {
     std::cout << "=== Quantization Tests ===\n\n";
 
@@ -298,6 +328,7 @@ void run_tests() {
     test_block_size_consistency();
     test_q4_k_decode_golden();
     test_q6_k_decode_golden();
+    test_iquant_block_sizes();
 
     std::cout << "\n--- Results ---\n";
     std::cout << "Passed: " << tests_passed << "\n";

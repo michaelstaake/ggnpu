@@ -1,6 +1,7 @@
 #include "quant/quant.h"
 #include "quant/iq4_nl.h"
 #include "quant/iq4_xs.h"
+#include "quant/iquants.h"
 #include "bf16.h"
 #include <cstring>
 #include <iostream>
@@ -50,6 +51,34 @@ void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
 
         case GgmlType::Q6_K:
             decode_q6_k_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
+            break;
+
+        case GgmlType::IQ2_XXS:
+            decode_iq2_xxs_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
+            break;
+
+        case GgmlType::IQ2_XS:
+            decode_iq2_xs_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
+            break;
+
+        case GgmlType::IQ2_S:
+            decode_iq2_s_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
+            break;
+
+        case GgmlType::IQ3_XXS:
+            decode_iq3_xxs_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
+            break;
+
+        case GgmlType::IQ3_S:
+            decode_iq3_s_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
+            break;
+
+        case GgmlType::IQ1_S:
+            decode_iq1_s_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
+            break;
+
+        case GgmlType::IQ1_M:
+            decode_iq1_m_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
             break;
 
         case GgmlType::F32:

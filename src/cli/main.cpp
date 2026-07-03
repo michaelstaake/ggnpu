@@ -25,6 +25,7 @@
 #include "quant/q8_0.h"
 #include "quant/iq4_nl.h"
 #include "quant/iq4_xs.h"
+#include "quant/iquants.h"
 
 namespace ggnpu {
 
@@ -119,6 +120,37 @@ void dequant_tensor_row(const TensorView* tv, int row, float* out, int row_dim) 
             }
         }
         return;
+    }
+
+    // Codebook i-quants: all 256-value super-blocks sharing one dequant signature,
+    // so table-dispatch by (block bytes, decode fn) instead of a case each.
+    {
+        void (*iq_deq)(const uint8_t*, float*) = nullptr;
+        size_t iq_bytes = 0;
+        switch (tv->type) {
+            case GgmlType::IQ2_XXS: iq_deq = dequant_iq2_xxs_block; iq_bytes = IQ2_XXS_BLOCK_BYTES; break;
+            case GgmlType::IQ2_XS:  iq_deq = dequant_iq2_xs_block;  iq_bytes = IQ2_XS_BLOCK_BYTES;  break;
+            case GgmlType::IQ2_S:   iq_deq = dequant_iq2_s_block;   iq_bytes = IQ2_S_BLOCK_BYTES;   break;
+            case GgmlType::IQ3_XXS: iq_deq = dequant_iq3_xxs_block; iq_bytes = IQ3_XXS_BLOCK_BYTES; break;
+            case GgmlType::IQ3_S:   iq_deq = dequant_iq3_s_block;   iq_bytes = IQ3_S_BLOCK_BYTES;   break;
+            case GgmlType::IQ1_S:   iq_deq = dequant_iq1_s_block;   iq_bytes = IQ1_S_BLOCK_BYTES;   break;
+            case GgmlType::IQ1_M:   iq_deq = dequant_iq1_m_block;   iq_bytes = IQ1_M_BLOCK_BYTES;   break;
+            default: break;
+        }
+        if (iq_deq) {
+            const size_t row_bytes = blocks_per_row * iq_bytes;
+            const uint8_t* row_data =
+                static_cast<const uint8_t*>(tv->data) + static_cast<size_t>(row) * row_bytes;
+            std::vector<float> block_f32(QK_K);
+            for (size_t b = 0; b < blocks_per_row; b++) {
+                iq_deq(row_data + b * iq_bytes, block_f32.data());
+                for (size_t j = 0; j < QK_K; j++) {
+                    size_t k = b * QK_K + j;
+                    if (k < static_cast<size_t>(row_dim)) out[k] = block_f32[j];
+                }
+            }
+            return;
+        }
     }
 
     if (tv->type == GgmlType::Q2_K) {
@@ -220,7 +252,11 @@ void compute_logits(const float* hidden, const TensorView* weight, float* logits
                      weight->type == GgmlType::Q4_K || weight->type == GgmlType::Q6_K ||
                      weight->type == GgmlType::Q4_0 || weight->type == GgmlType::Q8_0 ||
                      weight->type == GgmlType::Q5_K || weight->type == GgmlType::BF16 ||
-                     weight->type == GgmlType::IQ4_NL || weight->type == GgmlType::IQ4_XS)) {
+                     weight->type == GgmlType::IQ4_NL || weight->type == GgmlType::IQ4_XS ||
+                     weight->type == GgmlType::IQ2_XXS || weight->type == GgmlType::IQ2_XS ||
+                     weight->type == GgmlType::IQ2_S || weight->type == GgmlType::IQ3_XXS ||
+                     weight->type == GgmlType::IQ3_S || weight->type == GgmlType::IQ1_S ||
+                     weight->type == GgmlType::IQ1_M)) {
         const int8_t* decoded = weight_cache.get_or_decode(*weight);
         if (!decoded) goto cpu_fallback;
 
@@ -580,7 +616,11 @@ bool attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cac
                w->type != GgmlType::Q4_K && w->type != GgmlType::Q6_K &&
                w->type != GgmlType::Q4_0 && w->type != GgmlType::Q8_0 &&
                w->type != GgmlType::Q5_K && w->type != GgmlType::BF16 &&
-               w->type != GgmlType::IQ4_NL && w->type != GgmlType::IQ4_XS)) {
+               w->type != GgmlType::IQ4_NL && w->type != GgmlType::IQ4_XS &&
+               w->type != GgmlType::IQ2_XXS && w->type != GgmlType::IQ2_XS &&
+               w->type != GgmlType::IQ2_S && w->type != GgmlType::IQ3_XXS &&
+               w->type != GgmlType::IQ3_S && w->type != GgmlType::IQ1_S &&
+               w->type != GgmlType::IQ1_M)) {
         return true;
     }
     const auto& scales = cache.get_scales(*w);

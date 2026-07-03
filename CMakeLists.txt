@@ -72,6 +72,7 @@ set(LIB_SOURCES
     src/quant/q6_k.cpp
     src/quant/iq4_nl.cpp
     src/quant/iq4_xs.cpp
+    src/quant/iquants.cpp
     src/quant/quant.cpp
     src/arch/llama/llama.cpp
     src/runtime/kv_cache.cpp
