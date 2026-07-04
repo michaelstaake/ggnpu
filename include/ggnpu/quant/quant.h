@@ -16,6 +16,11 @@ void decode_q4_0_for_npu(const uint8_t* gguf_data, size_t data_size,
                          std::vector<int8_t>& int8_output,
                          std::vector<float>& scales_output);
 
+void decode_q4_1_for_npu(const uint8_t* gguf_data, size_t data_size,
+                         int64_t n_rows, int64_t n_cols,
+                         std::vector<int8_t>& int8_output,
+                         std::vector<float>& scales_output);
+
 void decode_q8_0_for_npu(const uint8_t* gguf_data, size_t data_size,
                          int64_t n_rows, int64_t n_cols,
                          std::vector<int8_t>& int8_output,

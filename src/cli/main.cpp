@@ -22,6 +22,7 @@
 #include "weight_cache.h"
 #include "quant/kquant.h"
 #include "quant/q4_0.h"
+#include "quant/q4_1.h"
 #include "quant/q8_0.h"
 #include "quant/iq4_nl.h"
 #include "quant/iq4_xs.h"
@@ -60,6 +61,25 @@ void dequant_tensor_row(const TensorView* tv, int row, float* out, int row_dim) 
             dequant_q4_0_block(row_data + b * Q4_0_BLOCK_BYTES, block_f32.data());
             for (int j = 0; j < QK4_0; j++) {
                 size_t k = b * QK4_0 + j;
+                if (k < static_cast<size_t>(row_dim)) out[k] = block_f32[j];
+            }
+        }
+        return;
+    }
+
+    if (tv->type == GgmlType::Q4_1) {
+        constexpr int QK4_1 = 32;
+        constexpr size_t Q4_1_BLOCK_BYTES = 20;
+        const size_t blocks_per_row =
+            (static_cast<size_t>(row_dim) + QK4_1 - 1) / QK4_1;
+        const size_t row_bytes = blocks_per_row * Q4_1_BLOCK_BYTES;
+        const uint8_t* row_data =
+            static_cast<const uint8_t*>(tv->data) + static_cast<size_t>(row) * row_bytes;
+        std::vector<float> block_f32(QK4_1);
+        for (size_t b = 0; b < blocks_per_row; b++) {
+            dequant_q4_1_block(row_data + b * Q4_1_BLOCK_BYTES, block_f32.data());
+            for (int j = 0; j < QK4_1; j++) {
+                size_t k = b * QK4_1 + j;
                 if (k < static_cast<size_t>(row_dim)) out[k] = block_f32[j];
             }
         }
@@ -250,7 +270,8 @@ void compute_logits(const float* hidden, const TensorView* weight, float* logits
 
     if (npu_path && (weight->type == GgmlType::Q2_K || weight->type == GgmlType::Q3_K ||
                      weight->type == GgmlType::Q4_K || weight->type == GgmlType::Q6_K ||
-                     weight->type == GgmlType::Q4_0 || weight->type == GgmlType::Q8_0 ||
+                     weight->type == GgmlType::Q4_0 || weight->type == GgmlType::Q4_1 ||
+                     weight->type == GgmlType::Q8_0 ||
                      weight->type == GgmlType::Q5_K || weight->type == GgmlType::BF16 ||
                      weight->type == GgmlType::IQ4_NL || weight->type == GgmlType::IQ4_XS ||
                      weight->type == GgmlType::IQ2_XXS || weight->type == GgmlType::IQ2_XS ||
@@ -618,7 +639,8 @@ bool report_compare(const char* label, const CompareResult& r, int n,
 bool attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cache) {
     if (!w || (w->type != GgmlType::Q2_K && w->type != GgmlType::Q3_K &&
                w->type != GgmlType::Q4_K && w->type != GgmlType::Q6_K &&
-               w->type != GgmlType::Q4_0 && w->type != GgmlType::Q8_0 &&
+               w->type != GgmlType::Q4_0 && w->type != GgmlType::Q4_1 &&
+               w->type != GgmlType::Q8_0 &&
                w->type != GgmlType::Q5_K && w->type != GgmlType::BF16 &&
                w->type != GgmlType::IQ4_NL && w->type != GgmlType::IQ4_XS &&
                w->type != GgmlType::IQ2_XXS && w->type != GgmlType::IQ2_XS &&
@@ -1236,6 +1258,14 @@ int main(int argc, char* argv[]) {
 
     const bool npu_matmul = (backend->name() == "amd_xdna");
 
+    // GGNPU_FP32_SSM: run the whole forward's elementwise math in fp32 on the CPU
+    // (matmul + rmsnorm + FFN silu), not just weights. Diagnostic for qwen35 gated
+    // delta-net numerical sensitivity: GGNPU_FP32_MATMUL alone leaves rmsnorm/silu
+    // on the NPU (int8), whose ~1% residual error is the suspected cause of the
+    // recurrent-state collapse by layer ~5. Setting this implies FP32_MATMUL.
+    // NOTE: flash_attn (attention layers) still runs on the NPU under this flag.
+    const bool fp32_ssm = std::getenv("GGNPU_FP32_SSM") != nullptr;
+
     auto mul_mat_weight = [&](const float* A, const TensorView* weight, float* C,
                               int M, int N, int K, int lda, int ldb, int ldc,
                               double* matmul_ms = nullptr) -> bool {
@@ -1248,7 +1278,7 @@ int main(int argc, char* argv[]) {
         // f32, exact dot product). Isolates NPU int8 quantization error. M is 1
         // in the qwen35/decode paths. Enable with GGNPU_FP32_MATMUL=1.
         static const bool fp32_matmul = std::getenv("GGNPU_FP32_MATMUL") != nullptr;
-        if (fp32_matmul && M == 1) {
+        if ((fp32_matmul || fp32_ssm) && M == 1) {
             std::vector<float> wr(static_cast<size_t>(K));
             for (int n = 0; n < N; n++) {
                 dequant_tensor_row(weight, n, wr.data(), K);
@@ -2070,6 +2100,12 @@ int main(int argc, char* argv[]) {
     auto g_rmsnorm = [&](float* out, const float* in, int n, const float* w, float eps) -> bool {
         std::unique_ptr<ScopedTimer> t;
         if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.rms_norm_ms);
+        // Full-fp32 diagnostic: exact host RMSNorm over exactly n elements (no NPU
+        // pow2 pad, no int8). See GGNPU_FP32_SSM above.
+        if (fp32_ssm) {
+            host_rmsnorm(out, in, n, w, eps);
+            return true;
+        }
         if (!rms_norm(out, in, 1, n, eps, w)) {
             model.unload();
             return false;
@@ -2840,7 +2876,11 @@ int main(int argc, char* argv[]) {
                 mul_mat_weight(xn.data(), up_w, up.data(), 1, ffn_size, hidden_size,
                                hidden_size, ffn_size, ffn_size, mm);
                 backend->sync();
-                {
+                if (fp32_ssm) {
+                    // Exact fp32 SiLU on CPU (full-fp32 diagnostic; see GGNPU_FP32_SSM).
+                    for (int i = 0; i < ffn_size; i++)
+                        act[i] = gate[i] / (1.0f + std::exp(-gate[i]));
+                } else {
                     SiluParams sp; sp.input = gate.data(); sp.output = act.data(); sp.size = ffn_size;
                     if (backend->silu(sp) != Status::OK) {
                         std::cerr << "Error: qwen35 silu failed at layer " << L << "\n";

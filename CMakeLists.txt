@@ -64,6 +64,7 @@ set(LIB_SOURCES
     src/gguf/gguf.cpp
     src/gguf/tensor.cpp
     src/quant/q4_0.cpp
+    src/quant/q4_1.cpp
     src/quant/q8_0.cpp
     src/quant/q2_k.cpp
     src/quant/q3_k.cpp
