@@ -37,6 +37,23 @@ Also correct: "The quick brown fox"→" jumps over the lazy dog.", "Q: What is
 2+2? A:"→" 4.". Note qwen35 is a *thinking* model — compare with `llama-simple`
 (raw completion), not `llama-cli` (forces chat template + `<think>`).
 
+**Quant sweep** — all six `qwen35` GGUFs in `models/` now generate correct
+greedy output (`-p "The capital of France is" -n 15 -c 512 --temp 0`):
+
+| Model | Quant | Output (first tokens) | Result |
+|-------|-------|-----------------------|--------|
+| Qwen3.5-4B | Q6_K   | " Paris. A. True B. False" | ✅ |
+| Qwen3.5-4B | Q4_K_M | " Paris. A. True B. False" | ✅ |
+| Qwen3.5-9B | Q6_K   | " Paris." | ✅ |
+| Qwen3.5-9B | Q3_K_M | " Paris. This is a well-known fact, and it is the most populous" | ✅ |
+| Qwen3.5-9B | UD-IQ2_XXS | " Paris. A. True B. False" | ✅ (2-bit i-quant) |
+| ornith-9b  | IQ2_M  | " the city of Paris. A. 100 B." | ✅ (2-bit i-quant; MTP blk.32 skipped) |
+
+The head-mapping fix is quant-independent, so the same fix carries every
+k-quant and i-quant. i-quant decoders (IQ2_XXS/IQ2_M) were already in place
+from the 2026-07-03 quant-coverage work; the arch bug was the only thing
+standing between them and coherent output.
+
 ## 2026-06-30 — Qwen2.5-Coder-1.5B runs end-to-end on the NPU (2nd architecture)
 
 Second model architecture (`qwen2`) brought up on the NPU. Multi-arch is
