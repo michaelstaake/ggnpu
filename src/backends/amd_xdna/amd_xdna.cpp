@@ -568,7 +568,6 @@ public:
         float* C = static_cast<float*>(params.C);
         std::fill(C, C + static_cast<size_t>(M) * N, 0.0f);
 
-        std::vector<int8_t> a_tile(tile_bytes_a);
         std::vector<int8_t> b_tile(tile_bytes_b);
         std::vector<int32_t> c_tile(static_cast<size_t>(T_m) * T);
 
@@ -720,6 +719,29 @@ public:
             return it->second.get();
         };
 
+        // A activation packing depends only on the M-row block and K-slice
+        // (m0, k0), never on n0 — the same packed int8 A feeds every N-tile of a
+        // matmul. At decode (M=1, deep-K) there is a single (m0,k0), so the old
+        // per-tile pack re-quantized the same K-vector N/256 times (~39% of decode
+        // matmul time, measured). Cache the packed int8 A per (m0,k0) for this call
+        // and reuse it across N-tiles. Purely host-side; no kernel/DMA-shape change.
+        std::unordered_map<uint64_t, std::vector<int8_t>> packed_a_cache;
+        auto resolve_a_tile = [&](int m0, int mc, int k0, int kc) -> const std::vector<int8_t>& {
+            const uint64_t akey = (static_cast<uint64_t>(static_cast<uint32_t>(m0)) << 32) |
+                                  static_cast<uint32_t>(k0);
+            auto found = packed_a_cache.find(akey);
+            if (found != packed_a_cache.end()) return found->second;
+            std::vector<int8_t> av(static_cast<size_t>(mc) * T_k, 0);
+            for (int row = 0; row < mc; row++) {
+                const float inv_a = 1.0f / a_scales[static_cast<size_t>(m0 + row)];
+                for (int k = 0; k < kc; k++)
+                    av[static_cast<size_t>(row) * T_k + k] =
+                        to_i8(A[(m0 + row) * params.lda + (k0 + k)] * inv_a);
+            }
+            auto [it, _] = packed_a_cache.emplace(akey, std::move(av));
+            return it->second;
+        };
+
         struct TileWork {
             int m0, mc, n0, nc, k0, kc;
             BTileKey bkey;
@@ -746,13 +768,9 @@ public:
 
                 auto t_pack_start = do_timing ? std::chrono::high_resolution_clock::now()
                                               : std::chrono::high_resolution_clock::time_point{};
-                std::fill(a_tile.begin(), a_tile.end(), 0);
-                for (int row = 0; row < work.mc; row++) {
-                    const float inv_a = 1.0f / a_scales[static_cast<size_t>(work.m0 + row)];
-                    for (int k = 0; k < work.kc; k++)
-                        a_tile[row * T_k + k] =
-                            to_i8(A[(work.m0 + row) * params.lda + (work.k0 + k)] * inv_a);
-                }
+                // Packed once per (m0,k0) and reused across this matmul's N-tiles.
+                const std::vector<int8_t>& a_data =
+                    resolve_a_tile(work.m0, work.mc, work.k0, work.kc);
                 if (do_timing) {
                     total_pack_ms += std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t_pack_start).count();
@@ -769,7 +787,7 @@ public:
                 // DMA only the real M rows of A. Rows [mc, T_m) in the device
                 // buffer hold stale data and produce output rows we never read
                 // back, so skipping them is safe and saves up to T_m/mc.
-                buf_mgr_->copy_to(*slot.buf_a, a_tile.data(),
+                buf_mgr_->copy_to(*slot.buf_a, a_data.data(),
                                   static_cast<size_t>(work.mc) * T_k);
                 if (do_timing) {
                     total_dma_a_ms += std::chrono::duration<double, std::milli>(
