@@ -2628,7 +2628,6 @@ int main(int argc, char* argv[]) {
             const int sk    = q35_ssm_hd;            // 128 SSM head dim
             const int nVH   = q35_v_heads;           // 32 value heads
             const int nKH   = q35_k_heads;           // 16 key heads
-            const int vgroup = (nKH > 0) ? nVH / nKH : 1;  // 2 value heads per key head
             double* mm = params.verbose ? &step_timings.matmul_ms : nullptr;
 
             std::vector<float> xn(hidden_size);
@@ -2738,7 +2737,12 @@ int main(int argc, char* argv[]) {
                     const float* dt_b  = get_float_ptr(dt_w);
                     std::vector<float>& S = q35_rec_state[L];
                     for (int h = 0; h < nVH; h++) {
-                        const int kh = h / vgroup;
+                        // Value head h reads key/query head (h % nKH). llama.cpp expands
+                        // q/k from nKH to nVH with ggml_repeat_4d, whose semantics are
+                        // modulo tiling (dst head = src head % nKH) — NOT block grouping
+                        // (h / vgroup). The two agree only for head 0, so a block mapping
+                        // silently corrupts every value head after the first.
+                        const int kh = h % nKH;
                         const float* qh = qn.data() + kh * sk;
                         const float* khp = kn.data() + kh * sk;
                         const float* vh = vc + h * sk;

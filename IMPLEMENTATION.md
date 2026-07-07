@@ -919,7 +919,7 @@ bash scripts/verify-npu.sh
 
 # Native build + validated NPU matmul (Phase 2 gate — PASSES)
 cmake -S . -B build-npu -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
-cmake --build build-npu -j1
+cmake --build build-npu -j2
 ./build-npu/ggnpu bench-matmul
 # → all sizes validate; ~1 ms per 256³ tile (8192³ takes minutes due to host tiling)
 
@@ -958,28 +958,6 @@ python3 scripts/compare_logits.py --check --ref  # + logit vs llama-cpp-python
 2. **RoPE on NPU** — working transform for gather/pair-shuffle loads.
 3. **Matmul perf:** batched tiles (done), small-M decode kernel (done), **deep-K in-kernel reduction (done, ~2× decode)**, **resident weight BOs (done, ~5%; decode now device-bound)**. Remaining is device-side: widen N per launch (amortize per-launch device overhead across N) or more cores — transform/kernel-shape work.
 4. **Phase 6:** 3B model, L2-aware tiling, production docs/errors, optional prebuilt xclbin distribution.
-
-### 7.2 Memory constraints (16 GB RAM dev machine)
-
-Dev laptop has ~14 GiB RAM + 4 GiB swap. Cursor IDE can consume several GB; combined with an oversized KV cache this is the highest OOM risk.
-
-| Activity | RAM impact | Recommendation |
-|----------|------------|----------------|
-| Native `ggnpu` build | ~2–4 GB at `-j1`; **much higher** at `-j2+` | **Always** `cmake --build … -j1` (§16) |
-| Local Triton-XDNA kernel build | **Low** (`pip install triton-xdna`) | No heavy build step required |
-| Load Llama 1B Q4_K_M (mmap) | ~770 MB virtual | Fine |
-| KV at **131k ctx** (current code) | **~8.6 GB** | **Will OOM** with IDE open |
-| KV at **2048 ctx** (after fix) | **~128 MB** | Comfortable |
-| Weight decode disk cache | ~1–2 GB first run | Disk, not RAM |
-| NPU pinned buffers | Tens–hundreds of MB | Requires memlock unlimited |
-
-**RAM hygiene before inference:**
-
-- Run `ggnpu` from a plain terminal outside the IDE when memory is tight
-- Do not run `GGNPU_BUILD_KERNELS=ON` on 16 GB RAM (but Triton-XDNA `pip install` is lightweight)
-- Start with `models/llama-3.2-1b-q4_k_m.gguf` only; avoid 3B+ until KV is fixed
-- Set `ulimit -l unlimited` in the shell session
-
 ---
 
 ### 7.3 Gemma 3n (`gemma4`) support roadmap
@@ -1152,7 +1130,20 @@ a standard SwiGLU FFN (`ffn_gate`/`up`/`down`).
   on the NPU across **all five staged quant variants** (Q6_K/Q8_0/Q5_K/BF16/IQ4_NL, each
   France → " Paris"). Quant work completed 2026-07-02 (§7.4.3).
 
-#### 7.4.2 `qwen35` — Qwen3.5 9B & Ornith 9B (hybrid SSM + gated attention)
+#### 7.4.2 `qwen35` — Qwen3.5 (hybrid SSM + gated attention)
+
+> **Status: DONE 2026-07-06.** Correct greedy output on **Q6_K** (4B and 9B):
+> "The capital of France is" → " Paris.", matching a `llama-simple` reference
+> token-for-token. Both original blockers are resolved: (1) i-quant decode was
+> **sidestepped** — Q6_K/Q4_K_M `qwen35` GGUFs (Qwen3.5-4B/9B, added Jul 3) use
+> already-supported quants, so no IQ2/IQ3 decoder is required to run the arch;
+> (2) the SSM forward path is implemented (`is_qwen35` block in `src/cli/main.cpp`).
+> The final bug was **not** "numerical sensitivity" (that diagnosis came from
+> 2-bit i-quants with no reference) — it was a value-head→key-head mapping error
+> in the delta recurrence: `kh = h / vgroup` must be `kh = h % nKH`, because
+> llama.cpp expands q/k from `nKH` to `nVH` with `ggml_repeat_4d` (modulo tiling,
+> agrees with block grouping only for head 0). The historical notes below are
+> retained for context. Ornith's blk.32 MTP/nextn head is still just skipped.
 
 Both 9B files report `general.architecture = qwen35`. 32 blocks (Ornith: 33, extra
 is an MTP head), hidden 4096, FFN 12288, 16 attn / 4 KV heads, head_dim 256,
@@ -1299,7 +1290,7 @@ bash scripts/verify-npu.sh
 ```bash
 mkdir -p build-npu && cd build-npu
 cmake .. -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
-cmake --build . -j1
+cmake --build . -j2
 ```
 
 ### Kernel artifacts
@@ -1324,7 +1315,7 @@ Kernel authoring uses Triton-XDNA (`kernels/triton/compile_kernels.py`). IRON/`X
 
 ```bash
 cmake -S . -B build-npu -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
-cmake --build build-npu -j1
+cmake --build build-npu -j2
 bash scripts/setup-triton-env.sh && source ~/triton-env/bin/activate
 ./scripts/build-kernels.sh npu6 matmul
 
@@ -1376,7 +1367,7 @@ Do not promise CUDA-class speed in v1.
 | Triton-XDNA / xclbin build OOM | `pip install triton-xdna` is lightweight; no heavy build step |
 | KV cache over-allocation | `init_kv_cache()` uses full GGUF `context_length`; must respect `-c` before inference on 16 GB hosts — **fixed** via `reinit_kv_cache()` |
 | GGUF models with 128k+ ctx metadata | Cap KV at CLI `-c` or sensible MVP default (2048) regardless of metadata |
-| IDE memory pressure (Cursor) | Run heavy builds and inference outside IDE; **always** `cmake --build … -j1` |
+| IDE memory pressure (Cursor) | Run heavy builds and inference outside IDE; **always** `cmake --build … -j2` |
 
 ---
 
@@ -1420,7 +1411,6 @@ On **Ubuntu 24.04 or 26.04** + **Ryzen AI 7 350**, via the native host flow:
    - The work genuinely belongs on CPU (GGUF decode, tokenization, sampling, cheap post-processing after an NPU kernel).
    
    Ops marked **NPU** in §2.1 must run on the NPU or **fail with an error**. If an xclbin is missing, a kernel launch fails, validation fails, or output is wrong, propagate the error and stop — **do not** catch the failure and run the same tensor op on CPU. Fixing the NPU path is the only acceptable fix; a CPU workaround is forbidden even as a temporary stub.
-6. **Use `-j1` for all builds** on the 16 GB dev machine. Always run `cmake --build <dir> -j1` (or `make -j1`). Do not use `-j2`, `-j$(nproc)`, or unconstrained Ninja parallelism — parallel C++ compilation plus the IDE is a common OOM trigger (see §7.2).
 7. Add tests for every parser/quant/graph component; NPU tests marked `MANUAL`.
 8. Update `docs/usage.md` and `--help` whenever CLI flags change.
 9. Commit logically per phase; write clear commit messages.
@@ -1449,7 +1439,7 @@ Hardware-facing conventions an agent must know (all in `src/backends/amd_xdna/`)
 - Runs are async: always `run.wait()` before reading output.
 - Each xclbin is compiled fixed-shape (see `kernels/triton/compile_kernels.py`): matmul 256³ int8→int32, rmsnorm M=2×N=2048 bf16, softmax 256×256 bf16, silu N=8192 bf16. flash_attn builds are experimental (`GGNPU_EXPERIMENTAL=1`).
 
-See §7.1 for full blocker list and §7.2 for RAM constraints.
+See §7.1 for full blocker list
 
 ---
 

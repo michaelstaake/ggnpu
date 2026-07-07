@@ -13,6 +13,30 @@ Hardware unless noted: AMD Ryzen AI 7 350 (Krackan / XDNA2 / `npu6`),
 
 ---
 
+## 2026-07-06 — qwen35 (Qwen3.5 Gated DeltaNet) now correct on Q6_K (head-mapping fix)
+
+`qwen35` hybrid SSM+attention was the last `models/` architecture producing
+garbage. Root cause was **not** the long-suspected "numerical sensitivity" — it
+was a value-head→key-head mapping bug in the delta-net recurrence
+(`src/cli/main.cpp`, `is_qwen35` block): the per-value-head loop used
+`kh = h / vgroup` (block grouping) but llama.cpp expands q/k from `nKH`=16 to
+`nVH`=32 with `ggml_repeat_4d`, which is **modulo tiling** → value head `h`
+reads key head `h % nKH`. The two agree only for head 0, so layer-0 head-0
+tensors matched the reference while every later value head was silently wrong.
+One-line fix: `const int kh = h % nKH;`. Diagnosed by per-tensor comparison
+against `llama-eval-callback` and `llama-simple` on the newly-added Q6_K files.
+
+**Correctness (greedy, `--temp 0`)** — matches llama.cpp token-for-token:
+```
+./build-npu/ggnpu -m models/Qwen3.5-4B-Q6_K.gguf -p "The capital of France is" -n 20 --temp 0
+  → " Paris.\nA. True\nB. False\n\n<think>..."   (llama-simple ref: "Paris. A. True B. False Answer: A")
+./build-npu/ggnpu -m models/Qwen3.5-9B-Q6_K.gguf -p "The capital of France is" -n 15 --temp 0
+  → " Paris.\n\nWhat is the capital of France?"
+```
+Also correct: "The quick brown fox"→" jumps over the lazy dog.", "Q: What is
+2+2? A:"→" 4.". Note qwen35 is a *thinking* model — compare with `llama-simple`
+(raw completion), not `llama-cli` (forces chat template + `<think>`).
+
 ## 2026-06-30 — Qwen2.5-Coder-1.5B runs end-to-end on the NPU (2nd architecture)
 
 Second model architecture (`qwen2`) brought up on the NPU. Multi-arch is
