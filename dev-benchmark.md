@@ -36,8 +36,14 @@ the deep-K path, else 256). Default-on; disable with GGNPU_NO_WIDEN_N.
 
 **N sweep:** N=256 → 8072 ms, **N=512 → 7305 ms (best)**, N=1024 → 8363 ms
 (regresses — array becomes N-throughput-bound + larger DMA, and fewer matmuls
-are N%1024==0). So 512 is the sweet spot. Logits (vocab N=128256, not %512)
-stays on the N=256 path.
+are N%1024==0). So 512 is the sweet spot.
+
+**Follow-up (same day): widen gate relaxed N%512==0 → N>=512.** The N-tiling loop
+already zero-pads a partial final tile (nc<512) and reads back only nc columns,
+so N need not be a multiple of 512. This lets the logits projection (vocab
+N=128256) use widen too, with one wasteful partial tail tile amortized over ~250
+full ones: logits 1735 → 1567 ms (−9.7%), total decode 10885 → 10011 ms (−8.0%,
+~+8.7% tok/s). Greedy output unchanged (Llama/Qwen3.5/Qwen3/Gemma-4 → "Paris").
 
 Correctness unchanged across every arch (all still greedy-correct → "Paris"):
 Llama-1B, Qwen3.5-4B/Qwen3-0.6B, Gemma-4-E2B (K=1536), LFM2.5-230M, Ministral-3-3B.

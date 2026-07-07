@@ -541,11 +541,14 @@ public:
         // output, halving the launch count. Measured ~9.5% off decode matmul on
         // Llama-1B at kWideN=512 (1024 regressed — array becomes N-throughput-
         // bound + larger DMA). Default-on; disable with GGNPU_NO_WIDEN_N. Requires
-        // the matmul_small_m_deepk_wide xclbin (M=16,N=kWideN,K=kDeepK) and N a
-        // multiple of kWideN (else falls back to the 256-N deep-K path — e.g. the
-        // logits projection whose vocab N is not a multiple of 512).
+        // the matmul_small_m_deepk_wide xclbin (M=16,N=kWideN,K=kDeepK) and N >=
+        // kWideN. The N-tiling loop below handles a partial final tile (nc<kWideN)
+        // by zero-padding B and reading back only nc columns — same as the 256-N
+        // path — so N need not be a multiple of kWideN. This lets the logits
+        // projection (vocab N, e.g. 128256, not a multiple of 512) use widen too,
+        // with one wasteful partial tail tile amortized over ~250 full ones.
         const bool use_widen = use_deepk && std::getenv("GGNPU_NO_WIDEN_N") == nullptr &&
-                               (N % kWideN == 0) && ensure_matmul_deepk_wide_kernel();
+                               (N >= kWideN) && ensure_matmul_deepk_wide_kernel();
         CachedMatmulKernel& active_kernel =
             use_widen ? matmul_deepk_wide_kernel_
             : use_deepk ? matmul_deepk_kernels_.at(deepk_span)
