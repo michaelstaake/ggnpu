@@ -318,6 +318,92 @@ cpu_fallback:
     }
 }
 
+// True for the K-quant / packed weight types compute_logits can run on the NPU
+// (shared by the single-row and batched vocab projections).
+static bool npu_logits_weight_type(GgmlType t) {
+    return t == GgmlType::Q2_K || t == GgmlType::Q3_K || t == GgmlType::Q4_K ||
+           t == GgmlType::Q6_K || t == GgmlType::Q4_0 || t == GgmlType::Q4_1 ||
+           t == GgmlType::Q8_0 || t == GgmlType::Q5_K || t == GgmlType::BF16 ||
+           t == GgmlType::IQ4_NL || t == GgmlType::IQ4_XS || t == GgmlType::IQ2_XXS ||
+           t == GgmlType::IQ2_XS || t == GgmlType::IQ2_S || t == GgmlType::IQ3_XXS ||
+           t == GgmlType::IQ3_S || t == GgmlType::IQ1_S || t == GgmlType::IQ1_M;
+}
+
+// Batched vocab projection: `n_rows` hidden rows @ weight^T -> `n_rows`*vocab
+// logits (row-major, ldc=vocab_size). One mul_mat_q at M=n_rows; for n_rows<=16
+// this stays on the small-M decode kernel, so verifying a speculative draft
+// block of k+1<=16 rows costs one logits launch (same device cost as the M=1
+// single-token logits), not n_rows separate launches. CPU fallback dots each row.
+void compute_logits_rows(const float* hidden, int n_rows, const TensorView* weight,
+                         float* logits, int vocab_size, int hidden_size,
+                         WeightCache& weight_cache, Backend& backend) {
+    if (!weight || !hidden || !logits || n_rows <= 0) return;
+
+    if (backend.name() == "amd_xdna" && npu_logits_weight_type(weight->type)) {
+        const int8_t* decoded = weight_cache.get_or_decode(*weight);
+        if (decoded) {
+            std::vector<float> C(static_cast<size_t>(n_rows) * vocab_size, 0.0f);
+            MulMatParams p;
+            p.A = hidden;
+            p.B = decoded;
+            p.C = C.data();
+            p.M = n_rows;
+            p.N = vocab_size;
+            p.K = hidden_size;
+            p.lda = hidden_size;
+            p.ldb = hidden_size;
+            p.ldc = vocab_size;
+            p.n_batches = 1;
+            p.B_type = weight->type;
+            if (attach_kquant_scales(p, weight, weight_cache)) {
+                Status st = backend.mul_mat_q(p);
+                backend.sync();
+                if (st == Status::OK) {
+                    std::memcpy(logits, C.data(),
+                                static_cast<size_t>(n_rows) * vocab_size * sizeof(float));
+                    return;
+                }
+            }
+        }
+    }
+
+    // CPU fallback: dequant each weight row once, dot against every hidden row.
+    std::vector<float> wrow(static_cast<size_t>(hidden_size));
+    for (int v = 0; v < vocab_size; v++) {
+        dequant_tensor_row(weight, v, wrow.data(), hidden_size);
+        for (int r = 0; r < n_rows; r++) {
+            const float* h = hidden + static_cast<size_t>(r) * hidden_size;
+            float sum = 0.0f;
+            for (int d = 0; d < hidden_size; d++) sum += h[d] * wrow[d];
+            logits[static_cast<size_t>(r) * vocab_size + v] = sum;
+        }
+    }
+}
+
+// Prompt-lookup drafter: find the most recent earlier occurrence of the last
+// `ng` tokens of `seq` and return up to `k` tokens that followed it, preferring
+// longer n-gram matches. Pure host-side lookup (no draft model); returns empty
+// when nothing matches, in which case the caller runs a normal single-token step.
+static std::vector<int> lookup_draft(const std::vector<int>& seq,
+                                     int ngram_max, int ngram_min, int k) {
+    const int n = static_cast<int>(seq.size());
+    for (int ng = ngram_max; ng >= ngram_min; ng--) {
+        if (n < ng + 1) continue;
+        for (int i = n - ng - 1; i >= 0; i--) {  // most-recent match first
+            bool match = true;
+            for (int j = 0; j < ng; j++) {
+                if (seq[i + j] != seq[n - ng + j]) { match = false; break; }
+            }
+            if (!match) continue;
+            std::vector<int> draft;
+            for (int j = 0; j < k && (i + ng + j) < n; j++)
+                draft.push_back(seq[i + ng + j]);
+            if (!draft.empty()) return draft;
+        }
+    }
+    return {};
+}
+
 // Legacy name kept for compatibility — forwards to compute_logits with CPU-only path.
 void compute_logits_f32(const float* hidden, const TensorView* weight, float* logits,
                         int vocab_size, int hidden_size) {
@@ -2158,6 +2244,28 @@ int main(int argc, char* argv[]) {
         info << "bench-logits: " << input_tokens.size() << " prompt tokens\n";
     }
 
+    // Prompt-lookup speculative decode (opt-in GGNPU_SPEC_DECODE): draft the next
+    // few tokens by matching recent n-grams in the sequence, then verify them all
+    // in one batched M=(k+1) forward (the same path prefill batching uses). Because
+    // the decode matmul kernel is fixed at M=16, verifying up to 15 draft tokens
+    // costs the same device time as one M=1 step, so any accepted draft is a near-
+    // free extra token. Greedy only (argmax verification == sequential greedy);
+    // restricted to the generic transformer path (lfm2/qwen35 are sequential
+    // recurrences, gemma4 has a separate forward — both deferred, like prefill batch).
+    const bool spec_decode = std::getenv("GGNPU_SPEC_DECODE") != nullptr &&
+                             !is_gemma && !is_lfm2 && !is_qwen35 &&
+                             params.temp == 0.0f && logits_w != nullptr;
+    const int spec_ngram_max = 3;
+    const int spec_ngram_min = 1;
+    int spec_k = 8;  // draft length; k+1 must stay <= small-M kernel tile (16)
+    if (const char* e = std::getenv("GGNPU_SPEC_K")) {
+        spec_k = std::max(1, std::min(15, std::atoi(e)));
+    }
+    // Full token history (prompt + generated) for the n-gram drafter.
+    std::vector<int> seq = input_tokens;
+    const bool spec_debug = std::getenv("GGNPU_SPEC_DEBUG") != nullptr;
+    long spec_steps = 0, spec_proposed = 0, spec_accepted = 0;
+
     bool first_token = true;
     while (generated < params.max_tokens || params.bench_logits) {
         step_timings = InferenceTimings();
@@ -2175,6 +2283,7 @@ int main(int argc, char* argv[]) {
                                    std::getenv("GGNPU_NO_PREFILL_BATCH") == nullptr;
         std::vector<int> batch_toks;
         bool do_sample = false;
+        int n_draft = 0;  // # of speculative draft tokens appended after last_sampled
         if (prompt_idx < input_tokens.size()) {
             const int remaining = static_cast<int>(input_tokens.size()) - static_cast<int>(prompt_idx);
             const int chunk = batch_prefill ? std::min(remaining, kPrefillChunk) : 1;
@@ -2186,6 +2295,13 @@ int main(int argc, char* argv[]) {
         } else {
             batch_toks.push_back(last_sampled);
             do_sample = true;
+            // Speculative: append an n-gram draft so the block is verified in one
+            // batched forward. seq already ends with last_sampled.
+            if (spec_decode) {
+                std::vector<int> draft = lookup_draft(seq, spec_ngram_max, spec_ngram_min, spec_k);
+                for (int dt : draft) batch_toks.push_back(dt);
+                n_draft = static_cast<int>(draft.size());
+            }
         }
         const int n_tokens = static_cast<int>(batch_toks.size());
         step_timings.token_steps = n_tokens;
@@ -3273,6 +3389,72 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        // Speculative verification: the block was [last_sampled, draft_1..draft_k]
+        // (k=n_draft). Score all n_tokens rows at once (one batched logits launch),
+        // then greedily accept the longest draft prefix whose argmax matches. Commit
+        // matched+1 tokens (accepted drafts + one bonus/correction). `pos += n_tokens`
+        // above over-counted by the rejected drafts, so roll it back to
+        // old_pos + 1 + matched (= committed length). KV for rejected positions is
+        // overwritten next step (attention never reads past the new query positions).
+        if (n_draft > 0) {
+            std::vector<float> spec_logits(static_cast<size_t>(n_tokens) * vocab_size, 0.0f);
+            {
+                ScopedTimer t(step_timings.logits_ms);
+                compute_logits_rows(inp_norm.data(), n_tokens, logits_w, spec_logits.data(),
+                                    vocab_size, hidden_size, weight_cache, *backend);
+            }
+            backend->sync();
+
+            auto row_argmax = [&](int r) -> int {
+                const float* row = spec_logits.data() + static_cast<size_t>(r) * vocab_size;
+                int best = 0;
+                float bv = row[0];
+                for (int v = 1; v < vocab_size; v++)
+                    if (row[v] > bv) { bv = row[v]; best = v; }
+                return best;
+            };
+
+            // cand[r] = greedy token predicted from row r (fed token at pos+r).
+            // Accept draft batch_toks[matched+1] while it equals cand[matched].
+            int matched = 0;
+            std::vector<int> committed;
+            committed.reserve(static_cast<size_t>(n_draft) + 1);
+            while (true) {
+                int c = row_argmax(matched);
+                committed.push_back(c);  // new token at old_pos + matched + 1
+                if (matched < n_draft && c == batch_toks[matched + 1]) {
+                    matched++;           // draft accepted; verify the next one
+                } else {
+                    break;               // mismatch or drafts exhausted -> bonus token
+                }
+            }
+
+            pos -= (n_draft - matched);  // discard rejected draft positions
+
+            spec_steps++;
+            spec_proposed += n_draft;
+            spec_accepted += matched;
+
+            bool stop = false;
+            for (int c : committed) {
+                std::cout << tokenizer.decode(c);
+                std::cout.flush();
+                first_token = false;
+                seq.push_back(c);
+                last_sampled = c;
+                generated++;
+                if (c == tokenizer.eos_token_id()) { stop = true; break; }
+                if (pos >= ctx_size) { stop = true; break; }
+                if (generated >= params.max_tokens) { stop = true; break; }
+            }
+
+            if (params.verbose) {
+                total_timings.add(step_timings);
+            }
+            if (stop) break;
+            continue;
+        }
+
         // Logits: only the last token's row feeds sampling (batched prefill
         // computed n_tokens rows in inp_norm; we sample the next token from the
         // final prompt position). NPU INT8 mul_mat_q (cached decode) with CPU fallback.
@@ -3326,6 +3508,7 @@ int main(int argc, char* argv[]) {
         std::cout.flush();
 
         last_sampled = next_token;
+        seq.push_back(next_token);
         generated++;
 
         if (next_token == tokenizer.eos_token_id()) break;
@@ -3337,6 +3520,13 @@ int main(int argc, char* argv[]) {
     }
 
     info << "\n\nGenerated " << generated << " tokens.\n";
+    if (spec_debug && spec_steps > 0) {
+        info << "Speculative: " << spec_steps << " steps, "
+             << spec_accepted << "/" << spec_proposed << " drafts accepted ("
+             << (100.0 * spec_accepted / std::max(1L, spec_proposed)) << "%), "
+             << (static_cast<double>(generated) / spec_steps)
+             << " tokens/step (vs 1.0 baseline)\n";
+    }
 
     if (params.verbose) {
         total_timings.print_summary();
