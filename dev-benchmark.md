@@ -13,6 +13,35 @@ Hardware unless noted: AMD Ryzen AI 7 350 (Krackan / XDNA2 / `npu6`),
 
 ---
 
+## 2026-07-06 — Widen-N decode matmul (kWideN=512): ~10% off decode matmul
+
+Decode is device-bound on INT8 matmul kernel execution (confirmed after the
+A-pack hoist removed the 39% host pack, which had been hidden behind kernel
+execution — per-tile total barely moved). At M<=16 the AIE array's M lanes are
+mostly idle, so the array is partly fill/drain-latency-bound; a wider N tile per
+launch rides that latency for near-free extra output and halves the launch count.
+
+Built `matmul_small_m_deepk_wide` (M=16, N=512, K=2048) via Triton-XDNA (same
+transform as small_m/deep-K; toolchain needs build-kernels.sh's LD_LIBRARY_PATH
+for the in-repo boost-lib — `xclbinutil` links libboost_filesystem.so.1.90.0).
+Added host routing: N-tile width is now a runtime value (kWideN when N%512==0 on
+the deep-K path, else 256). Default-on; disable with GGNPU_NO_WIDEN_N.
+
+**Result (Llama-1B Q4_K_M, `-p "The capital of France is" -n 32 -c 512 --temp 0`):**
+
+| Path | decode matmul | total (37 steps) | Δ |
+|------|---------------|------------------|---|
+| GGNPU_NO_WIDEN_N (N=256) | 8167 ms | 10984 ms | baseline |
+| default (N=512 widen) | 7327 ms | 10121 ms | **matmul −10.3%, total −7.9% (~+8.5% tok/s)** |
+
+**N sweep:** N=256 → 8072 ms, **N=512 → 7305 ms (best)**, N=1024 → 8363 ms
+(regresses — array becomes N-throughput-bound + larger DMA, and fewer matmuls
+are N%1024==0). So 512 is the sweet spot. Logits (vocab N=128256, not %512)
+stays on the N=256 path.
+
+Correctness unchanged across every arch (all still greedy-correct → "Paris"):
+Llama-1B, Qwen3.5-4B/Qwen3-0.6B, Gemma-4-E2B (K=1536), LFM2.5-230M, Ministral-3-3B.
+
 ## 2026-07-06 — qwen35 (Qwen3.5 Gated DeltaNet) now correct on Q6_K (head-mapping fix)
 
 `qwen35` hybrid SSM+attention was the last `models/` architecture producing

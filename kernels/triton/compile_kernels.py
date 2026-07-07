@@ -64,6 +64,18 @@ KERNELS = {
         "defaults": {"M": 16, "N": 256, "K": 2048},
         "transform": "matmul_small_m_aie2p.mlir",
     },
+    "matmul_small_m_deepk_wide": {
+        # Widen-N decode matmul: identical to matmul_small_m_deepk (M=16, K=2048)
+        # but with a wider N tile (512) per launch. At M<=16 the AIE array's M
+        # lanes are mostly idle, so a wider N amortizes the fixed array fill/drain
+        # latency over more useful output and halves the launch count. Measured
+        # ~9.5% off Llama-1B decode matmul; N=1024 regressed (array becomes
+        # N-throughput-bound). Same transform/datapath as small_m; only N grows.
+        "description": "INT8 matmul, small M + deep K=2048 + wide N=512 (decode)",
+        "params": ["M", "N", "K"],
+        "defaults": {"M": 16, "N": 512, "K": 2048},
+        "transform": "matmul_small_m_aie2p.mlir",
+    },
     "matmul_bf16": {
         # bf16 A@B -> f32 C, reusing the int8 matmul transform with the contract
         # casts changed to bf16/f32 (16-bit packing is shared). Feasibility probe

@@ -54,6 +54,12 @@ constexpr int kSmallMTile = 16;
 // exact-multiple-only condition rejected entirely, falling back to 6 plain
 // 256-K-tile launches each.
 constexpr int kDeepK = 2048;
+// Widen-N decode matmul: the deep-K small-M kernel recompiled with a wider N
+// tile (matmul_small_m_deepk_wide, M=16 N=kWideN K=kDeepK). At M<=16 the AIE
+// array's M lanes are mostly idle, so a wider N per launch amortizes the fixed
+// array fill/drain latency over more useful output and halves the launch count.
+// Opt-in via GGNPU_WIDEN_N; requires N % kWideN == 0.
+constexpr int kWideN = 512;
 // Prebuilt rmsnorm xclbin is M=1,N=2048 bf16 (Llama 3.2 hidden). Legacy 32x256
 // xclbins still work for N=256 bench sizes; rebuild with compile_kernels.py for 2048.
 constexpr int kRmsnormKernelCols = 256;
@@ -529,10 +535,24 @@ public:
             deepk_span = kDeepK;
         }
         const bool use_deepk = deepk_span != 0;
-        CachedMatmulKernel& active_kernel = use_deepk ? matmul_deepk_kernels_.at(deepk_span)
-                                            : use_small_m ? matmul_small_m_kernel_ : kernel;
+        // Widen-N: on the deep-K decode path the AIE array is M-latency-bound at
+        // M<=16 (only 16/256 of its M lanes carry real rows), so a wider N tile
+        // per launch rides the array's fill/drain latency for near-free extra
+        // output, halving the launch count. Measured ~9.5% off decode matmul on
+        // Llama-1B at kWideN=512 (1024 regressed — array becomes N-throughput-
+        // bound + larger DMA). Default-on; disable with GGNPU_NO_WIDEN_N. Requires
+        // the matmul_small_m_deepk_wide xclbin (M=16,N=kWideN,K=kDeepK) and N a
+        // multiple of kWideN (else falls back to the 256-N deep-K path — e.g. the
+        // logits projection whose vocab N is not a multiple of 512).
+        const bool use_widen = use_deepk && std::getenv("GGNPU_NO_WIDEN_N") == nullptr &&
+                               (N % kWideN == 0) && ensure_matmul_deepk_wide_kernel();
+        CachedMatmulKernel& active_kernel =
+            use_widen ? matmul_deepk_wide_kernel_
+            : use_deepk ? matmul_deepk_kernels_.at(deepk_span)
+            : use_small_m ? matmul_small_m_kernel_ : kernel;
         std::vector<MatmulPipelineSlot>& slots =
-            use_deepk ? matmul_deepk_slots_[deepk_span]
+            use_widen ? matmul_deepk_wide_slots_
+            : use_deepk ? matmul_deepk_slots_[deepk_span]
             : use_small_m ? matmul_small_m_slots_ : matmul_slots_;
         const int T_m = use_small_m ? kSmallMTile : kMatmulTile;
         const int T_k = use_deepk ? deepk_span : kMatmulTile;  // K extent per launch
@@ -544,7 +564,8 @@ public:
             return last_status_;
         }
 
-        constexpr int T = kMatmulTile;  // N tile + C row width (output is M x N)
+        // N tile + C row width (output is M x N). kWideN on the widen-N path.
+        const int T = use_widen ? kWideN : kMatmulTile;
         // A is [T_m x T_k], B is [T_k x T], C is [T_m x T] (int32). For the 256^3
         // and 256-K small-M paths T_k == T so these are all 256*256.
         size_t tile_bytes_a = static_cast<size_t>(T_m) * T_k;               // int8
@@ -2302,6 +2323,42 @@ private:
         }
     }
 
+    // Lazily load the widen-N deep-K decode matmul (M=kSmallMTile, N=kWideN,
+    // K=kDeepK) from matmul_small_m_deepk_wide_<profile>.xclbin. Returns false
+    // (cached) when absent so callers fall back to the N=256 deep-K path.
+    bool ensure_matmul_deepk_wide_kernel() {
+        if (matmul_deepk_wide_kernel_.bo_instr && matmul_deepk_wide_kernel_.instr_words) return true;
+        if (matmul_deepk_wide_unavailable_) return false;
+        std::string name = "matmul_small_m_deepk_wide_" + profile_str_ + ".xclbin";
+        std::string path = detail::find_prebuilt_xclbin(name, cache_dir_);
+        if (path.empty() && cache_->has_xclbin(name)) path = cache_->get_xclbin_path(name);
+        if (path.empty()) { matmul_deepk_wide_unavailable_ = true; return false; }
+        try {
+            auto data = detail::load_xclbin_file(path);
+            if (data.empty()) { matmul_deepk_wide_unavailable_ = true; return false; }
+            xrt::hw_context ctx = register_xclbin_from_data(*device_, data);
+            matmul_shape_ctxs_.push_back(ctx);  // keep context alive
+            xrt::kernel krnl(ctx, kTritonXdnaKernelName);
+            CachedMatmulKernel cached{std::move(krnl), {}, 0,
+                                      kSmallMTile, kWideN, kDeepK, GgmlType::I8};
+            std::string seq = detail::find_prebuilt_sequence(name, cache_dir_);
+            if (!seq.empty()) {
+                load_instr_bo(*device_, cached.krnl, cached.bo_instr, cached.instr_words, seq);
+            }
+            if (!cached.bo_instr || cached.instr_words == 0) {
+                std::cerr << "Error: matmul_small_m_deepk_wide xclbin missing instruction sequence\n";
+                matmul_deepk_wide_unavailable_ = true;
+                return false;
+            }
+            matmul_deepk_wide_kernel_ = std::move(cached);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: failed to load matmul_small_m_deepk_wide kernel: " << e.what() << "\n";
+            matmul_deepk_wide_unavailable_ = true;
+            return false;
+        }
+    }
+
     // Load or compile the rmsnorm xclbin (prefer Llama-shaped rmsnorm_2048 when present).
     bool load_rmsnorm_xclbin() {
         std::string shaped_name = "rmsnorm_2048_" + profile_str_ + ".xclbin";
@@ -2974,6 +3031,14 @@ private:
     std::unordered_map<int, CachedMatmulKernel> matmul_deepk_kernels_;
     std::unordered_set<int> matmul_deepk_unavailable_;
     std::unordered_map<int, std::vector<MatmulPipelineSlot>> matmul_deepk_slots_;
+
+    // Widen-N deep-K decode matmul (M=16, N=kWideN, K=kDeepK): wider N tile than
+    // the N=256 deep-K kernel to amortize AIE array fill/drain latency at small M.
+    // Loaded from matmul_small_m_deepk_wide_<profile>.xclbin; own pipeline slots
+    // (buffer sizes depend on the wider N). Opt-in via GGNPU_WIDEN_N.
+    CachedMatmulKernel matmul_deepk_wide_kernel_;
+    bool matmul_deepk_wide_unavailable_ = false;
+    std::vector<MatmulPipelineSlot> matmul_deepk_wide_slots_;
 
     // Resident packed-weight device BOs for the INT8 matmul path. A weight tile
     // never changes across tokens, so once packed into a device BO we bind that

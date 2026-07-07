@@ -211,6 +211,7 @@ Kernels=(
     "matmul:--M 256 --N 256 --K 256"
     "matmul_small_m:--M 16 --N 256 --K 256"
     "matmul_small_m_deepk:--M 16 --N 256 --K 2048"
+    "matmul_small_m_deepk_wide:--M 16 --N 512 --K 2048"
     "rmsnorm:--M 32 --N 256"
     "rmsnorm_256:--M 2 --N 256"
     "rmsnorm_512:--M 2 --N 512"
