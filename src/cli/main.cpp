@@ -2163,18 +2163,17 @@ int main(int argc, char* argv[]) {
         step_timings = InferenceTimings();
         step_timings.token_steps = 1;
 
-        // Prefill batching: the generic transformer path (not gemma/lfm2/qwen35,
-        // which have their own single-token forward branches) processes all
-        // remaining prompt tokens in one M=n_tokens forward pass instead of one
-        // M=1 pass per token. This uses the 256-M matmul kernel (full array) for
-        // the prompt's Q/K/V/O/FFN projections — far fewer, fatter launches —
-        // cutting time-to-first-token. Decode (post-prompt) stays M=1. Chunked at
-        // kPrefillChunk so M stays within one matmul M-tile.
+        // Prefill batching: the generic transformer path and gemma4 (not lfm2/
+        // qwen35, whose ShortConv/DeltaNet blocks are sequential state recurrences)
+        // process all remaining prompt tokens in one M=n_tokens forward pass
+        // instead of one M=1 pass per token. This uses the 256-M matmul kernel
+        // (full array) for the prompt's Q/K/V/O/FFN (+ gemma PLE) projections — far
+        // fewer, fatter launches — cutting time-to-first-token. Decode (post-prompt)
+        // stays M=1. Chunked at kPrefillChunk so M stays within one matmul M-tile.
         constexpr int kPrefillChunk = 256;
-        const bool batch_prefill = !is_gemma && !is_lfm2 && !is_qwen35 &&
+        const bool batch_prefill = !is_lfm2 && !is_qwen35 &&
                                    std::getenv("GGNPU_NO_PREFILL_BATCH") == nullptr;
         std::vector<int> batch_toks;
-        int tok = 0;
         bool do_sample = false;
         if (prompt_idx < input_tokens.size()) {
             const int remaining = static_cast<int>(input_tokens.size()) - static_cast<int>(prompt_idx);
@@ -2188,8 +2187,6 @@ int main(int argc, char* argv[]) {
             batch_toks.push_back(last_sampled);
             do_sample = true;
         }
-        tok = batch_toks[0];  // single-token branches (gemma/lfm2/qwen35) use this
-
         const int n_tokens = static_cast<int>(batch_toks.size());
         step_timings.token_steps = n_tokens;
 
@@ -2218,41 +2215,51 @@ int main(int argc, char* argv[]) {
 
         // ---- Gemma 4 forward ----
         if (is_gemma) {
-            for (int i = 0; i < hidden_size; i++) inp_embd[i] *= gemma_embd_scale;
+            // Scale every batched token's embedding row (n_tokens==1 in decode).
+            for (int bt = 0; bt < n_tokens; bt++) {
+                float* row = inp_embd.data() + static_cast<size_t>(bt) * hidden_size;
+                for (int i = 0; i < hidden_size; i++) row[i] *= gemma_embd_scale;
+            }
 
-            // Per-Layer Embeddings (PLE, G3): build one ple_dim vector per layer.
+            // Per-Layer Embeddings (PLE, G3): build one ple_dim vector per layer,
+            // per batched token.
             //   token-identity: per_layer_token_embd[tok] * sqrt(ple_dim)
             //   context-aware:  RMSNorm(per_layer_model_proj(embed) / sqrt(hidden))
             //   combined:       (token + context) / sqrt(2)
             const int ple_dim = gemma_ple_dim;
             const int ple_total = num_layers * ple_dim;
-            std::vector<float> pli(static_cast<size_t>(ple_total), 0.0f);
-            std::vector<float> pgate(static_cast<size_t>(ple_dim), 0.0f);
-            std::vector<float> inj(hidden_size, 0.0f);
+            // pli is [n_tokens][ple_total]; pgate/inj are per-token working buffers.
+            std::vector<float> pli(static_cast<size_t>(n_tokens) * ple_total, 0.0f);
+            std::vector<float> pgate, inj;
             {
-                std::vector<float> ple_tok(static_cast<size_t>(ple_total), 0.0f);
-                dequant_tensor_row(ple_tok_embd, tok, ple_tok.data(), ple_total);
-                const float tok_scale = std::sqrt(static_cast<float>(ple_dim));
-
-                std::vector<float> ple_ctx(static_cast<size_t>(ple_total), 0.0f);
+                // Context-aware projection batched over all rows: [n_tokens][ple_total].
+                std::vector<float> ple_ctx(static_cast<size_t>(n_tokens) * ple_total, 0.0f);
                 mul_mat_weight(inp_embd.data(), ple_model_proj, ple_ctx.data(),
-                               1, ple_total, hidden_size, hidden_size, ple_total, ple_total,
+                               n_tokens, ple_total, hidden_size, hidden_size, ple_total, ple_total,
                                params.verbose ? &step_timings.matmul_ms : nullptr);
                 backend->sync();
                 const float ctx_scale = 1.0f / std::sqrt(static_cast<float>(hidden_size));
-                const float* plpn = get_float_ptr(ple_proj_norm);
-                for (int L = 0; L < num_layers; L++) {
-                    float* slice = ple_ctx.data() + static_cast<size_t>(L) * ple_dim;
-                    for (int i = 0; i < ple_dim; i++) slice[i] *= ctx_scale;
-                    if (!g_rmsnorm(slice, slice, ple_dim, plpn, rms_eps)) return 1;
-                }
+                const float tok_scale = std::sqrt(static_cast<float>(ple_dim));
                 const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
-                for (int i = 0; i < ple_total; i++)
-                    pli[i] = (ple_tok[i] * tok_scale + ple_ctx[i]) * inv_sqrt2;
+                const float* plpn = get_float_ptr(ple_proj_norm);
+                std::vector<float> ple_tok(static_cast<size_t>(ple_total), 0.0f);
+                for (int bt = 0; bt < n_tokens; bt++) {
+                    dequant_tensor_row(ple_tok_embd, batch_toks[bt], ple_tok.data(), ple_total);
+                    float* ctx_row = ple_ctx.data() + static_cast<size_t>(bt) * ple_total;
+                    float* pli_row = pli.data() + static_cast<size_t>(bt) * ple_total;
+                    for (int L = 0; L < num_layers; L++) {
+                        float* slice = ctx_row + static_cast<size_t>(L) * ple_dim;
+                        for (int i = 0; i < ple_dim; i++) slice[i] *= ctx_scale;
+                        if (!g_rmsnorm(slice, slice, ple_dim, plpn, rms_eps)) return 1;
+                    }
+                    for (int i = 0; i < ple_total; i++)
+                        pli_row[i] = (ple_tok[i] * tok_scale + ctx_row[i]) * inv_sqrt2;
+                }
             }
 
-            std::vector<float> xn(hidden_size), q, kbuf, vbuf, attn_in, attn_o(hidden_size);
-            std::vector<float> gate, up, act, dn(hidden_size), kexp, vexp;
+            // Per-token working buffers (sized per layer; qdim/ffn vary by layer).
+            std::vector<float> xn, q, kbuf, vbuf, attn_in, attn_o;
+            std::vector<float> gate, up, act, dn, kexp, vexp;
 
             for (int L = 0; L < max_layers_override; L++) {
                 const GemmaLayer& gl = gplan[L];
@@ -2270,12 +2277,16 @@ int main(int argc, char* argv[]) {
                 const TensorView* down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", L);
                 const TensorView* postffw_w = find_tensor_pattern(model, "blk.{layer}.post_ffw_norm.weight", L);
 
-                // Attention input norm.
-                if (!g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(attn_norm_w), rms_eps)) return 1;
+                // Attention input norm (per row).
+                xn.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+                for (int bt = 0; bt < n_tokens; bt++)
+                    if (!g_rmsnorm(xn.data() + static_cast<size_t>(bt) * hidden_size,
+                                   inp_embd.data() + static_cast<size_t>(bt) * hidden_size,
+                                   hidden_size, get_float_ptr(attn_norm_w), rms_eps)) return 1;
 
-                // Q projection -> per-head QK-norm -> RoPE.
-                q.assign(qdim, 0.0f);
-                mul_mat_weight(xn.data(), q_w, q.data(), 1, qdim, hidden_size, hidden_size, qdim, qdim,
+                // Q projection (M=n_tokens) -> per-token per-head QK-norm -> RoPE.
+                q.assign(static_cast<size_t>(n_tokens) * qdim, 0.0f);
+                mul_mat_weight(xn.data(), q_w, q.data(), n_tokens, qdim, hidden_size, hidden_size, qdim, qdim,
                                params.verbose ? &step_timings.matmul_ms : nullptr);
                 backend->sync();
 
@@ -2311,137 +2322,175 @@ int main(int argc, char* argv[]) {
                               << "  |pli_L0|=" << l2v(pli.data(), ple_dim) << "\n";
                 }
 
-                for (int h = 0; h < num_heads; h++)
-                    if (!g_rmsnorm(q.data() + h * hd, q.data() + h * hd, hd, get_float_ptr(qn_w), rms_eps)) return 1;
-                if (!g_rope(q.data(), num_heads, hd, pos, gl.rope_base)) return 1;
                 // Gemma4 attention scale is 1.0 (f_attention_scale); the host
                 // flash_attn bakes in 1/sqrt(head_dim), so pre-scale Q by sqrt(hd)
                 // to cancel it back to an effective scale of 1.0.
                 {
                     const float qs = std::sqrt(static_cast<float>(hd));
-                    for (int i = 0; i < qdim; i++) q[i] *= qs;
+                    for (int bt = 0; bt < n_tokens; bt++) {
+                        float* qrow = q.data() + static_cast<size_t>(bt) * qdim;
+                        for (int h = 0; h < num_heads; h++)
+                            if (!g_rmsnorm(qrow + h * hd, qrow + h * hd, hd, get_float_ptr(qn_w), rms_eps)) return 1;
+                        // Each batched token carries its own absolute position (pos + bt).
+                        if (!g_rope(qrow, num_heads, hd, pos + bt, gl.rope_base)) return 1;
+                        for (int i = 0; i < qdim; i++) qrow[i] *= qs;
+                    }
                 }
 
-                // K/V: compute + append if this layer owns them, else reuse the source layer's store.
+                // K/V: compute + append if this layer owns them, else reuse the
+                // source layer's store. All n_tokens positions are appended (in
+                // order) before attention, so each query sees only its own prefix.
                 if (gl.kv_src == L) {
                     const TensorView* k_w = find_tensor_pattern(model, "blk.{layer}.attn_k.weight", L);
                     const TensorView* v_w = find_tensor_pattern(model, "blk.{layer}.attn_v.weight", L);
                     const TensorView* kn_w = find_tensor_pattern(model, "blk.{layer}.attn_k_norm.weight", L);
-                    kbuf.assign(hd, 0.0f);
-                    vbuf.assign(hd, 0.0f);
-                    mul_mat_weight(xn.data(), k_w, kbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd,
+                    kbuf.assign(static_cast<size_t>(n_tokens) * hd, 0.0f);
+                    vbuf.assign(static_cast<size_t>(n_tokens) * hd, 0.0f);
+                    mul_mat_weight(xn.data(), k_w, kbuf.data(), n_tokens, hd, hidden_size, hidden_size, hd, hd,
                                    params.verbose ? &step_timings.matmul_ms : nullptr);
-                    mul_mat_weight(xn.data(), v_w, vbuf.data(), 1, hd, hidden_size, hidden_size, hd, hd,
+                    mul_mat_weight(xn.data(), v_w, vbuf.data(), n_tokens, hd, hidden_size, hidden_size, hd, hd,
                                    params.verbose ? &step_timings.matmul_ms : nullptr);
                     backend->sync();
-                    // K: RMSNorm with attn_k_norm weight, then RoPE.
-                    if (!g_rmsnorm(kbuf.data(), kbuf.data(), hd, get_float_ptr(kn_w), rms_eps)) return 1;
-                    if (!g_rope(kbuf.data(), 1, hd, pos, gl.rope_base)) return 1;
-                    // V: plain RMSNorm (no weight, no RoPE) — Vcur = ggml_rms_norm(Vcur, eps).
-                    if (!g_rmsnorm(vbuf.data(), vbuf.data(), hd, nullptr, rms_eps)) return 1;
-                    gk_store[L].insert(gk_store[L].end(), kbuf.begin(), kbuf.end());
-                    gv_store[L].insert(gv_store[L].end(), vbuf.begin(), vbuf.end());
+                    for (int bt = 0; bt < n_tokens; bt++) {
+                        float* kr = kbuf.data() + static_cast<size_t>(bt) * hd;
+                        float* vr = vbuf.data() + static_cast<size_t>(bt) * hd;
+                        // K: RMSNorm with attn_k_norm weight, then RoPE (own position).
+                        if (!g_rmsnorm(kr, kr, hd, get_float_ptr(kn_w), rms_eps)) return 1;
+                        if (!g_rope(kr, 1, hd, pos + bt, gl.rope_base)) return 1;
+                        // V: plain RMSNorm (no weight, no RoPE) — Vcur = ggml_rms_norm(Vcur, eps).
+                        if (!g_rmsnorm(vr, vr, hd, nullptr, rms_eps)) return 1;
+                        gk_store[L].insert(gk_store[L].end(), kr, kr + hd);
+                        gv_store[L].insert(gv_store[L].end(), vr, vr + hd);
+                    }
                 }
 
                 const int src = gl.kv_src;
-                // Sliding-window attention on local layers: attend only to keys k
-                // with pos - k < n_swa. Slice the KV store to [k0..pos]; global
-                // layers keep the full context. Passing the sliced window keeps the
-                // host flash_attn's plain causal mask correct (query is last).
-                int64_t k0 = 0;
-                if (gl.is_swa && gemma_swa_window > 0)
-                    k0 = std::max<int64_t>(0, (pos + 1) - gemma_swa_window);
-                const int64_t ctx_len = (pos + 1) - k0;
-                // Broadcast the single KV head to all query heads (num_kv_heads=1).
-                kexp.assign(static_cast<size_t>(num_heads) * ctx_len * hd, 0.0f);
-                vexp.assign(static_cast<size_t>(num_heads) * ctx_len * hd, 0.0f);
                 const std::vector<float>& ks = gk_store[src];
                 const std::vector<float>& vs = gv_store[src];
-                {
-                    std::unique_ptr<ScopedTimer> t;
-                    if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.kv_expand_ms);
-                    for (int h = 0; h < num_heads; h++) {
-                        for (int64_t j = 0; j < ctx_len; j++) {
-                            std::memcpy(kexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
-                                        ks.data() + static_cast<size_t>(k0 + j) * hd, hd * sizeof(float));
-                            std::memcpy(vexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
-                                        vs.data() + static_cast<size_t>(k0 + j) * hd, hd * sizeof(float));
+
+                // Causal attention: one call per query token over its own (possibly
+                // sliding-window) causal prefix. Query at position p=pos+bt attends
+                // keys [k0..p]; SWA local layers window k0 = p+1-n_swa, global layers
+                // keep k0=0. The KV store now holds this batch's later positions too,
+                // but each query slices only up to its own p, so they stay masked.
+                attn_in.assign(static_cast<size_t>(n_tokens) * qdim, 0.0f);
+                for (int bt = 0; bt < n_tokens; bt++) {
+                    const int64_t p = pos + bt;
+                    int64_t k0 = 0;
+                    if (gl.is_swa && gemma_swa_window > 0)
+                        k0 = std::max<int64_t>(0, (p + 1) - gemma_swa_window);
+                    const int64_t ctx_len = (p + 1) - k0;
+                    // Broadcast the single KV head to all query heads (num_kv_heads=1).
+                    kexp.assign(static_cast<size_t>(num_heads) * ctx_len * hd, 0.0f);
+                    vexp.assign(static_cast<size_t>(num_heads) * ctx_len * hd, 0.0f);
+                    {
+                        std::unique_ptr<ScopedTimer> t;
+                        if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.kv_expand_ms);
+                        for (int h = 0; h < num_heads; h++) {
+                            for (int64_t j = 0; j < ctx_len; j++) {
+                                std::memcpy(kexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
+                                            ks.data() + static_cast<size_t>(k0 + j) * hd, hd * sizeof(float));
+                                std::memcpy(vexp.data() + (static_cast<size_t>(h) * ctx_len + j) * hd,
+                                            vs.data() + static_cast<size_t>(k0 + j) * hd, hd * sizeof(float));
+                            }
+                        }
+                    }
+                    AttnParams fa;
+                    fa.Q = q.data() + static_cast<size_t>(bt) * qdim;
+                    fa.K = kexp.data();
+                    fa.V = vexp.data();
+                    fa.output = attn_in.data() + static_cast<size_t>(bt) * qdim;
+                    fa.batch_size = 1;
+                    fa.n_head = num_heads;
+                    fa.head_dim = hd;
+                    fa.ctx_len = ctx_len;
+                    fa.query_pos = ctx_len - 1;  // query is the last (newest) key in the slice
+                    fa.freq_factors = nullptr;
+                    {
+                        std::unique_ptr<ScopedTimer> t;
+                        if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.flash_attn_ms);
+                        if (backend->flash_attn(fa) != Status::OK) {
+                            std::cerr << "Error: gemma flash_attn failed at layer " << L << "\n";
+                            model.unload();
+                            return 1;
                         }
                     }
                 }
 
-                // Causal attention (host f32) over the (possibly windowed) keys.
-                attn_in.assign(qdim, 0.0f);
-                AttnParams fa;
-                fa.Q = q.data();
-                fa.K = kexp.data();
-                fa.V = vexp.data();
-                fa.output = attn_in.data();
-                fa.batch_size = 1;
-                fa.n_head = num_heads;
-                fa.head_dim = hd;
-                fa.ctx_len = ctx_len;
-                fa.query_pos = ctx_len - 1;  // query is the last (newest) key in the slice
-                fa.freq_factors = nullptr;
-                {
-                    std::unique_ptr<ScopedTimer> t;
-                    if (params.verbose) t = std::make_unique<ScopedTimer>(step_timings.flash_attn_ms);
-                    if (backend->flash_attn(fa) != Status::OK) {
-                        std::cerr << "Error: gemma flash_attn failed at layer " << L << "\n";
-                        model.unload();
-                        return 1;
-                    }
+                // Output projection (M=n_tokens) -> post-attention norm -> residual.
+                attn_o.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+                mul_mat_weight(attn_in.data(), o_w, attn_o.data(), n_tokens, hidden_size, qdim, qdim, hidden_size, hidden_size,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
+                backend->sync();
+                for (int bt = 0; bt < n_tokens; bt++) {
+                    float* ao = attn_o.data() + static_cast<size_t>(bt) * hidden_size;
+                    if (!g_rmsnorm(ao, ao, hidden_size, get_float_ptr(postattn_w), rms_eps)) return 1;
+                    float* h = inp_embd.data() + static_cast<size_t>(bt) * hidden_size;
+                    for (int i = 0; i < hidden_size; i++) h[i] += ao[i];
                 }
 
-                // Output projection -> post-attention norm -> residual.
-                attn_o.assign(hidden_size, 0.0f);
-                mul_mat_weight(attn_in.data(), o_w, attn_o.data(), 1, hidden_size, qdim, qdim, hidden_size, hidden_size,
-                               params.verbose ? &step_timings.matmul_ms : nullptr);
-                backend->sync();
-                if (!g_rmsnorm(attn_o.data(), attn_o.data(), hidden_size, get_float_ptr(postattn_w), rms_eps)) return 1;
-                for (int i = 0; i < hidden_size; i++) inp_embd[i] += attn_o[i];
-
                 // FFN: pre-norm -> GeGLU -> down -> post-FFN norm -> residual.
-                if (!g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(ffnnorm_w), rms_eps)) return 1;
                 const int ffn = gl.ffn;
-                gate.assign(ffn, 0.0f);
-                up.assign(ffn, 0.0f);
-                mul_mat_weight(xn.data(), gate_w, gate.data(), 1, ffn, hidden_size, hidden_size, ffn, ffn,
+                xn.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+                for (int bt = 0; bt < n_tokens; bt++)
+                    if (!g_rmsnorm(xn.data() + static_cast<size_t>(bt) * hidden_size,
+                                   inp_embd.data() + static_cast<size_t>(bt) * hidden_size,
+                                   hidden_size, get_float_ptr(ffnnorm_w), rms_eps)) return 1;
+                gate.assign(static_cast<size_t>(n_tokens) * ffn, 0.0f);
+                up.assign(static_cast<size_t>(n_tokens) * ffn, 0.0f);
+                mul_mat_weight(xn.data(), gate_w, gate.data(), n_tokens, ffn, hidden_size, hidden_size, ffn, ffn,
                                params.verbose ? &step_timings.matmul_ms : nullptr);
-                mul_mat_weight(xn.data(), up_w, up.data(), 1, ffn, hidden_size, hidden_size, ffn, ffn,
-                               params.verbose ? &step_timings.matmul_ms : nullptr);
-                backend->sync();
-                act.assign(ffn, 0.0f);
-                if (!g_gelu(gate.data(), ffn)) return 1;
-                for (int i = 0; i < ffn; i++) act[i] = gate[i] * up[i];
-                dn.assign(hidden_size, 0.0f);
-                mul_mat_weight(act.data(), down_w, dn.data(), 1, hidden_size, ffn, ffn, hidden_size, hidden_size,
+                mul_mat_weight(xn.data(), up_w, up.data(), n_tokens, ffn, hidden_size, hidden_size, ffn, ffn,
                                params.verbose ? &step_timings.matmul_ms : nullptr);
                 backend->sync();
-                if (!g_rmsnorm(dn.data(), dn.data(), hidden_size, get_float_ptr(postffw_w), rms_eps)) return 1;
-                for (int i = 0; i < hidden_size; i++) inp_embd[i] += dn[i];
+                act.assign(static_cast<size_t>(n_tokens) * ffn, 0.0f);
+                for (int bt = 0; bt < n_tokens; bt++) {
+                    float* g = gate.data() + static_cast<size_t>(bt) * ffn;
+                    float* u = up.data() + static_cast<size_t>(bt) * ffn;
+                    float* a = act.data() + static_cast<size_t>(bt) * ffn;
+                    if (!g_gelu(g, ffn)) return 1;
+                    for (int i = 0; i < ffn; i++) a[i] = g[i] * u[i];
+                }
+                dn.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
+                mul_mat_weight(act.data(), down_w, dn.data(), n_tokens, hidden_size, ffn, ffn, hidden_size, hidden_size,
+                               params.verbose ? &step_timings.matmul_ms : nullptr);
+                backend->sync();
+                for (int bt = 0; bt < n_tokens; bt++) {
+                    float* d = dn.data() + static_cast<size_t>(bt) * hidden_size;
+                    if (!g_rmsnorm(d, d, hidden_size, get_float_ptr(postffw_w), rms_eps)) return 1;
+                    float* h = inp_embd.data() + static_cast<size_t>(bt) * hidden_size;
+                    for (int i = 0; i < hidden_size; i++) h[i] += d[i];
+                }
 
-                // Per-Layer Embedding injection (G3):
-                //   inj = post_norm( proj( gelu(inp_gate(h)) * pli[L] ) ); h += inj
+                // Per-Layer Embedding injection (G3), per token:
+                //   inj = post_norm( proj( gelu(inp_gate(h)) * pli[bt][L] ) ); h += inj
                 const TensorView* inpgate_w = find_tensor_pattern(model, "blk.{layer}.inp_gate.weight", L);
                 const TensorView* proj_w = find_tensor_pattern(model, "blk.{layer}.proj.weight", L);
                 const TensorView* postnorm_w = find_tensor_pattern(model, "blk.{layer}.post_norm.weight", L);
                 if (inpgate_w && proj_w && postnorm_w) {
-                    std::fill(pgate.begin(), pgate.end(), 0.0f);
+                    pgate.assign(static_cast<size_t>(n_tokens) * ple_dim, 0.0f);
                     mul_mat_weight(inp_embd.data(), inpgate_w, pgate.data(),
-                                   1, ple_dim, hidden_size, hidden_size, ple_dim, ple_dim,
+                                   n_tokens, ple_dim, hidden_size, hidden_size, ple_dim, ple_dim,
                                    params.verbose ? &step_timings.matmul_ms : nullptr);
                     backend->sync();
-                    const float* pli_L = pli.data() + static_cast<size_t>(L) * ple_dim;
-                    if (!g_gelu(pgate.data(), ple_dim)) return 1;
-                    for (int i = 0; i < ple_dim; i++) pgate[i] = pgate[i] * pli_L[i];
-                    std::fill(inj.begin(), inj.end(), 0.0f);
+                    for (int bt = 0; bt < n_tokens; bt++) {
+                        float* pg = pgate.data() + static_cast<size_t>(bt) * ple_dim;
+                        const float* pli_L = pli.data() + static_cast<size_t>(bt) * ple_total
+                                             + static_cast<size_t>(L) * ple_dim;
+                        if (!g_gelu(pg, ple_dim)) return 1;
+                        for (int i = 0; i < ple_dim; i++) pg[i] = pg[i] * pli_L[i];
+                    }
+                    inj.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
                     mul_mat_weight(pgate.data(), proj_w, inj.data(),
-                                   1, hidden_size, ple_dim, ple_dim, hidden_size, hidden_size,
+                                   n_tokens, hidden_size, ple_dim, ple_dim, hidden_size, hidden_size,
                                    params.verbose ? &step_timings.matmul_ms : nullptr);
                     backend->sync();
-                    if (!g_rmsnorm(inj.data(), inj.data(), hidden_size, get_float_ptr(postnorm_w), rms_eps)) return 1;
-                    for (int i = 0; i < hidden_size; i++) inp_embd[i] += inj[i];
+                    for (int bt = 0; bt < n_tokens; bt++) {
+                        float* ij = inj.data() + static_cast<size_t>(bt) * hidden_size;
+                        if (!g_rmsnorm(ij, ij, hidden_size, get_float_ptr(postnorm_w), rms_eps)) return 1;
+                        float* h = inp_embd.data() + static_cast<size_t>(bt) * hidden_size;
+                        for (int i = 0; i < hidden_size; i++) h[i] += ij[i];
+                    }
                 }
 
                 // Per-layer output scale: multiply the full hidden state (cur *= out_scale).
@@ -2449,13 +2498,19 @@ int main(int argc, char* argv[]) {
                 const TensorView* outscale_w = find_tensor_pattern(model, "blk.{layer}.layer_output_scale.weight", L);
                 if (outscale_w) {
                     const float os = get_float_ptr(outscale_w)[0];
-                    for (int i = 0; i < hidden_size; i++) inp_embd[i] *= os;
+                    for (int bt = 0; bt < n_tokens; bt++) {
+                        float* h = inp_embd.data() + static_cast<size_t>(bt) * hidden_size;
+                        for (int i = 0; i < hidden_size; i++) h[i] *= os;
+                    }
                 }
             }
 
-            // Final norm into inp_norm (fed to logits below).
+            // Final norm into inp_norm (per row; logits read the last token's row).
             const TensorView* out_norm_w = find_tensor(model, "output_norm.weight");
-            if (!g_rmsnorm(inp_norm.data(), inp_embd.data(), hidden_size, get_float_ptr(out_norm_w), rms_eps)) return 1;
+            for (int bt = 0; bt < n_tokens; bt++)
+                if (!g_rmsnorm(inp_norm.data() + static_cast<size_t>(bt) * hidden_size,
+                               inp_embd.data() + static_cast<size_t>(bt) * hidden_size,
+                               hidden_size, get_float_ptr(out_norm_w), rms_eps)) return 1;
         }
 
         // ---- LFM2 forward ----

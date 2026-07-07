@@ -337,3 +337,34 @@ logits projection (16%, itself a matmul). Attention/norms/activations are
 noise. Making this usable = making NPU matmul faster (and/or fewer
 host↔device round-trips per matmul). Flash-attn being on the host CPU is
 **not** the bottleneck.
+
+---
+
+## gemma4 prefill batching (2026-07-07)
+
+Extended prefill batching (previously generic-path only) to the **gemma4**
+forward (Gemma 3n E2B). The gemma block was a separate single-token path; it now
+processes all remaining prompt tokens in one M=n_tokens pass through embed-scale,
+PLE build, and every per-layer projection (Q/K/V/O, GeGLU FFN, PLE inp_gate/proj),
+while per-row ops (RMSNorm, QK-norm, RoPE at pos+bt, GeLU, per-query SWA attention)
+loop over the batch. Decode stays M=1. Opt out with `GGNPU_NO_PREFILL_BATCH=1`.
+lfm2/qwen35 remain per-token (ShortConv/DeltaNet are sequential recurrences).
+
+**A/B, `gemma-4-E2B-it-qat-UD-Q4_K_XL`, 39-token prompt + 1 token, `-v` totals:**
+
+| op        | batched (ms) | per-token (ms) | Δ      |
+|-----------|-------------:|---------------:|--------|
+| matmul    |      9353.3  |       18678.9  | −49.9% |
+| rms_norm  |      2341.3  |        3292.7  | −28.9% |
+| rope      |       989.7  |        1134.1  | −12.7% |
+| silu      |       746.9  |        1530.3  | −51.2% |
+| flash_attn|       330.0  |         493.0  | −33.1% |
+| logits    |      1514.8  |        1517.6  |  ~0    |
+| **total** |  **15283.8** |    **26661.1** | **−42.7% (TTFT)** |
+
+matmul (the device bottleneck) halves: the 256-M kernel runs the prompt's
+projections in n_tokens-wide passes instead of 39 separate M=1 launches. Greedy
+top-1 matches per-token on substantive completions ("...Japan is Tokyo.",
+"2+2? A: 4"); only degenerate post-answer `<turn|>` spam can differ by one token
+(int8 rounding between the 256-M prefill kernel and the M=1 decode kernel), same
+caveat as the generic path.
