@@ -573,7 +573,7 @@ def build_kernel_script(op: str, params: dict) -> str:
                 tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, c_block)
         """)
 
-    elif op in ("matmul_small_m", "matmul_small_m_deepk"):
+    elif op in ("matmul_small_m", "matmul_small_m_deepk", "matmul_small_m_deepk_wide"):
         # Same kernel body as matmul, but launched with a small BLOCK_SIZE_M so
         # the compute herd does less wasted M-row work for decode (M=1 padded
         # to BLOCK_SIZE_M). N/K block sizes stay 256 so the transform's L3->L2
