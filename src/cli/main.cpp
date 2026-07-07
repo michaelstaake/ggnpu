@@ -2163,19 +2163,35 @@ int main(int argc, char* argv[]) {
         step_timings = InferenceTimings();
         step_timings.token_steps = 1;
 
+        // Prefill batching: the generic transformer path (not gemma/lfm2/qwen35,
+        // which have their own single-token forward branches) processes all
+        // remaining prompt tokens in one M=n_tokens forward pass instead of one
+        // M=1 pass per token. This uses the 256-M matmul kernel (full array) for
+        // the prompt's Q/K/V/O/FFN projections — far fewer, fatter launches —
+        // cutting time-to-first-token. Decode (post-prompt) stays M=1. Chunked at
+        // kPrefillChunk so M stays within one matmul M-tile.
+        constexpr int kPrefillChunk = 256;
+        const bool batch_prefill = !is_gemma && !is_lfm2 && !is_qwen35 &&
+                                   std::getenv("GGNPU_NO_PREFILL_BATCH") == nullptr;
+        std::vector<int> batch_toks;
         int tok = 0;
         bool do_sample = false;
         if (prompt_idx < input_tokens.size()) {
-            tok = input_tokens[prompt_idx++];
+            const int remaining = static_cast<int>(input_tokens.size()) - static_cast<int>(prompt_idx);
+            const int chunk = batch_prefill ? std::min(remaining, kPrefillChunk) : 1;
+            for (int i = 0; i < chunk; i++) batch_toks.push_back(input_tokens[prompt_idx + i]);
+            prompt_idx += chunk;
             do_sample = (prompt_idx >= input_tokens.size());
         } else if (params.bench_logits) {
             break;
         } else {
-            tok = last_sampled;
+            batch_toks.push_back(last_sampled);
             do_sample = true;
         }
+        tok = batch_toks[0];  // single-token branches (gemma/lfm2/qwen35) use this
 
-        const int n_tokens = 1;
+        const int n_tokens = static_cast<int>(batch_toks.size());
+        step_timings.token_steps = n_tokens;
 
         inp_embd.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
         inp_norm.assign(static_cast<size_t>(n_tokens) * hidden_size, 0.0f);
@@ -2192,7 +2208,12 @@ int main(int argc, char* argv[]) {
 
         {
             ScopedTimer t(step_timings.embed_ms);
-            dequant_tensor_row(tok_embd, tok, inp_embd.data(), hidden_size);
+            // Embed each batched token into its own row (n_tokens==1 for the
+            // single-token branches, so this matches the old single-row embed).
+            for (int bt = 0; bt < n_tokens; bt++)
+                dequant_tensor_row(tok_embd, batch_toks[bt],
+                                   inp_embd.data() + static_cast<size_t>(bt) * hidden_size,
+                                   hidden_size);
         }
 
         // ---- Gemma 4 forward ----
@@ -2989,39 +3010,51 @@ int main(int argc, char* argv[]) {
 
             {
                 ScopedTimer t(step_timings.rope_ms);
-                if (is_qwen3) {
-                    // qwen3 uses NEOX (split-half) RoPE: pair element i with i+hd/2
-                    // per head (vs the interleaved pairs apply_rope uses). Done on
-                    // CPU via rope_cache (built with qwen3's freq_base).
-                    auto rope_neox = [&](float* out, const float* in, int nh) {
-                        const int half = head_dim / 2;
-                        for (int h = 0; h < nh; h++) {
-                            const float* ih = in + static_cast<size_t>(h) * head_dim;
-                            float* oh = out + static_cast<size_t>(h) * head_dim;
-                            for (int i = 0; i < half; i++) {
-                                const float c = *rope_cache.cos_ptr(pos, i);
-                                const float s = *rope_cache.sin_ptr(pos, i);
-                                const float v0 = ih[i], v1 = ih[i + half];
-                                oh[i]        = v0 * c - v1 * s;
-                                oh[i + half] = v0 * s + v1 * c;
+                const int kvdim = num_kv_heads * head_dim;
+                // Each batched token carries its own absolute position (pos + bt).
+                for (int bt = 0; bt < n_tokens; bt++) {
+                    const int tpos = pos + bt;
+                    float* qr = q_rope.data() + static_cast<size_t>(bt) * q_dim;
+                    const float* qp = q_proj.data() + static_cast<size_t>(bt) * q_dim;
+                    float* kr = k_rope.data() + static_cast<size_t>(bt) * kvdim;
+                    const float* kp = k_proj.data() + static_cast<size_t>(bt) * kvdim;
+                    if (is_qwen3) {
+                        // qwen3 uses NEOX (split-half) RoPE: pair element i with i+hd/2
+                        // per head (vs the interleaved pairs apply_rope uses). Done on
+                        // CPU via rope_cache (built with qwen3's freq_base).
+                        auto rope_neox = [&](float* out, const float* in, int nh) {
+                            const int half = head_dim / 2;
+                            for (int h = 0; h < nh; h++) {
+                                const float* ih = in + static_cast<size_t>(h) * head_dim;
+                                float* oh = out + static_cast<size_t>(h) * head_dim;
+                                for (int i = 0; i < half; i++) {
+                                    const float c = *rope_cache.cos_ptr(tpos, i);
+                                    const float s = *rope_cache.sin_ptr(tpos, i);
+                                    const float v0 = ih[i], v1 = ih[i + half];
+                                    oh[i]        = v0 * c - v1 * s;
+                                    oh[i + half] = v0 * s + v1 * c;
+                                }
                             }
-                        }
-                    };
-                    rope_neox(q_rope.data(), q_proj.data(), num_heads);
-                    rope_neox(k_rope.data(), k_proj.data(), num_kv_heads);
-                } else {
-                    // RoPE: NPU when GGNPU_NPU_ROPE=1 (validated, see bench-layer 0g),
-                    // else CPU. apply_rope dispatches and falls back to CPU on failure.
-                    apply_rope(q_rope.data(), q_proj.data(), num_heads, pos, head_dim);
-                    apply_rope(k_rope.data(), k_proj.data(), num_kv_heads, pos, head_dim);
+                        };
+                        rope_neox(qr, qp, num_heads);
+                        rope_neox(kr, kp, num_kv_heads);
+                    } else {
+                        // RoPE: NPU when GGNPU_NPU_ROPE=1 (validated, see bench-layer 0g),
+                        // else CPU. apply_rope dispatches and falls back to CPU on failure.
+                        apply_rope(qr, qp, num_heads, tpos, head_dim);
+                        apply_rope(kr, kp, num_kv_heads, tpos, head_dim);
+                    }
                 }
             }
 
-            model.kv_cache().update_slab(layer, pos, pos + 1,
+            // Write all n_tokens positions [pos, pos+n_tokens) into the KV cache.
+            model.kv_cache().update_slab(layer, pos, pos + n_tokens,
                                          k_rope.data(), v_proj.data(),
                                          num_kv_heads, head_dim);
 
-            int64_t ctx_len = pos + 1;
+            // Full context after this batch's positions are written. Each query
+            // masks future keys via query_pos, so one K/V build serves all queries.
+            int64_t ctx_len = pos + n_tokens;
             int64_t num_kv_heads = hparams.attention_head_count_kv;
             int64_t qkv_groups = hparams.attention_head_count / num_kv_heads;
 
@@ -3050,21 +3083,27 @@ int main(int argc, char* argv[]) {
 
             {
                 ScopedTimer t(step_timings.flash_attn_ms);
-                AttnParams fa_params;
-                fa_params.Q = q_rope.data();
-                fa_params.K = k_expanded.data();
-                fa_params.V = v_expanded.data();
-                fa_params.output = attn_out.data();
-                fa_params.batch_size = 1;
-                fa_params.n_head = num_heads;
-                fa_params.head_dim = head_dim;
-                fa_params.ctx_len = ctx_len;
-                fa_params.query_pos = pos;
-                fa_params.freq_factors = nullptr;
-                if (backend->flash_attn(fa_params) != Status::OK) {
-                    std::cerr << "Error: flash_attn failed at layer " << layer << "\n";
-                    model.unload();
-                    return 1;
+                // One attention call per query row. K/V hold the full context
+                // (ctx_len); each query at absolute position pos+bt masks keys
+                // beyond it via query_pos, giving correct causal attention over
+                // its own prefix. For n_tokens==1 (decode) this is one call.
+                for (int bt = 0; bt < n_tokens; bt++) {
+                    AttnParams fa_params;
+                    fa_params.Q = q_rope.data() + static_cast<size_t>(bt) * q_dim;
+                    fa_params.K = k_expanded.data();
+                    fa_params.V = v_expanded.data();
+                    fa_params.output = attn_out.data() + static_cast<size_t>(bt) * q_dim;
+                    fa_params.batch_size = 1;
+                    fa_params.n_head = num_heads;
+                    fa_params.head_dim = head_dim;
+                    fa_params.ctx_len = ctx_len;
+                    fa_params.query_pos = pos + bt;
+                    fa_params.freq_factors = nullptr;
+                    if (backend->flash_attn(fa_params) != Status::OK) {
+                        std::cerr << "Error: flash_attn failed at layer " << layer << "\n";
+                        model.unload();
+                        return 1;
+                    }
                 }
             }
 
@@ -3169,7 +3208,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        pos++;
+        pos += n_tokens;
 
         if (!do_sample) {
             backend->sync();
@@ -3179,10 +3218,14 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        // Logits: NPU INT8 mul_mat_q (cached decode) with CPU fallback.
+        // Logits: only the last token's row feeds sampling (batched prefill
+        // computed n_tokens rows in inp_norm; we sample the next token from the
+        // final prompt position). NPU INT8 mul_mat_q (cached decode) with CPU fallback.
         if (logits_w) {
             ScopedTimer t(step_timings.logits_ms);
-            compute_logits(inp_norm.data(), logits_w, logits.data(),
+            const float* last_row = inp_norm.data() +
+                static_cast<size_t>(n_tokens - 1) * hidden_size;
+            compute_logits(last_row, logits_w, logits.data(),
                            vocab_size, hidden_size, weight_cache, *backend);
         }
 

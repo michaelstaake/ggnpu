@@ -13,6 +13,33 @@ Hardware unless noted: AMD Ryzen AI 7 350 (Krackan / XDNA2 / `npu6`),
 
 ---
 
+## 2026-07-06 — Prefill batching (generic path): ~45% off time-to-first-token
+
+The forward processed the prompt one token at a time (`n_tokens=1` hardcoded),
+so a P-token prompt paid P sequential M=1 forwards before the first output.
+The generic transformer forward was already written for `n_tokens>1` in the
+expensive parts (Q/K/V/O/FFN matmuls use M=n_tokens; QK-norm/residual/SwiGLU
+loop n_tokens) — only embed, RoPE, KV-update and flash_attn were single-position.
+Batched those: embed all tokens, RoPE per absolute position (pos+bt), KV-update
+the range [pos, pos+n_tokens), and one flash_attn per query row (K/V hold full
+context; query_pos masks the causal prefix). Prompt now runs in M=n_tokens
+passes (chunked at 256 to fit one matmul M-tile) on the 256-M kernel (full
+array) instead of P× M=1 passes. Decode (post-prompt) stays M=1.
+
+Scoped to the generic path (llama/qwen2/qwen3/mistral/deepseek); gemma4/lfm2/
+qwen35 keep their single-token branches (chunk forced to 1). Escape hatch
+GGNPU_NO_PREFILL_BATCH.
+
+**TTFT (Llama-1B Q4_K_M, ~130-token prompt, `-n 1`):** 24.29 s → **13.25 s
+(−45%)**.
+
+**Correctness:** batched vs per-token give the *identical* greedy top-1 after
+the prompt (Germany's largest city → "Berlin", logit 23.41 vs 23.48 — 0.3% int8
+rounding; the two paths use the M=256 vs M=1 kernel so low-confidence branches
+can diverge a few tokens later, both valid). Verified "Berlin" across generic
+archs (Llama, Qwen3, Qwen2, Ministral-3); hybrid qwen35 unaffected. Decode
+throughput unchanged (still M=1).
+
 ## 2026-07-06 — Widen-N decode matmul (kWideN=512): ~10% off decode matmul
 
 Decode is device-bound on INT8 matmul kernel execution (confirmed after the
