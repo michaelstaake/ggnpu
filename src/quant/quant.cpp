@@ -86,48 +86,33 @@ void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
             break;
 
         case GgmlType::F32:
-        case GgmlType::F16:
-            // F32/F16 weights don't need quantization — copy as-is
+            // F32 weights: fixed 1/127 scale (single scale/tensor). Used only for
+            // the on-the-fly F32 matmul path and norm-style tensors — NOT the
+            // per-row kq_path. Clips magnitudes > 1; fine for norms, and the F32
+            // matmul weight path re-derives its own scale in the backend.
             {
                 size_t elem_count = data_size / ggml_type_size(type);
                 int8_output.resize(elem_count);
                 scales_output.resize(1);
                 scales_output[0] = 1.0f;
-
-                if (type == GgmlType::F32) {
-                    const float* src = reinterpret_cast<const float*>(gguf_data);
-                    for (size_t i = 0; i < elem_count; i++) {
-                        int32_t v = static_cast<int32_t>(src[i] * 127.0f);
-                        int8_output[i] = static_cast<int8_t>(std::clamp(v, -128, 127));
-                    }
-                } else {
-                    const uint8_t* raw = gguf_data;
-                    for (size_t i = 0; i < elem_count; i++) {
-                        uint16_t bits = (static_cast<uint16_t>(raw[i * 2]) << 0) |
-                                        (static_cast<uint16_t>(raw[i * 2 + 1]) << 8);
-                        uint16_t sign = (bits >> 15) & 1;
-                        uint16_t exp = (bits >> 10) & 0x1F;
-                        uint16_t frac = bits & 0x3FF;
-                        float f;
-                        if (exp == 0) {
-                            f = (frac == 0) ? 0.0f : (static_cast<float>(frac) / 1024.0f) * powf(2.0f, -14);
-                        } else if (exp == 31) {
-                            f = (frac == 0) ? (sign ? -INFINITY : INFINITY) : NAN;
-                        } else {
-                            f = (sign ? -1.0f : 1.0f) * powf(2.0f, static_cast<float>(exp - 15)) * (1.0f + static_cast<float>(frac) / 1024.0f);
-                        }
-                        int32_t v = static_cast<int32_t>(f * 127.0f);
-                        int8_output[i] = static_cast<int8_t>(std::clamp(v, -128, 127));
-                    }
+                const float* src = reinterpret_cast<const float*>(gguf_data);
+                for (size_t i = 0; i < elem_count; i++) {
+                    int32_t v = static_cast<int32_t>(src[i] * 127.0f);
+                    int8_output[i] = static_cast<int8_t>(std::clamp(v, -128, 127));
                 }
             }
             break;
 
+        case GgmlType::F16:
         case GgmlType::BF16: {
-            // bf16 weights (2 bytes/value, no blocks). Requantize per row to
-            // symmetric int8 + one scale/row, matching the kq_path convention
-            // (the F16/F32 case above uses a fixed 1/127 scale, which clips real
-            // weight magnitudes > 1 — fine for norms, wrong for matmul weights).
+            // f16/bf16 weights (2 bytes/value, no blocks). Requantize per row to
+            // symmetric int8 + one scale/row, matching the kq_path convention.
+            // A prior version routed F16 through the F32 fixed-1/127 case with a
+            // single tensor scale — but F16 matmul weights use the per-row kq_path
+            // (B laid out [N][K]), so a single scale + non-per-row decode left the
+            // backend reading an all-zero B tile → zero logits (e.g. Unsloth
+            // UD-Q8_K_XL, which keeps embed/output/some attn tensors in F16).
+            const bool is_f16 = (type == GgmlType::F16);
             const uint16_t* src = reinterpret_cast<const uint16_t*>(gguf_data);
             int64_t rows = n_rows, cols = n_cols;
             if (rows <= 0 || cols <= 0 ||
@@ -135,18 +120,19 @@ void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
                 rows = 1;
                 cols = static_cast<int64_t>(data_size / sizeof(uint16_t));
             }
+            auto to_f32 = [is_f16](uint16_t v) { return is_f16 ? f16_to_f32(v) : bf16_to_f32(v); };
             int8_output.assign(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0);
             scales_output.assign(static_cast<size_t>(rows), 1.0f);
             for (int64_t r = 0; r < rows; r++) {
                 const uint16_t* row = src + static_cast<size_t>(r) * cols;
                 float max_abs = 0.0f;
                 for (int64_t k = 0; k < cols; k++)
-                    max_abs = std::max(max_abs, std::fabs(bf16_to_f32(row[k])));
+                    max_abs = std::max(max_abs, std::fabs(to_f32(row[k])));
                 float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
                 float inv = 1.0f / scale;
                 scales_output[static_cast<size_t>(r)] = scale;
                 for (int64_t k = 0; k < cols; k++) {
-                    float q = std::nearbyint(bf16_to_f32(row[k]) * inv);
+                    float q = std::nearbyint(to_f32(row[k]) * inv);
                     int8_output[static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(k)] =
                         static_cast<int8_t>(std::clamp(q, -128.0f, 127.0f));
                 }

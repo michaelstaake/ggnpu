@@ -616,6 +616,7 @@ public:
                               params.B_type == GgmlType::Q8_0 ||
                               params.B_type == GgmlType::Q5_K ||
                               params.B_type == GgmlType::BF16 ||
+                              params.B_type == GgmlType::F16 ||
                               params.B_type == GgmlType::IQ4_NL ||
                               params.B_type == GgmlType::IQ4_XS ||
                               params.B_type == GgmlType::IQ2_XXS ||
@@ -670,7 +671,8 @@ public:
             params.B_type == GgmlType::Q2_K || params.B_type == GgmlType::Q3_K ||
             params.B_type == GgmlType::Q4_K || params.B_type == GgmlType::Q6_K ||
             params.B_type == GgmlType::Q8_0 || params.B_type == GgmlType::Q5_K ||
-            params.B_type == GgmlType::BF16 || params.B_type == GgmlType::IQ4_NL ||
+            params.B_type == GgmlType::BF16 || params.B_type == GgmlType::F16 ||
+            params.B_type == GgmlType::IQ4_NL ||
             params.B_type == GgmlType::IQ4_XS || params.B_type == GgmlType::IQ2_XXS ||
             params.B_type == GgmlType::IQ2_XS || params.B_type == GgmlType::IQ2_S ||
             params.B_type == GgmlType::IQ3_XXS || params.B_type == GgmlType::IQ3_S ||

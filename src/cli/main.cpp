@@ -48,6 +48,12 @@ void dequant_tensor_row(const TensorView* tv, int row, float* out, int row_dim) 
         return;
     }
 
+    if (tv->type == GgmlType::F16) {
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(tv->data) + static_cast<size_t>(row) * row_dim;
+        for (int k = 0; k < row_dim; k++) out[k] = f16_to_f32(src[k]);
+        return;
+    }
+
     if (tv->type == GgmlType::Q4_0) {
         constexpr int QK4_0 = 32;
         constexpr size_t Q4_0_BLOCK_BYTES = 18;
@@ -273,6 +279,7 @@ void compute_logits(const float* hidden, const TensorView* weight, float* logits
                      weight->type == GgmlType::Q4_0 || weight->type == GgmlType::Q4_1 ||
                      weight->type == GgmlType::Q8_0 ||
                      weight->type == GgmlType::Q5_K || weight->type == GgmlType::BF16 ||
+                     weight->type == GgmlType::F16 ||
                      weight->type == GgmlType::IQ4_NL || weight->type == GgmlType::IQ4_XS ||
                      weight->type == GgmlType::IQ2_XXS || weight->type == GgmlType::IQ2_XS ||
                      weight->type == GgmlType::IQ2_S || weight->type == GgmlType::IQ3_XXS ||
@@ -324,6 +331,7 @@ static bool npu_logits_weight_type(GgmlType t) {
     return t == GgmlType::Q2_K || t == GgmlType::Q3_K || t == GgmlType::Q4_K ||
            t == GgmlType::Q6_K || t == GgmlType::Q4_0 || t == GgmlType::Q4_1 ||
            t == GgmlType::Q8_0 || t == GgmlType::Q5_K || t == GgmlType::BF16 ||
+           t == GgmlType::F16 ||
            t == GgmlType::IQ4_NL || t == GgmlType::IQ4_XS || t == GgmlType::IQ2_XXS ||
            t == GgmlType::IQ2_XS || t == GgmlType::IQ2_S || t == GgmlType::IQ3_XXS ||
            t == GgmlType::IQ3_S || t == GgmlType::IQ1_S || t == GgmlType::IQ1_M;
@@ -728,6 +736,7 @@ bool attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cac
                w->type != GgmlType::Q4_0 && w->type != GgmlType::Q4_1 &&
                w->type != GgmlType::Q8_0 &&
                w->type != GgmlType::Q5_K && w->type != GgmlType::BF16 &&
+               w->type != GgmlType::F16 &&
                w->type != GgmlType::IQ4_NL && w->type != GgmlType::IQ4_XS &&
                w->type != GgmlType::IQ2_XXS && w->type != GgmlType::IQ2_XS &&
                w->type != GgmlType::IQ2_S && w->type != GgmlType::IQ3_XXS &&

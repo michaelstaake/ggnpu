@@ -19,6 +19,32 @@ float bf16_to_f32(uint16_t b) {
     return result;
 }
 
+float f16_to_f32(uint16_t h) {
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
+    const uint32_t exp = (h >> 10) & 0x1F;
+    const uint32_t frac = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0) {
+        if (frac == 0) {
+            bits = sign;  // signed zero
+        } else {
+            // subnormal f16 -> normalized f32
+            uint32_t f = frac;
+            int e = -1;
+            do { f <<= 1; e++; } while ((f & 0x400) == 0);
+            f &= 0x3FF;
+            bits = sign | (static_cast<uint32_t>(127 - 15 - e) << 23) | (f << 13);
+        }
+    } else if (exp == 0x1F) {
+        bits = sign | 0x7F800000u | (frac << 13);  // inf / nan
+    } else {
+        bits = sign | ((exp + (127 - 15)) << 23) | (frac << 13);
+    }
+    float result = 0.0f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
 std::vector<uint8_t> convert_f32_to_bf16(const void* f32_data, size_t count) {
     const float* f32 = static_cast<const float*>(f32_data);
     std::vector<uint8_t> bf16_buf(count * 2);  // 2 bytes per bf16

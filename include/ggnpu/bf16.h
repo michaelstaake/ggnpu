@@ -12,6 +12,9 @@ uint16_t f32_to_bf16(float f);
 // Convert a single bf16 value to f32.
 float bf16_to_f32(uint16_t b);
 
+// Convert a single IEEE-754 half-precision (f16) value to f32.
+float f16_to_f32(uint16_t h);
+
 // Convert f32 vector to bf16 vector (writes to separate buffer).
 std::vector<uint8_t> convert_f32_to_bf16(const void* f32_data, size_t count);
 
