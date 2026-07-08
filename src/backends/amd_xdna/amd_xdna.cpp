@@ -612,6 +612,7 @@ public:
                               params.B_type == GgmlType::Q4_K ||
                               params.B_type == GgmlType::Q6_K ||
                               params.B_type == GgmlType::Q4_0 ||
+                              params.B_type == GgmlType::Q4_0_4_4 ||
                               params.B_type == GgmlType::Q4_1 ||
                               params.B_type == GgmlType::Q8_0 ||
                               params.B_type == GgmlType::Q5_K ||
@@ -667,6 +668,7 @@ public:
 
         const int8_t* B_int8_base = nullptr;
         if (params.B_type == GgmlType::I8 || params.B_type == GgmlType::Q4_0 ||
+            params.B_type == GgmlType::Q4_0_4_4 ||
             params.B_type == GgmlType::Q4_1 ||
             params.B_type == GgmlType::Q2_K || params.B_type == GgmlType::Q3_K ||
             params.B_type == GgmlType::Q4_K || params.B_type == GgmlType::Q6_K ||

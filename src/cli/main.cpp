@@ -276,7 +276,8 @@ void compute_logits(const float* hidden, const TensorView* weight, float* logits
 
     if (npu_path && (weight->type == GgmlType::Q2_K || weight->type == GgmlType::Q3_K ||
                      weight->type == GgmlType::Q4_K || weight->type == GgmlType::Q6_K ||
-                     weight->type == GgmlType::Q4_0 || weight->type == GgmlType::Q4_1 ||
+                     weight->type == GgmlType::Q4_0 || weight->type == GgmlType::Q4_0_4_4 ||
+                     weight->type == GgmlType::Q4_1 ||
                      weight->type == GgmlType::Q8_0 ||
                      weight->type == GgmlType::Q5_K || weight->type == GgmlType::BF16 ||
                      weight->type == GgmlType::F16 ||
@@ -329,7 +330,8 @@ cpu_fallback:
 // (shared by the single-row and batched vocab projections).
 static bool npu_logits_weight_type(GgmlType t) {
     return t == GgmlType::Q2_K || t == GgmlType::Q3_K || t == GgmlType::Q4_K ||
-           t == GgmlType::Q6_K || t == GgmlType::Q4_0 || t == GgmlType::Q4_1 ||
+           t == GgmlType::Q6_K || t == GgmlType::Q4_0 || t == GgmlType::Q4_0_4_4 ||
+           t == GgmlType::Q4_1 ||
            t == GgmlType::Q8_0 || t == GgmlType::Q5_K || t == GgmlType::BF16 ||
            t == GgmlType::F16 ||
            t == GgmlType::IQ4_NL || t == GgmlType::IQ4_XS || t == GgmlType::IQ2_XXS ||
@@ -733,7 +735,8 @@ bool report_compare(const char* label, const CompareResult& r, int n,
 bool attach_kquant_scales(MulMatParams& p, const TensorView* w, WeightCache& cache) {
     if (!w || (w->type != GgmlType::Q2_K && w->type != GgmlType::Q3_K &&
                w->type != GgmlType::Q4_K && w->type != GgmlType::Q6_K &&
-               w->type != GgmlType::Q4_0 && w->type != GgmlType::Q4_1 &&
+               w->type != GgmlType::Q4_0 && w->type != GgmlType::Q4_0_4_4 &&
+               w->type != GgmlType::Q4_1 &&
                w->type != GgmlType::Q8_0 &&
                w->type != GgmlType::Q5_K && w->type != GgmlType::BF16 &&
                w->type != GgmlType::F16 &&
@@ -1380,6 +1383,24 @@ int main(int argc, char* argv[]) {
                 float acc = 0.0f;
                 for (int k = 0; k < K; k++) acc += A[k] * wr[static_cast<size_t>(k)];
                 C[static_cast<size_t>(n)] = acc;
+            }
+            return true;
+        }
+
+        // F32 weight tensors (e.g. qwen35moe's ssm_alpha/ssm_beta projections, which
+        // ship unquantized where dense qwen35 uses Q8_0) are not decodable by the NPU
+        // int8 path — it overflows to inf. They are always small projections, so
+        // compute them exactly on host. Mirrors the F16==BF16 matmul-weight wiring.
+        if (weight->type == GgmlType::F32) {
+            std::vector<float> wr(static_cast<size_t>(K));
+            for (int n = 0; n < N; n++) {
+                dequant_tensor_row(weight, n, wr.data(), K);
+                for (int m = 0; m < M; m++) {
+                    const float* a = A + static_cast<size_t>(m) * lda;
+                    float acc = 0.0f;
+                    for (int k = 0; k < K; k++) acc += a[k] * wr[static_cast<size_t>(k)];
+                    C[static_cast<size_t>(m) * ldc + n] = acc;
+                }
             }
             return true;
         }
@@ -2153,14 +2174,29 @@ int main(int argc, char* argv[]) {
     // output gate fused into the tail half of attn_q. Both blocks use attn_norm
     // (pre-mixer) + post_attention_norm (pre-FFN) + SwiGLU FFN. Attention head_dim
     // is key_length(256) with partial NEOX RoPE over rope.dimension_count(64).
-    const bool is_qwen35 = (model.gguf().arch() == "qwen35");
-    const int q35_head_dim = static_cast<int>(model.gguf().get_int("qwen35.attention.key_length", 256));
-    const int q35_rope_dim = static_cast<int>(model.gguf().get_int("qwen35.rope.dimension_count", 64));
-    const float q35_rope_base = static_cast<float>(model.gguf().get_float("qwen35.rope.freq_base", 1e7));
-    const int q35_conv_k   = static_cast<int>(model.gguf().get_int("qwen35.ssm.conv_kernel", 4));
-    const int q35_ssm_hd   = static_cast<int>(model.gguf().get_int("qwen35.ssm.state_size", 128));   // head dim (k==v)
-    const int q35_value_dim = static_cast<int>(model.gguf().get_int("qwen35.ssm.inner_size", 4096)); // v_heads*hd
-    const int q35_k_heads  = static_cast<int>(model.gguf().get_int("qwen35.ssm.group_count", 16));   // key/query heads
+    // qwen35moe (Qwen3.6-35B-A3B) shares qwen35's Gated-DeltaNet + full-attn mixer
+    // verbatim (identical ssm_*/attn_* tensor names and hparams); it only swaps the
+    // dense SwiGLU FFN for a 256-expert top-8 MoE plus a sigmoid-gated shared expert.
+    // So route it through the same forward, keyed on the arch's own metadata prefix.
+    const std::string q35_arch = model.gguf().arch();
+    const bool is_qwen35moe = (q35_arch == "qwen35moe");
+    const bool is_qwen35 = (q35_arch == "qwen35") || is_qwen35moe;
+    const int q35_head_dim = static_cast<int>(model.gguf().get_int(q35_arch + ".attention.key_length", 256));
+    const int q35_rope_dim = static_cast<int>(model.gguf().get_int(q35_arch + ".rope.dimension_count", 64));
+    const float q35_rope_base = static_cast<float>(model.gguf().get_float(q35_arch + ".rope.freq_base", 1e7));
+    const int q35_conv_k   = static_cast<int>(model.gguf().get_int(q35_arch + ".ssm.conv_kernel", 4));
+    const int q35_ssm_hd   = static_cast<int>(model.gguf().get_int(q35_arch + ".ssm.state_size", 128));   // head dim (k==v)
+    const int q35_value_dim = static_cast<int>(model.gguf().get_int(q35_arch + ".ssm.inner_size", 4096)); // v_heads*hd
+    const int q35_k_heads  = static_cast<int>(model.gguf().get_int(q35_arch + ".ssm.group_count", 16));   // key/query heads
+    // MoE hparams (qwen35moe only; 0 for the dense qwen35 4B/9B).
+    const int q35_n_expert      = static_cast<int>(model.gguf().get_int(q35_arch + ".expert_count", 0));
+    const int q35_n_expert_used = static_cast<int>(model.gguf().get_int(q35_arch + ".expert_used_count", 0));
+    const int q35_expert_ff     = static_cast<int>(model.gguf().get_int(q35_arch + ".expert_feed_forward_length", 0));
+    // Trailing Multi-Token-Prediction (nextn) layers carry blk.N.nextn.* tensors and
+    // are NOT part of the autoregressive backbone — running them as decoder layers
+    // NaNs out the hidden state. Skip them during standard greedy decode.
+    const int q35_nextn = static_cast<int>(model.gguf().get_int(q35_arch + ".nextn_predict_layers", 0));
+    const int q35_n_layers = std::min(max_layers_override, num_layers - q35_nextn);
     const int q35_v_heads  = (q35_ssm_hd > 0) ? q35_value_dim / q35_ssm_hd : 32;                     // value heads
     const int q35_key_dim  = q35_k_heads * q35_ssm_hd;                                                // 2048
     const int q35_conv_dim = 2 * q35_key_dim + q35_value_dim;                                         // 8192
@@ -2854,7 +2890,7 @@ int main(int argc, char* argv[]) {
                           << ", " << v[2] << ", ..., " << v[n-3] << ", " << v[n-2] << ", " << v[n-1] << "]\n";
             };
             if (q35dbg) std::cerr << "[dbg] embed rms=" << vnorm(inp_embd, hidden_size) << "\n";
-            for (int L = 0; L < max_layers_override; L++) {
+            for (int L = 0; L < q35_n_layers; L++) {
                 const TensorView* attn_norm_w = find_tensor_pattern(model, "blk.{layer}.attn_norm.weight", L);
                 const TensorView* post_norm_w = find_tensor_pattern(model, "blk.{layer}.post_attention_norm.weight", L);
                 if (!g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(attn_norm_w), rms_eps)) return 1;
@@ -3069,36 +3105,123 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (q35dbg && L < 5) std::cerr << " post_mix_rms=" << vnorm(inp_embd, hidden_size);
-                // ===== SwiGLU FFN (post_attention_norm as the FFN norm) =====
+                // ===== FFN (post_attention_norm as the FFN norm) =====
                 if (!g_rmsnorm(xn.data(), inp_embd.data(), hidden_size, get_float_ptr(post_norm_w), rms_eps)) return 1;
-                const TensorView* gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", L);
-                const TensorView* up_w   = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", L);
-                const TensorView* down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", L);
-                std::fill(gate.begin(), gate.end(), 0.0f);
-                std::fill(up.begin(), up.end(), 0.0f);
-                mul_mat_weight(xn.data(), gate_w, gate.data(), 1, ffn_size, hidden_size,
-                               hidden_size, ffn_size, ffn_size, mm);
-                mul_mat_weight(xn.data(), up_w, up.data(), 1, ffn_size, hidden_size,
-                               hidden_size, ffn_size, ffn_size, mm);
-                backend->sync();
-                if (fp32_ssm) {
-                    // Exact fp32 SiLU on CPU (full-fp32 diagnostic; see GGNPU_FP32_SSM).
-                    for (int i = 0; i < ffn_size; i++)
-                        act[i] = gate[i] / (1.0f + std::exp(-gate[i]));
-                } else {
-                    SiluParams sp; sp.input = gate.data(); sp.output = act.data(); sp.size = ffn_size;
-                    if (backend->silu(sp) != Status::OK) {
-                        std::cerr << "Error: qwen35 silu failed at layer " << L << "\n";
-                        model.unload();
-                        return 1;
+                if (is_qwen35moe) {
+                    // ---- MoE FFN: router top-k routed experts + sigmoid-gated shared expert ----
+                    const int nE  = q35_n_expert;       // 256 total experts
+                    const int nEU = q35_n_expert_used;  // 8 routed per token
+                    const int eff = q35_expert_ff;      // 512 per-expert hidden
+                    // Router logits = ffn_gate_inp (F32 [hidden, nE]) . xn. Tiny (256x2048),
+                    // computed host-side.
+                    const TensorView* router_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate_inp.weight", L);
+                    const float* rw = get_float_ptr(router_w);
+                    std::vector<float> rlogits(nE);
+                    for (int e = 0; e < nE; e++) {
+                        const float* wr = rw + static_cast<size_t>(e) * hidden_size;
+                        float acc = 0.0f;
+                        for (int i = 0; i < hidden_size; i++) acc += xn[i] * wr[i];
+                        rlogits[e] = acc;
                     }
+                    // Top-k experts, then softmax over just those (== softmax-over-all then
+                    // renormalize the top-k, i.e. Qwen MoE norm_topk_prob=true).
+                    std::vector<int> eidx(nE);
+                    for (int e = 0; e < nE; e++) eidx[e] = e;
+                    std::partial_sort(eidx.begin(), eidx.begin() + nEU, eidx.end(),
+                                      [&](int a, int b) { return rlogits[a] > rlogits[b]; });
+                    std::vector<float> wsel(nEU);
+                    float mx = rlogits[eidx[0]], wsum = 0.0f;
+                    for (int j = 0; j < nEU; j++) { wsel[j] = std::exp(rlogits[eidx[j]] - mx); wsum += wsel[j]; }
+                    for (int j = 0; j < nEU; j++) wsel[j] /= wsum;
+
+                    // Slice expert e's 2D [K,N] matrix out of a 3D [K,N,nE] expert tensor.
+                    // A distinct name gives each expert its own WeightCache entry (only the
+                    // ~8 experts touched per token ever get decoded).
+                    auto expert_slice = [](const TensorView* base, int e) -> TensorView {
+                        TensorView v = *base;
+                        v.n_dims = 2;
+                        const uint64_t K = base->dims[0], N = base->dims[1];
+                        v.dims = {K, N};
+                        const size_t per = (static_cast<size_t>(K) * N / ggml_blck_size(base->type))
+                                           * ggml_type_size(base->type);
+                        v.data = base->data + static_cast<size_t>(e) * per;
+                        v.name = base->name + ".e" + std::to_string(e);
+                        return v;
+                    };
+                    const TensorView* gexp = find_tensor_pattern(model, "blk.{layer}.ffn_gate_exps.weight", L);
+                    const TensorView* uexp = find_tensor_pattern(model, "blk.{layer}.ffn_up_exps.weight", L);
+                    const TensorView* dexp = find_tensor_pattern(model, "blk.{layer}.ffn_down_exps.weight", L);
+                    std::vector<float> eg(eff), eu(eff), ea(eff), ed(hidden_size), moe(hidden_size, 0.0f);
+                    // SwiGLU per expert: down(silu(gate(x)) * up(x)), weighted by router prob.
+                    auto run_expert = [&](const TensorView* g, const TensorView* u,
+                                          const TensorView* d, float weight) {
+                        std::fill(eg.begin(), eg.end(), 0.0f);
+                        std::fill(eu.begin(), eu.end(), 0.0f);
+                        mul_mat_weight(xn.data(), g, eg.data(), 1, eff, hidden_size, hidden_size, eff, eff, mm);
+                        mul_mat_weight(xn.data(), u, eu.data(), 1, eff, hidden_size, hidden_size, eff, eff, mm);
+                        backend->sync();
+                        for (int i = 0; i < eff; i++)
+                            ea[i] = (eg[i] / (1.0f + std::exp(-eg[i]))) * eu[i];
+                        std::fill(ed.begin(), ed.end(), 0.0f);
+                        mul_mat_weight(ea.data(), d, ed.data(), 1, hidden_size, eff, eff, hidden_size, hidden_size, mm);
+                        backend->sync();
+                        for (int i = 0; i < hidden_size; i++) moe[i] += weight * ed[i];
+                    };
+                    for (int j = 0; j < nEU; j++) {
+                        const int e = eidx[j];
+                        TensorView gv = expert_slice(gexp, e);
+                        TensorView uv = expert_slice(uexp, e);
+                        TensorView dv = expert_slice(dexp, e);
+                        run_expert(&gv, &uv, &dv, wsel[j]);
+                    }
+                    // Shared expert (always active), gated by sigmoid(ffn_gate_inp_shexp . x).
+                    const TensorView* sg = find_tensor_pattern(model, "blk.{layer}.ffn_gate_shexp.weight", L);
+                    const TensorView* su = find_tensor_pattern(model, "blk.{layer}.ffn_up_shexp.weight", L);
+                    const TensorView* sd = find_tensor_pattern(model, "blk.{layer}.ffn_down_shexp.weight", L);
+                    if (sg && su && sd) {
+                        float sgate_val = 1.0f;
+                        const TensorView* sgate = find_tensor_pattern(model, "blk.{layer}.ffn_gate_inp_shexp.weight", L);
+                        if (sgate) {
+                            const float* sw = get_float_ptr(sgate);
+                            float acc = 0.0f;
+                            for (int i = 0; i < hidden_size; i++) acc += xn[i] * sw[i];
+                            sgate_val = 1.0f / (1.0f + std::exp(-acc));
+                        }
+                        run_expert(sg, su, sd, sgate_val);
+                    }
+                    if (L == 0) dbg6("moe_ffn_out", moe.data(), hidden_size);
+                    for (int i = 0; i < hidden_size; i++) inp_embd[i] += moe[i];
+                } else {
+                    // ---- Dense SwiGLU FFN (qwen35 4B/9B) ----
+                    const TensorView* gate_w = find_tensor_pattern(model, "blk.{layer}.ffn_gate.weight", L);
+                    const TensorView* up_w   = find_tensor_pattern(model, "blk.{layer}.ffn_up.weight", L);
+                    const TensorView* down_w = find_tensor_pattern(model, "blk.{layer}.ffn_down.weight", L);
+                    std::fill(gate.begin(), gate.end(), 0.0f);
+                    std::fill(up.begin(), up.end(), 0.0f);
+                    mul_mat_weight(xn.data(), gate_w, gate.data(), 1, ffn_size, hidden_size,
+                                   hidden_size, ffn_size, ffn_size, mm);
+                    mul_mat_weight(xn.data(), up_w, up.data(), 1, ffn_size, hidden_size,
+                                   hidden_size, ffn_size, ffn_size, mm);
+                    backend->sync();
+                    if (fp32_ssm) {
+                        // Exact fp32 SiLU on CPU (full-fp32 diagnostic; see GGNPU_FP32_SSM).
+                        for (int i = 0; i < ffn_size; i++)
+                            act[i] = gate[i] / (1.0f + std::exp(-gate[i]));
+                    } else {
+                        SiluParams sp; sp.input = gate.data(); sp.output = act.data(); sp.size = ffn_size;
+                        if (backend->silu(sp) != Status::OK) {
+                            std::cerr << "Error: qwen35 silu failed at layer " << L << "\n";
+                            model.unload();
+                            return 1;
+                        }
+                    }
+                    for (int i = 0; i < ffn_size; i++) act[i] *= up[i];
+                    std::fill(dn.begin(), dn.end(), 0.0f);
+                    mul_mat_weight(act.data(), down_w, dn.data(), 1, hidden_size, ffn_size,
+                                   ffn_size, hidden_size, hidden_size, mm);
+                    backend->sync();
+                    for (int i = 0; i < hidden_size; i++) inp_embd[i] += dn[i];
                 }
-                for (int i = 0; i < ffn_size; i++) act[i] *= up[i];
-                std::fill(dn.begin(), dn.end(), 0.0f);
-                mul_mat_weight(act.data(), down_w, dn.data(), 1, hidden_size, ffn_size,
-                               ffn_size, hidden_size, hidden_size, mm);
-                backend->sync();
-                for (int i = 0; i < hidden_size; i++) inp_embd[i] += dn[i];
                 if (q35dbg && L < 5) std::cerr << " post_ffn_rms=" << vnorm(inp_embd, hidden_size) << "\n";
                 if (q35dbg && L < 6) {
                     double s = 0; for (int i = 0; i < hidden_size; i++) s += inp_embd[i];

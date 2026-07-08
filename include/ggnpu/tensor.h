@@ -38,6 +38,7 @@ enum class GgmlType : uint32_t {
     F64 = 28,
     IQ1_M = 29,
     BF16 = 30,
+    Q4_0_4_4 = 31,  // ARM-repacked Q4_0 (4 rows interleaved); de-interleaved to Q4_0 on decode
 };
 
 size_t ggml_type_size(GgmlType type);

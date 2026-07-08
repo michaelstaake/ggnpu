@@ -6,15 +6,14 @@ re-quantization — point `ggnpu` at a `.gguf` file and it runs.
 ## Supported models & quantizations
 
 **Validated on Krackan (`npu6`):** Llama 3.2 1B, Qwen2.5 / Qwen2.5-Coder 1.5B,
-DeepSeek-R1-Distill-Qwen 1.5B, Qwen3 0.6B, Gemma 3n E2B, LFM2.5 230M. Other
-`llama`- and `qwen2`-family GGUFs generally work through the same path.
+DeepSeek-R1-Distill-Qwen 1.5B, Qwen3 0.6B, Qwen3.5 (Gated DeltaNet hybrid),
+Qwen3.6-35B-A3B (`qwen35moe`, MoE + shared expert), Gemma 3n E2B, LFM2.5 230M.
+Other `llama`- and `qwen2`-family GGUFs generally work through the same path.
 
 **Quantizations:** `Q2_K` through `Q8_0`, `Q4_K`/`Q5_K`/`Q6_K` variants,
-`IQ4_NL`, `IQ4_XS`, and `BF16`. Mixed-precision GGUFs (e.g. `Q4_K_M` with `Q6_K`
-attention layers) are handled tensor-by-tensor.
-
-**Not yet:** codebook i-quants (`IQ1_*`, `IQ2_*`, `IQ3_*`) and architectures
-beyond those listed (e.g. `qwen35`). Full details:
+`IQ4_NL`, `IQ4_XS`, `BF16`, and the legacy ARM-repacked `Q4_0_4_4` (de-interleaved
+to `Q4_0` on load). Mixed-precision GGUFs (e.g. `Q4_K_M` with `Q6_K` attention
+layers) are handled tensor-by-tensor. Full details:
 [IMPLEMENTATION.md §1.2](IMPLEMENTATION.md#12-model-and-quantization-support).
 
 ## What you need

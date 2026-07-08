@@ -25,6 +25,51 @@ void decode_for_npu(GgmlType type, const uint8_t* gguf_data, size_t data_size,
             decode_q4_1_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
             break;
 
+        case GgmlType::Q4_0_4_4: {
+            // ARM-repacked Q4_0: 4 rows are interleaved into a block_q4_0x4 (8 bytes
+            // of 4 fp16 row scales + 64 bytes of qs, blck_size_interleave=4), laid
+            // out group-major (4 rows) then block-column. De-interleave back to plain
+            // row-major Q4_0 bytes, then reuse the Q4_0 decoder. Requires n_rows%4==0
+            // (always true for repacked tensors; smaller ones ship as plain Q4_0).
+            constexpr int QK = 32;
+            constexpr size_t PLAIN_BLK = 18;  // 2 (fp16 d) + 16 (qs)
+            constexpr size_t X4_BLK = 72;     // 8 (4x fp16 d) + 64 (qs)
+            if (n_rows <= 0 || n_cols <= 0 || (n_rows % 4) != 0) {
+                std::cerr << "Warning: Q4_0_4_4 requires n_rows%4==0 (got "
+                          << n_rows << "x" << n_cols << "), falling back to F32\n";
+                decode_for_npu(GgmlType::F32, gguf_data, data_size, n_rows, n_cols,
+                               int8_output, scales_output);
+                break;
+            }
+            const size_t bpr = (static_cast<size_t>(n_cols) + QK - 1) / QK;  // blocks per row
+            const size_t groups = static_cast<size_t>(n_rows) / 4;
+            std::vector<uint8_t> plain(static_cast<size_t>(n_rows) * bpr * PLAIN_BLK);
+            for (size_t g = 0; g < groups; g++) {
+                for (size_t b = 0; b < bpr; b++) {
+                    const uint8_t* x4 = gguf_data + (g * bpr + b) * X4_BLK;
+                    const uint8_t* xd = x4;      // 4 fp16 row scales
+                    const uint8_t* xq = x4 + 8;  // 64 interleaved qs bytes
+                    for (int r = 0; r < 4; r++) {
+                        uint8_t* dst = plain.data() + ((g * 4 + r) * bpr + b) * PLAIN_BLK;
+                        std::memcpy(dst, xd + r * 2, 2);  // this row's fp16 scale
+                        uint8_t* dqs = dst + 2;           // 16-byte plain qs
+                        // reverse of make_block_q4_0x4: chunks with i%4==r belong to row r,
+                        // src (plain) offset (i/4)*4, dst (interleaved) offset i*4. The
+                        // repack XORs every nibble with 0x8 (mask 0x88888888) to store the
+                        // quants unsigned for ARM; XOR back to recover standard Q4_0 nibbles.
+                        for (int i = r; i < 16; i += 4) {
+                            const uint8_t* s = xq + i * 4;
+                            uint8_t* d = dqs + (i / 4) * 4;
+                            for (int c = 0; c < 4; c++) d[c] = s[c] ^ 0x88;
+                        }
+                    }
+                }
+            }
+            decode_q4_0_for_npu(plain.data(), plain.size(), n_rows, n_cols,
+                                int8_output, scales_output);
+            break;
+        }
+
         case GgmlType::Q8_0:
             decode_q8_0_for_npu(gguf_data, data_size, n_rows, n_cols, int8_output, scales_output);
             break;

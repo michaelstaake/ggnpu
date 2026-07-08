@@ -12,6 +12,7 @@ constexpr const char* type_names[] = {
     "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS",
     "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S", "IQ2_S", "IQ4_XS",
     "I8", "I16", "I32", "I64", "F64", "IQ1_M", "BF16",
+    "Q4_0_4_4",
 };
 
 constexpr size_t block_sizes[] = {
@@ -20,6 +21,7 @@ constexpr size_t block_sizes[] = {
     256, 256, 256, 256, 256, 256,
     256, 256, 32, 256, 256, 256,
     1, 1, 1, 1, 1, 256, 1,
+    32,  // Q4_0_4_4: same 32-value block as Q4_0 (rows interleaved in groups of 4)
 };
 
 constexpr size_t type_sizes[] = {
@@ -31,7 +33,8 @@ constexpr size_t type_sizes[] = {
     20, 22, 34, 34, 84, 110,
     144, 176, 210, 292, 66, 74,
     98, 50, 18, 110, 82, 136,
-    1, 2, 4, 8, 8, 56, 2
+    1, 2, 4, 8, 8, 56, 2,
+    18,  // Q4_0_4_4: 18 bytes/32-value block, identical to Q4_0
 };
 
 } // namespace
