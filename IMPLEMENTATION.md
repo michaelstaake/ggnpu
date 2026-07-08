@@ -40,6 +40,37 @@ Build a standalone C++20 inference binary named `ggnpu` that:
 
 See **§9** and `docs/host-setup-guide.md`.
 
+### 1.2 Model and quantization support
+
+**Most GGUF models run unmodified.** Architecture support is metadata-driven
+(`general.architecture`); non-pow2 hidden sizes and arbitrary FFN widths are
+handled automatically (RMSNorm pad-to-pow2, SiLU host-tiling).
+
+#### Confirmed models (validated end-to-end on `npu6` / Krackan)
+
+| Model | `architecture` | Notes |
+|-------|----------------|-------|
+| **Llama 3.2 1B** | `llama` | |
+| **Qwen2.5 / Qwen2.5-Coder 1.5B** | `qwen2` | QKV bias, GQA |
+| **DeepSeek-R1-Distill-Qwen 1.5B** | `qwen2` | validated across Q2_K → Q8_0, IQ4_XS, BF16 |
+| **Qwen3 0.6B** | `qwen3` | explicit head_dim (key_length), per-head QK-norm, NEOX RoPE, tied output |
+| **Gemma 3n E2B** | `gemma4` | MatFormer: SentencePiece-unigram tokenizer, Per-Layer Embeddings, QK-norm, sandwich norms, shared-KV, sliding-window attention, logit soft-cap |
+| **LFM2.5 230M** | `lfm2` | hybrid gated ShortConv (depthwise causal conv1d) + GQA attention, per-head QK-norm, NeoX RoPE, tied output head |
+
+Any other `llama`- or `qwen2`-family GGUF loads through the same path.
+
+#### Supported quantizations
+
+`Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ4_NL`, `IQ4_XS`, and
+`BF16` — all decoded to per-row int8 for the NPU matmul, and to reference float for
+the embedding/output paths. Mixed-precision GGUFs (e.g. a `Q4_K_M` file with `Q6_K`
+attention/FFN tensors) are handled tensor-by-tensor. Full-precision `F16`/`F32`
+tensors (norms, biases) pass through directly.
+
+Not yet supported: the codebook i-quants `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`/`IQ2_M`/
+`IQ3_XXS`/`IQ3_S`, and architectures beyond those above (e.g. selective-SSM
+hybrids such as `qwen35`).
+
 ---
 
 ## 2. Hard constraints

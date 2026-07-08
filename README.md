@@ -1,67 +1,36 @@
 # ggnpu
 
-Run GGUF models on AMD NPUs (Krackan / XDNA2).
+Run standard GGUF models on AMD NPUs (Krackan / XDNA2). No conversion or
+re-quantization — point `ggnpu` at a `.gguf` file and it runs.
 
-## Status
+## Supported models & quantizations
 
-| Backend | Status |
-|---------|--------|
-| AMD NPU | Work in progress |
+**Validated on Krackan (`npu6`):** Llama 3.2 1B, Qwen2.5 / Qwen2.5-Coder 1.5B,
+DeepSeek-R1-Distill-Qwen 1.5B, Qwen3 0.6B, Gemma 3n E2B, LFM2.5 230M. Other
+`llama`- and `qwen2`-family GGUFs generally work through the same path.
 
-**Most GGUF models run unmodified.** Point `ggnpu` at a `.gguf` file for any
-supported architecture in any supported quantization and it just runs on the NPU —
-no conversion, re-quantization, or per-model tweaking. Architecture support is
-metadata-driven (`general.architecture`); non-pow2 hidden sizes and arbitrary FFN
-widths are handled automatically (RMSNorm pad-to-pow2, SiLU host-tiling).
+**Quantizations:** `Q2_K` through `Q8_0`, `Q4_K`/`Q5_K`/`Q6_K` variants,
+`IQ4_NL`, `IQ4_XS`, and `BF16`. Mixed-precision GGUFs (e.g. `Q4_K_M` with `Q6_K`
+attention layers) are handled tensor-by-tensor.
 
-### Confirmed models (validated end-to-end on `npu6` / Krackan)
+**Not yet:** codebook i-quants (`IQ1_*`, `IQ2_*`, `IQ3_*`) and architectures
+beyond those listed (e.g. `qwen35`). Full details:
+[IMPLEMENTATION.md §1.2](IMPLEMENTATION.md#12-model-and-quantization-support).
 
-| Model | `architecture` | Notes |
-|-------|----------------|-------|
-| **Llama 3.2 1B** | `llama` | |
-| **Qwen2.5 / Qwen2.5-Coder 1.5B** | `qwen2` | QKV bias, GQA |
-| **DeepSeek-R1-Distill-Qwen 1.5B** | `qwen2` | validated across Q2_K → Q8_0, IQ4_XS, BF16 |
-| **Qwen3 0.6B** | `qwen3` | explicit head_dim (key_length), per-head QK-norm, NEOX RoPE, tied output |
-| **Gemma 3n E2B** | `gemma4` | MatFormer: SentencePiece-unigram tokenizer, Per-Layer Embeddings, QK-norm, sandwich norms, shared-KV, sliding-window attention, logit soft-cap |
-| **LFM2.5 230M** | `lfm2` | hybrid gated ShortConv (depthwise causal conv1d) + GQA attention, per-head QK-norm, NeoX RoPE, tied output head |
+## What you need
 
-Any other `llama`- or `qwen2`-family GGUF loads through the same path.
+| Item | Notes |
+|------|-------|
+| AMD Ryzen AI system | Krackan or Strix Point with NPU enabled in BIOS |
+| Ubuntu 24.04 or 26.04 | Native Linux on the NPU host (not Docker) |
+| ~4 GB disk | Plus space for model files |
+| A GGUF model | e.g. Llama 3.2 1B Q4_K_M |
 
-### Supported quantizations
+**BIOS:** NPU/IPU enabled. **Kernel:** `amd_iommu=on` at boot.
 
-`Q4_0`, `Q8_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ4_NL`, `IQ4_XS`, and
-`BF16` — all decoded to per-row int8 for the NPU matmul, and to reference float for
-the embedding/output paths. Mixed-precision GGUFs (e.g. a `Q4_K_M` file with `Q6_K`
-attention/FFN tensors) are handled tensor-by-tensor. Full-precision `F16`/`F32`
-tensors (norms, biases) pass through directly.
+## Quick start
 
-Not yet supported: the codebook i-quants `IQ1_S`/`IQ1_M`/`IQ2_XXS`/`IQ2_S`/`IQ2_M`/
-`IQ3_XXS`/`IQ3_S`, and architectures beyond those above (e.g. selective-SSM
-hybrids such as `qwen35`).
-
-## Native host setup
-
-`ggnpu` is intended to be built and run directly on the host. Docker is not used.
-
-### Host prerequisites
-
-| Required on host | Notes |
-|------------------|-------|
-| Linux with `amdxdna` loaded | Ryzen AI / XDNA-capable host |
-| `/dev/accel/accel0` | NPU device node |
-| `/usr/lib/firmware/amdnpu` | Firmware directory |
-| XRT runtime, headers, tools | `libxrt2`, `libxrt-npu2`, `libxrt-dev`, `libxrt-utils` (xclbinutil) |
-| CMake and C++ toolchain | `cmake`, `g++`, `make` or Ninja |
-| Python 3.10+ | For kernel compilation via Triton-XDNA |
-| User in host `render` group | Required to open the accel device |
-
-BIOS: NPU/IPU enabled. Boot: `amd_iommu=on`.
-
-### Full installation
-
-**One command** — installs host prerequisites, builds ggnpu, optionally builds the
-NPU kernels, and verifies. It drives the scripts below, is interactive and safe to
-re-run (finished work is skipped):
+### Step 1 — Clone and set up
 
 ```bash
 git clone https://github.com/michaelstaake/ggnpu.git
@@ -69,194 +38,157 @@ cd ggnpu
 ./setup.sh
 ```
 
-`./setup.sh` asks before any privileged action. Useful flags: `--yes`
-(non-interactive), `--cpu` (CPU-only build, no NPU/driver), `--kernels-here`,
-`--kernels-separate`, `--no-kernels`, `--skip-install`, `--skip-build`.
-After it runs, **log out and back in (or reboot)** if it added you to the `render`
-group or changed memlock limits.
+`./setup.sh` installs host dependencies, builds `ggnpu`, and walks you through
+building NPU kernels. It is interactive and safe to re-run — finished steps are
+skipped.
 
-<details>
-<summary>Manual alternative (what <code>setup.sh</code> automates)</summary>
+**After setup:** log out and back in (or reboot) if the script added you to the
+`render` group or changed memlock limits.
+
+Useful flags:
+
+| Flag | Description |
+|------|-------------|
+| `--yes` | Non-interactive (accept defaults) |
+| `--kernels-here` | Build NPU kernels on this machine |
+| `--kernels-separate` | Skip kernels (you will build on another machine) |
+| `--no-kernels` | Skip kernel build entirely |
+| `--cpu` | CPU-only build (no NPU hardware needed) |
+| `--skip-install` | Skip privileged host install |
+| `--skip-build` | Skip the C++ build |
+
+### Step 2 — Build NPU kernels
+
+Inference and `bench-matmul` need compiled kernel files in
+`~/.cache/ggnpu/xclbin/`. Each operation needs **both** a `.xclbin` and its
+matching `*_sequence.bin` file.
+
+Kernel compilation runs on **CPU only** — no NPU hardware is required to build.
+It needs **~16 GB RAM** (32 GB recommended) and takes a while.
+
+Pick one of the two options below.
+
+#### Option A — Build on the NPU host
+
+Use this when your NPU machine has enough RAM (~16 GB+).
+
+During `./setup.sh`, choose **build kernels here**, or run:
 
 ```bash
-# 1. Core build tools
+./setup.sh --kernels-here
+```
+
+Or manually:
+
+```bash
+bash scripts/setup-triton-env.sh       # one-time: creates ~/triton-env
+source ~/triton-env/bin/activate
+bash scripts/verify-kernel-build.sh    # fix any [FAIL] before compiling
+./scripts/build-kernels.sh npu6        # all kernels for Krackan
+```
+
+Already-built kernels are skipped, so re-running after a failure is safe.
+
+#### Option B — Build on a separate machine
+
+Use this when the NPU host does **not** have enough RAM for kernel compilation.
+Any Ubuntu 24.04+ PC can build the kernels — no NPU, driver, or firmware needed.
+
+**On the build machine:**
+
+```bash
+# 1. System packages (python3-dev is required)
 sudo apt update
-sudo apt install build-essential cmake git clang lld ninja-build python3-pip python3-venv
+sudo apt install -y build-essential cmake git python3 python3-venv python3-pip python3-dev uuid-dev
 
-# 2. XRT runtime + NPU driver (from AMD PPA)
-sudo add-apt-repository ppa:amd-team/xrt
+# 2. XRT dev headers (no driver needed)
+sudo add-apt-repository -y ppa:amd-team/xrt
 sudo apt update
-sudo apt install libxrt2 libxrt-npu2 libxrt-dev libxrt-utils libxrt-utils-npu amdxdna-dkms
+sudo apt install -y libxrt2 libxrt-dev libxrt-utils
 
-# 3. Memlock limits (required for NPU pinned DMA buffers)
-echo '* soft memlock unlimited' | sudo tee /etc/security/limits.d/99-amdxdna.conf
-echo '* hard memlock unlimited' | sudo tee -a /etc/security/limits.d/99-amdxdna.conf
+# 3. Clone, set up Triton, and build
+git clone https://github.com/michaelstaake/ggnpu.git ~/ggnpu
+cd ~/ggnpu
+bash scripts/setup-triton-env.sh
+source ~/triton-env/bin/activate
+bash scripts/verify-kernel-build.sh
+./scripts/build-kernels.sh npu6
+```
 
-# 4. Add user to render group
-sudo usermod -aG render $USER
+**WSL users:** raise memory in `C:\Users\<you>\.wslconfig` (`memory=24GB`,
+`swap=16GB`), run `wsl --shutdown`, then reopen WSL. Clone to the Linux
+filesystem (`~/ggnpu`), **not** `/mnt/c/...`.
 
-# 5. Log out and back in (or reboot) for group/limits to take effect
+**Copy kernels to the NPU host:**
 
-# 6. Verify everything
+```bash
+scp -r ~/.cache/ggnpu/xclbin/* user@npu-host:~/.cache/ggnpu/xclbin/
+```
+
+Copy both `.xclbin` and `*_sequence.bin` files for each operation.
+
+If you already have prebuilt kernels, place them directly in
+`~/.cache/ggnpu/xclbin/` on the NPU host.
+
+### Step 3 — Verify
+
+```bash
+bash scripts/verify-npu.sh
+./build-npu/ggnpu bench-matmul
+```
+
+### Step 4 — Run inference
+
+Put your `.gguf` model in `models/`, then:
+
+```bash
+./build-npu/ggnpu \
+  -m models/llama-3.2-1b-q4_k_m.gguf \
+  -p "The capital of France is" \
+  -c 2048 \
+  -n 32
+```
+
+More examples and CLI flags: [docs/usage.md](docs/usage.md).
+
+## Common kernel build failures
+
+| Symptom | Fix |
+|---------|-----|
+| `Triton-XDNA not installed` | Run `bash scripts/setup-triton-env.sh`, then `source ~/triton-env/bin/activate` |
+| `Python.h` not found | `sudo apt install python3-dev` |
+| `XRT development files not found` | `sudo apt install libxrt2 libxrt-dev uuid-dev` from the AMD PPA |
+| `xclbinutil not found` | `sudo apt install libxrt-utils` |
+| Build killed / OOM | Use **Option B** (build on another machine) or add RAM |
+| Symlink or I/O errors in WSL | Re-clone to `~/ggnpu`, not `/mnt/c/...` |
+
+## Manual setup (alternative to `./setup.sh`)
+
+<details>
+<summary>What <code>setup.sh</code> automates</summary>
+
+```bash
+# 1. Core build tools + XRT/NPU driver
+bash scripts/install-host.sh
+
+# 2. Build ggnpu
+./scripts/build.sh
+
+# 3. Verify host
 bash scripts/setup-host.sh
 bash scripts/verify-npu.sh
 ```
 
-Steps 1–4 are performed by `scripts/install-host.sh`; the build by `scripts/build.sh`.
+See [docs/host-setup-guide.md](docs/host-setup-guide.md) for the full manual
+walkthrough including memlock limits, render group, and IOMMU.
 
 </details>
 
-### Quick start
+## Documentation
 
-```bash
-git clone https://github.com/michaelstaake/ggnpu.git
-cd ggnpu
-
-# Build ggnpu with the NPU backend (wrapper; or run the cmake commands below directly)
-./scripts/build.sh
-# Equivalent:
-#   cmake -S . -B build-npu \
-#     -DGGNPU_NPU_BACKEND=ON -DGGNPU_TEST_CPU=OFF -DGGNPU_BUILD_TESTS=ON
-#   cmake --build build-npu -j2
-
-# Smoke test
-./build-npu/ggnpu bench-matmul
-
-# Inference (put GGUF files in models/)
-./build-npu/ggnpu \
-  -m models/llama-3.2-1b-q4_k_m.gguf -p "The capital of France is" -c 2048 -n 32
-```
-
-### Build NPU kernels (Triton-XDNA)
-
-`bench-matmul` and inference need `.xclbin` kernel files **and their `*_sequence.bin` instruction files** in `~/.cache/ggnpu/xclbin/`. Both are produced by `scripts/build-kernels.sh`; if you copy kernels between machines, copy both files per op.
-No NPU hardware is needed to build kernels — compilation runs entirely on CPU.
-You can build on any Ubuntu 24.04+ machine (including WSL) with ~16 GB RAM
-(32 GB recommended) and copy the `.xclbin` files back to the NPU machine.
-
-#### Step-by-step: build kernels on another machine (native Ubuntu or WSL)
-
-**Step 0 (WSL only) — give WSL enough RAM and clone on the Linux filesystem.**
-WSL caps memory at 50% of host RAM by default; kernel compilation needs ~16 GB.
-In Windows, edit `C:\Users\<you>\.wslconfig`:
-
-```ini
-[wsl2]
-memory=24GB
-swap=16GB
-```
-
-Then run `wsl --shutdown` in PowerShell and reopen WSL.
-
-The repo **must** live on the Linux filesystem (e.g. `~/ggnpu`), **not** `/mnt/c/...`.
-Builds on Windows mounts fail due to broken symlinks and slow I/O.
-
-**Step 1 — system packages.** `python3-dev` is mandatory; the kernel compiler
-links a small launcher against `Python.h` and fails without it.
-
-```bash
-sudo apt update
-sudo apt install -y build-essential cmake git python3 python3-venv python3-pip python3-dev uuid-dev
-```
-
-**Step 2 — XRT dev headers.** Kernel builds need XRT headers even without an NPU.
-Add the AMD PPA and install just the dev packages (no driver/firmware needed):
-
-```bash
-sudo add-apt-repository -y ppa:amd-team/xrt
-sudo apt update
-sudo apt install -y libxrt2 libxrt-dev libxrt-utils uuid-dev
-```
-
-If the PPA isn't available, `./scripts/build-kernels.sh` will try
-`bash scripts/fetch-xrt-dev.sh` automatically, but that also requires `libxrt2`
-to be installed — so prefer the PPA route above.
-
-**Step 3 — clone and create the Triton-XDNA venv.** Triton-XDNA is distributed
-as GitHub release wheels, not on PyPI, so plain `pip install triton-xdna` fails.
-Use the setup script, which passes the required `--find-links` URLs:
-
-```bash
-git clone https://github.com/michaelstaake/ggnpu.git ~/ggnpu
-cd ~/ggnpu
-bash scripts/setup-triton-env.sh          # creates ~/triton-env
-```
-
-The script ends by verifying the install; you should see `NPUDriver: OK`.
-
-(If you must install manually instead:)
-
-```bash
-python3 -m venv ~/triton-env
-source ~/triton-env/bin/activate
-pip install --upgrade pip wheel
-pip install triton-xdna \
-  --find-links https://github.com/amd/Triton-XDNA/releases/expanded_assets/latest-wheels \
-  --find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-no-rtti-2 \
-  --find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly \
-  --find-links https://github.com/Xilinx/mlir-air/releases/expanded_assets/latest-air-wheels-no-rtti
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-```
-
-**Step 4 — preflight check.** This catches every known WSL/venv problem
-(Windows-mount repo, missing `python3-dev`, missing XRT headers, link failures)
-before you waste time on a long compile:
-
-```bash
-source ~/triton-env/bin/activate
-bash scripts/verify-kernel-build.sh
-```
-
-Fix any `[FAIL]` items it reports, then re-run until it says `Preflight OK`.
-
-**Step 5 — build the kernels.**
-
-```bash
-source ~/triton-env/bin/activate
-./scripts/build-kernels.sh npu6          # all kernels for npu6 (Krackan)
-# ./scripts/build-kernels.sh npu6 matmul # single kernel
-# ./scripts/build-kernels.sh npu4 npu5 npu6
-```
-
-Output goes to `~/.cache/ggnpu/xclbin/`. Already-built xclbins are skipped, so
-re-running after a failure is safe.
-
-**Step 6 — copy the kernels back to the NPU machine.**
-
-```bash
-scp -r ~/.cache/ggnpu/xclbin/* user@npu-machine:~/.cache/ggnpu/xclbin/
-```
-
-(Or copy via USB/shared folder — anything that lands the `.xclbin` files in
-`~/.cache/ggnpu/xclbin/` on the NPU machine works.)
-
-#### Common failures
-
-| Symptom | Cause / fix |
-|---------|-------------|
-| `ERROR: Triton-XDNA not installed` | venv not activated, or installed without `--find-links` URLs. Run `bash scripts/setup-triton-env.sh` then `source ~/triton-env/bin/activate`. |
-| `Python.h` not found / launcher link fails | `sudo apt install python3-dev` |
-| `XRT development files not found` | Step 2: install `libxrt2 libxrt-dev uuid-dev` from the AMD PPA. |
-| `xclbinutil not found, skipping xclbin generation` | `sudo apt install libxrt-utils libxrt-utils-npu` (or `bash scripts/fetch-xrt-dev.sh --tools`). |
-| Build killed / OOM in WSL | Raise `memory=` in `.wslconfig` (Step 0), then `wsl --shutdown`. |
-| Symlink or random I/O errors in WSL | Repo is on `/mnt/c` — re-clone to `~/ggnpu`. |
-| Wheels not found for your Python | Use Ubuntu's default `python3` (3.10+); avoid exotic interpreters. |
-
-### Verify host
-
-```bash
-bash scripts/setup-host.sh
-bash scripts/verify-npu.sh
-```
-
-These scripts check hardware, driver, permissions, XRT, and the local xclbin cache.
-
----
-
-**Implementation spec:** [IMPLEMENTATION.md](IMPLEMENTATION.md) — complete handoff for contributors and AI agents.
-
-**Benchmark log:** [dev-benchmark.md](dev-benchmark.md) — running record of timed/correctness runs. **Append a new entry (commit, date, command, result) every time you run a benchmark or timed test.**
-
-**Full host setup guide:** [docs/host-setup-guide.md](docs/host-setup-guide.md)
-
-**Kernel builds:** Local kernel compilation requires `Triton-XDNA`. If you already have prebuilt `.xclbin` files, place them under `~/.cache/ggnpu/xclbin/`.
+| Doc | Contents |
+|-----|----------|
+| [docs/usage.md](docs/usage.md) | CLI reference, flags, examples |
+| [docs/host-setup-guide.md](docs/host-setup-guide.md) | Detailed host setup and troubleshooting |
+| [IMPLEMENTATION.md](IMPLEMENTATION.md) | Architecture, supported models, contributor handoff |
+| [dev-benchmark.md](dev-benchmark.md) | Benchmark and correctness log |

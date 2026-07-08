@@ -169,7 +169,7 @@ bash scripts/setup-triton-env.sh .venv-triton
 source ~/triton-env/bin/activate   # or: source .venv-triton/bin/activate
 ```
 
-The setup script installs `triton-xdna` plus transitive wheels (mlir-air, mlir-aie, llvm-aie/Peano) via GitHub find-links. You can also install system-wide on Ubuntu 24.04+ with `pip install triton-xdna --break-system-packages` and the same find-links URLs from [README.md](../README.md).
+The setup script installs `triton-xdna` plus transitive wheels (mlir-air, mlir-aie, llvm-aie/Peano) via GitHub find-links. See `scripts/setup-triton-env.sh` for the exact `pip install` URLs if you need to install manually.
 
 Requires `libxrt-dev` (or `third_party/xrt-dev/`) and `uuid-dev` headers for the compile-only launcher build. Runtime packages (`libxrt2`, `libxrt-npu2`) alone are not enough — you need the **-dev** headers.
 
