@@ -155,10 +155,14 @@ bool Tokenizer::load_from_gguf(const std::map<std::string, GgufKV>& kv_pairs) {
             // token past the first was wrong → garbage generation (same trap as
             // lfm2/tekken). This was THE qwen35 bug, not the SSM math.
             pre_type_ = PreType::Qwen35;
-        } else if (pre == "qwen2") {
+        } else if (pre == "qwen2" || pre == "deepseek-r1-qwen") {
             // Qwen2/Qwen3 (pre="qwen2"): GPT-2-style byte-level BPE with the Qwen2
             // split regex (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2). Distinct from
             // qwen35 (\p{L}+ vs [\p{L}\p{M}]+, different negated symbol class).
+            // "deepseek-r1-qwen" (DeepSeek-R1-Distill-Qwen) maps to the same
+            // LLAMA_VOCAB_PRE_TYPE_QWEN2 in llama.cpp; leaving it unmapped fell to
+            // PreType::Default (whole prompt as one word) → garbage generation at
+            // every quant incl BF16 (same trap as lfm2/tekken/qwen35).
             pre_type_ = PreType::Qwen2;
         } else if (pre == "gpt-2" || pre == "default") {
             pre_type_ = PreType::Gpt2;
