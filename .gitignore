@@ -13,6 +13,9 @@ test_arch
 
 # Local test models (large GGUF files)
 models/*.gguf
+
+# Smoke-sweep run artifacts (scripts/smoke-sweep.sh output)
+sweep-results/
 models/*.bin
 
 # IDE
