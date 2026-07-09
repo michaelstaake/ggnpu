@@ -21,11 +21,46 @@ layers) are handled tensor-by-tensor. Full details:
 | Item | Notes |
 |------|-------|
 | AMD Ryzen AI system | Krackan or Strix Point with NPU enabled in BIOS |
-| Ubuntu 24.04 or 26.04 | Native Linux on the NPU host (not Docker) |
+| Ubuntu 24.04 or 26.04 | Native Linux, or a Proxmox LXC container (see below) — not Docker |
 | ~4 GB disk | Plus space for model files |
 | A GGUF model | e.g. Llama 3.2 1B Q4_K_M |
 
 **BIOS:** NPU/IPU enabled. **Kernel:** `amd_iommu=on` at boot.
+
+### Running inside a Proxmox LXC container
+
+The NPU works from an unprivileged Ubuntu LXC container, but the passthrough
+and limits are configured on the **Proxmox host**, not inside the container.
+
+1. **Enable IOMMU on the host.** Add `amd_iommu=on iommu=pt` to the kernel
+   command line (`/etc/default/grub` → `GRUB_CMDLINE_LINUX_DEFAULT`, then
+   `update-grub`, or edit `/etc/kernel/cmdline` for systemd-boot). Reboot.
+
+2. **Pass the NPU device into the container.** Edit the container config on the
+   host at `/etc/pve/lxc/<vmid>.conf`. Confirm the device major first with
+   `ls -l /dev/accel/accel0` (shown as `<major>, <minor>`, e.g. `261, 0`):
+
+   ```
+   lxc.cgroup2.devices.allow: c 261:* rwm
+   lxc.mount.entry: /dev/accel dev/accel none bind,optional,create=dir
+   ```
+
+3. **Raise the memlock limit for the container.** The NPU driver locks large
+   buffers; the default 8 MB cap makes device open fail with
+   `mmap(...) failed (err=-11): Resource temporarily unavailable`. Add to the
+   same config file:
+
+   ```
+   lxc.prlimit.memlock: unlimited
+   ```
+
+4. **Restart the container** (`pct restart <vmid>`) so the changes apply.
+
+Inside the container, install the `amdxdna` driver / XRT as usual (`./setup.sh`
+handles this). `bash scripts/verify-npu.sh` may report `[FAIL]` for **IOMMU**
+and **NPU firmware** even when everything works — those checks read host
+`/sys` nodes the container can't see; `./build-npu/ggnpu bench-matmul` is the
+real test.
 
 ## Quick start
 
