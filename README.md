@@ -36,14 +36,7 @@ and limits are configured on the **Proxmox host**, not inside the container.
    command line (`/etc/default/grub` → `GRUB_CMDLINE_LINUX_DEFAULT`, then
    `update-grub`, or edit `/etc/kernel/cmdline` for systemd-boot). Reboot.
 
-2. **Pass the NPU device into the container.** Edit the container config on the
-   host at `/etc/pve/lxc/<vmid>.conf`. Confirm the device major first with
-   `ls -l /dev/accel/accel0` (shown as `<major>, <minor>`, e.g. `261, 0`):
-
-   ```
-   lxc.cgroup2.devices.allow: c 261:* rwm
-   lxc.mount.entry: /dev/accel dev/accel none bind,optional,create=dir
-   ```
+2. **Pass the NPU device into the container.** In Proxmox UI, Container > Resources > Add > Device Passthrough. Should be something like /dev/accel/accel0.
 
 3. **Raise the memlock limit for the container.** The NPU driver locks large
    buffers; the default 8 MB cap makes device open fail with
